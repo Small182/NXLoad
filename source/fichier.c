@@ -16,6 +16,11 @@
 
 #define HTML_CAPACITY (512 * 1024)
 #define URL_CAPACITY 2048
+#define DLARCHIVE_ORIGIN "https://drive.dlarchive.my.id"
+#define DLARCHIVE_FILE_HOST "direct-stor.berkasdrive.com"
+#define MYSIMS_ID "t94awh34fed17a"
+
+typedef enum { HOST_FICHIER, HOST_MEGAUP, HOST_DLARCHIVE } DownloadHost;
 #ifdef __SWITCH__
 #define OUTPUT_DIR "sdmc:/switch/SwitchDownloadProbe"
 #else
@@ -27,6 +32,7 @@ typedef struct {
     char *html;
     size_t length;
     char name[160];
+    char fallback_name[160];
     long status;
     bool challenge;
     bool text;
@@ -45,7 +51,7 @@ static bool in_domain(const char *host, const char *domain) {
 }
 
 static bool resolve_host_url(const char *base, const char *target,
-                             char out[URL_CAPACITY], bool megaup) {
+                             char out[URL_CAPACITY], DownloadHost source) {
     if (!target || !*target) return false;
     CURLU *parsed = curl_url();
     if (!parsed) return false;
@@ -54,11 +60,12 @@ static bool resolve_host_url(const char *base, const char *target,
         !curl_url_set(parsed, CURLUPART_URL, target, CURLU_DISALLOW_USER) &&
         !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) && !strcmp(scheme, "https") &&
         !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
-        (megaup ? !strcasecmp(host, MEGAUP_FILE_HOST) :
-            in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
+        (source == HOST_MEGAUP ? !strcasecmp(host, MEGAUP_FILE_HOST) :
+         source == HOST_DLARCHIVE ? !strcasecmp(host, DLARCHIVE_FILE_HOST) :
+         in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
         !curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) && !strcmp(port, "443") &&
         !curl_url_get(parsed, CURLUPART_URL, &url, 0) && strlen(url) < URL_CAPACITY;
-    if (ok && megaup) {
+    if (ok && source == HOST_MEGAUP) {
         ok = !curl_url_get(parsed, CURLUPART_QUERY, &query, 0) &&
             !strncmp(query, "download_token=", 15) && query[15] && query[15] != '&';
     }
@@ -73,7 +80,7 @@ static bool resolve_host_url(const char *base, const char *target,
 }
 
 static bool resolve_url(const char *base, const char *target, char out[URL_CAPACITY]) {
-    return resolve_host_url(base, target, out, false);
+    return resolve_host_url(base, target, out, HOST_FICHIER);
 }
 
 static bool same_host(const char *a, const char *b) {
@@ -82,20 +89,23 @@ static bool same_host(const char *a, const char *b) {
     return end_a - a == end_b - b && !strncasecmp(a, b, end_a - a);
 }
 
+static void copy_filename(char *out, size_t capacity, const char *name, size_t n) {
+    if (n == 0 || n >= capacity || name[0] == '.') return;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+        if (ch < 32 || ch >= 127 || strchr("/\\:<>|?*\"", ch)) return;
+    }
+    memcpy(out, name, n);
+    out[n] = 0;
+}
+
 static void read_filename(Transfer *t, const char *value) {
     const char *name = strcasestr(value, "filename=");
     if (!name) return;
     name += strlen("filename=");
     bool quoted = *name == '"';
     if (quoted) ++name;
-    size_t n = strcspn(name, quoted ? "\"\r\n" : ";\r\n");
-    if (n == 0 || n >= sizeof(t->name) || name[0] == '.') return;
-    for (size_t i = 0; i < n; ++i) {
-        unsigned char ch = (unsigned char)name[i];
-        if (ch < 32 || ch >= 127 || strchr("/\\:<>|?*\"", ch)) return;
-    }
-    memcpy(t->name, name, n);
-    t->name[n] = 0;
+    copy_filename(t->name, sizeof(t->name), name, strcspn(name, quoted ? "\"\r\n" : ";\r\n"));
 }
 
 static size_t on_header(char *data, size_t size, size_t count, void *arg) {
@@ -121,13 +131,16 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
         t->text = strcasestr(line, "text/") || strcasestr(line, "html") || strcasestr(line, "json");
         t->binary = strcasestr(line, "application/octet-stream") ||
             strcasestr(line, "application/x-rar") || strcasestr(line, "application/vnd.rar") ||
-            strcasestr(line, "application/zip") || strcasestr(line, "application/x-7z");
+            strcasestr(line, "application/zip") || strcasestr(line, "application/x-7z") ||
+            (t->job->dlarchive && (strcasestr(line, "application/x-nsp") ||
+                                    strcasestr(line, "application/force-download")));
     }
     return n;
 }
 
 static bool open_partial(Transfer *t) {
     const char *fallback = t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
+    if (t->job->dlarchive) fallback = t->fallback_name[0] ? t->fallback_name : "MySims.nsp";
     const char *name = t->name[0] ? t->name : fallback;
     snprintf(t->job->path, sizeof(t->job->path), "%s/%s", OUTPUT_DIR, name);
     snprintf(t->partial, sizeof(t->partial), "%s/%s.part", OUTPUT_DIR, name);
@@ -345,6 +358,115 @@ static bool resolve_bunny(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
     return found;
 }
 
+// DLArchive returns a flat JSON object with string, boolean and numeric fields.
+static void skip_json_space(const char **p) {
+    while (isspace((unsigned char)**p)) ++*p;
+}
+
+static bool read_json_string(const char **p, char *out, size_t capacity) {
+    if (**p != '"') return false;
+    const char *s = *p + 1;
+    size_t n = 0;
+    while (*s && *s != '"') {
+        unsigned char ch = (unsigned char)*s++;
+        if (ch < 0x20) return false;
+        if (ch == '\\') {
+            ch = (unsigned char)*s++;
+            const char *simple = "\"\\/bfnrt";
+            const char *escape = ch ? strchr(simple, ch) : NULL;
+            if (escape) {
+                ch = (unsigned char)"\"\\/\b\f\n\r\t"[escape - simple];
+            } else if (ch == 'u') {
+                unsigned code = 0;
+                const char *hex = "0123456789abcdef";
+                for (unsigned i = 0; i < 4; ++i) {
+                    int digit = tolower((unsigned char)*s++);
+                    const char *value = digit ? strchr(hex, digit) : NULL;
+                    if (!value) return false;
+                    code = 16 * code + (unsigned)(value - hex);
+                }
+                if (!code || code > 0x7f) return false;
+                ch = (unsigned char)code;
+            } else {
+                return false;
+            }
+        }
+        if (n + 1 >= capacity) return false;
+        out[n++] = (char)ch;
+    }
+    if (*s != '"') return false;
+    out[n] = 0;
+    *p = s + 1;
+    return true;
+}
+
+static bool read_dlarchive_reply(Transfer *t, char out[URL_CAPACITY]) {
+    const char *p = t->html;
+    char target[URL_CAPACITY] = {0};
+    bool ok = false;
+    skip_json_space(&p);
+    if (*p++ != '{') return false;
+    while (true) {
+        char key[64], value[URL_CAPACITY];
+        skip_json_space(&p);
+        if (!read_json_string(&p, key, sizeof(key))) return false;
+        skip_json_space(&p);
+        if (*p++ != ':') return false;
+        skip_json_space(&p);
+        if (*p == '"') {
+            if (!read_json_string(&p, value, sizeof(value))) return false;
+            if (!strcmp(key, "url")) strcpy(target, value);
+            if (!strcmp(key, "filename")) {
+                copy_filename(t->fallback_name, sizeof(t->fallback_name), value, strlen(value));
+            }
+        } else {
+            size_t n = strcspn(p, ",} \t\r\n");
+            if (!n) return false;
+            if (!strcmp(key, "ok")) ok = n == 4 && !memcmp(p, "true", 4);
+            p += n;
+        }
+        skip_json_space(&p);
+        if (*p == '}') break;
+        if (*p++ != ',') return false;
+    }
+    ++p;
+    skip_json_space(&p);
+    return !*p && ok && !strncmp(target, "https://", 8) &&
+        resolve_host_url(NULL, target, out, HOST_DLARCHIVE);
+}
+
+static bool resolve_mysims(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
+    FichierJob *job = t->job;
+    struct curl_slist *headers = curl_slist_append(NULL, "Origin: " DLARCHIVE_ORIGIN);
+    if (!headers) return false;
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_REFERER, DLARCHIVE_ORIGIN "/dl/?id=" MYSIMS_ID);
+    curl_easy_setopt(curl, CURLOPT_URL,
+        "https://uptobox.dlarchive.my.id/files_api.php?action=file-url&id=" MYSIMS_ID);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    CURLcode code = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->api_http);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, NULL);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+    curl_slist_free_all(headers);
+
+    if (code != CURLE_OK) {
+        job->result = curl_easy_strerror(code);
+        return false;
+    }
+    if (job->api_http != 200 || t->challenge) {
+        job->result = "DLArchive API did not return a file address";
+        return false;
+    }
+    if (!read_dlarchive_reply(t, out)) {
+        job->result = "DLArchive API returned no supported file address";
+        return false;
+    }
+    return true;
+}
+
 static const char *page_error(const Transfer *t) {
     if (t->challenge || strcasestr(t->html, "just a moment") ||
         strcasestr(t->html, "cf-turnstile") || strcasestr(t->html, "h-captcha") ||
@@ -389,7 +511,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.6");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.7");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
@@ -399,8 +521,11 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &t);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 
-    if (job->megaup) {
-        if (!resolve_host_url(NULL, job->url, url, true)) {
+    if (job->dlarchive) {
+        if (!resolve_mysims(curl, &t, url)) goto done;
+        strcpy(referrer, DLARCHIVE_ORIGIN "/");
+    } else if (job->megaup) {
+        if (!resolve_host_url(NULL, job->url, url, HOST_MEGAUP)) {
             job->result = "Unexpected MegaUp file address";
             goto done;
         }
@@ -442,6 +567,19 @@ void fichier_download(FichierJob *job) {
         }
         if (code != CURLE_OK || t.error) {
             job->result = t.error ? t.error : curl_easy_strerror(code);
+            goto done;
+        }
+        if (job->dlarchive) {
+            char *redirect = NULL;
+            curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &redirect);
+            if (redirect && resolve_host_url(url, redirect, next, HOST_DLARCHIVE)) {
+                strcpy(url, next);
+                job->result = "DLArchive reached the request limit";
+                continue;
+            }
+            job->result = t.challenge || t.status == 401 || t.status == 403 ?
+                "DLArchive file host rejected the native GET" :
+                "DLArchive file host did not return a file";
             goto done;
         }
         if (job->megaup) {

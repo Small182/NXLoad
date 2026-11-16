@@ -20,10 +20,11 @@
 #define SHARE_URL ORIGIN "/" FILE_ID
 #define DOWNLOAD_PATH "/" FILE_ID "/download"
 #define TITLE "My Cozy Room"
-#define APP_HEADING "Switch Download Probe 0.6"
+#define APP_HEADING "Switch Download Probe 0.7"
 #define CONTROLS "L: MegaUp browser     ZL: enter MegaUp link\n" \
                  "R: WebApplet control  X: A Pretty Odd Bunny\n" \
-                 "Y: 1Fichier link      A: Buzzheavier check    +: exit\n"
+                 "Y: 1Fichier link      A: Buzzheavier check\n" \
+                 "ZR: MySims / DLArchive                       +: exit\n"
 #define MEGAUP_SAMPLE_URL "https://megaup.net/bde566e21b5f549831bafb99218f8081/" \
                           "My_Cozy_Room_%5B0100A21021442000%5D%5Bv0%5D%5BUS%5D.nsp.rar"
 #define MEGAUP_CALLBACK_URL "https://" MEGAUP_FILE_HOST "/"
@@ -451,12 +452,17 @@ static void run_web_control(void) {
     free(body);
 }
 
+static const char *download_title(const FichierJob *job) {
+    if (job->dlarchive) return "MySims / DLArchive";
+    return job->megaup ? "MegaUp file" : "1Fichier";
+}
+
 static void show_download(const FichierJob *job) {
     uint_fast64_t received = atomic_load(&job->received);
     uint_fast64_t total = atomic_load(&job->total);
     unsigned waiting = atomic_load(&job->waiting);
     consoleClear();
-    printf(APP_HEADING " | %s\n\n", job->megaup ? "MegaUp file" : "1Fichier");
+    printf(APP_HEADING " | %s\n\n", download_title(job));
     if (job->megaup) printf("WebApplet returned the file address.\n");
     if (waiting) printf("Host wait: %u s\n", waiting);
     else if (received) {
@@ -508,9 +514,11 @@ int main(void) {
             continue;
         }
         if (!busy && !curl_init && (buttons & (HidNpadButton_A | HidNpadButton_X |
-                                              HidNpadButton_Y | HidNpadButton_L | HidNpadButton_ZL))) {
-            job.megaup = (buttons & (HidNpadButton_L | HidNpadButton_ZL)) != 0;
-            downloading = job.megaup || !(buttons & HidNpadButton_A);
+                                              HidNpadButton_Y | HidNpadButton_L |
+                                              HidNpadButton_ZL | HidNpadButton_ZR))) {
+            job.dlarchive = (buttons & HidNpadButton_ZR) != 0;
+            job.megaup = !job.dlarchive && (buttons & (HidNpadButton_L | HidNpadButton_ZL));
+            downloading = job.dlarchive || job.megaup || !(buttons & HidNpadButton_A);
             consoleClear();
             if (downloading) {
                 job.url = BUNNY_NSWGF_URL;
@@ -521,7 +529,7 @@ int main(void) {
                         continue;
                     }
                     job.url = browser_url;
-                } else if (buttons & HidNpadButton_Y) {
+                } else if (!job.dlarchive && (buttons & HidNpadButton_Y)) {
                     if (!enter_fichier_url(entered_url)) {
                         printf("\n" CONTROLS);
                         consoleUpdate(NULL);
@@ -535,6 +543,7 @@ int main(void) {
                 atomic_store(&job.waiting, 0);
                 job.path[0] = 0;
                 job.http = 0;
+                job.api_http = 0;
                 show_download(&job);
             } else {
                 printf(APP_HEADING " | " TITLE " / Buzzheavier\n\nChecking over HTTPS...\n");
@@ -557,7 +566,8 @@ int main(void) {
             if (downloading) {
                 printf(APP_HEADING " | %s\n\n", job.megaup ? "MegaUp file" : "1Fichier");
                 if (job.megaup) printf("WebApplet returned the file address.\n");
-                printf("HTTP: %ld\n%s\n", job.http, job.result);
+                if (job.dlarchive) printf("DLArchive API HTTP: %ld\n", job.api_http);
+                printf("%sHTTP: %ld\n%s\n", job.dlarchive ? "File host " : "", job.http, job.result);
                 printf("Received: %" PRIuFAST64 " bytes\n", atomic_load(&job.received));
                 if (!strcmp(job.result, "Download saved")) printf("\n%s\n", job.path);
             } else {

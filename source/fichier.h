@@ -16,9 +16,11 @@ typedef struct {
     atomic_uint waiting;
     const char *result;
     long http;
+    long api_http;
     char path[256];
     const char *url;
     bool megaup;
+    bool dlarchive;
 } FichierJob;
 
 void fichier_download(FichierJob *job);

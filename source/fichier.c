@@ -13,16 +13,20 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#include <sys/statvfs.h>
+#endif
 
 #define HTML_CAPACITY (512 * 1024)
 #define URL_CAPACITY 2048
 #define DLARCHIVE_ORIGIN "https://drive.dlarchive.my.id"
 #define DLARCHIVE_FILE_HOST "direct-stor.berkasdrive.com"
-#define MYSIMS_ID "t94awh34fed17a"
+
 
 typedef enum { HOST_FICHIER, HOST_MEGAUP, HOST_DLARCHIVE } DownloadHost;
 #ifdef __SWITCH__
-#define OUTPUT_DIR "sdmc:/switch/SwitchDownloadProbe"
+#define OUTPUT_DIR DOWNLOAD_DIR
 #else
 #define OUTPUT_DIR "./SwitchDownloadProbe"
 #endif
@@ -34,6 +38,7 @@ typedef struct {
     char name[160];
     char fallback_name[160];
     long status;
+    uint64_t expected;
     bool challenge;
     bool text;
     bool attachment;
@@ -119,6 +124,7 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
         const char *code = strchr(line, ' ');
         t->status = code ? strtol(code + 1, NULL, 10) : 0;
         t->length = 0;
+        t->expected = 0;
         t->html[0] = 0;
         t->name[0] = 0;
         t->challenge = t->text = t->attachment = t->binary = false;
@@ -127,6 +133,8 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
     } else if (!strncasecmp(line, "content-disposition:", 20)) {
         t->attachment = strcasestr(line, "attachment") != NULL;
         read_filename(t, line);
+    } else if (!strncasecmp(line, "content-length:", 15)) {
+        t->expected = strtoull(line + 15, NULL, 10);
     } else if (!strncasecmp(line, "content-type:", 13)) {
         t->text = strcasestr(line, "text/") || strcasestr(line, "html") || strcasestr(line, "json");
         t->binary = strcasestr(line, "application/octet-stream") ||
@@ -140,7 +148,11 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
 
 static bool open_partial(Transfer *t) {
     const char *fallback = t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
-    if (t->job->dlarchive) fallback = t->fallback_name[0] ? t->fallback_name : "MySims.nsp";
+    char generic[DLARCHIVE_ID_CAPACITY + 8];
+    if (t->job->dlarchive) {
+        snprintf(generic, sizeof(generic), "%s.bin", t->job->dlarchive_id);
+        fallback = t->fallback_name[0] ? t->fallback_name : generic;
+    }
     const char *name = t->name[0] ? t->name : fallback;
     snprintf(t->job->path, sizeof(t->job->path), "%s/%s", OUTPUT_DIR, name);
     snprintf(t->partial, sizeof(t->partial), "%s/%s.part", OUTPUT_DIR, name);
@@ -149,7 +161,27 @@ static bool open_partial(Transfer *t) {
         t->error = "Destination file already exists";
         return false;
     }
-    int fd = open(t->partial, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    int fd;
+#ifdef __SWITCH__
+    struct statvfs storage;
+    if (t->expected && !statvfs(OUTPUT_DIR, &storage) &&
+        t->expected > (uint64_t)storage.f_bavail * storage.f_frsize) {
+        t->error = "Not enough free space on SD";
+        return false;
+    }
+    if (t->expected > UINT32_MAX) {
+        Result rc = fsdevCreateFile(t->partial, 0, FsCreateOption_BigFile);
+        if (R_FAILED(rc)) {
+            t->error = "Cannot create a large split file on SD";
+            return false;
+        }
+        fd = open(t->partial, O_WRONLY);
+        if (fd < 0) unlink(t->partial);
+    } else
+#endif
+    {
+        fd = open(t->partial, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    }
     if (fd < 0) {
         t->error = "Cannot open .part file on SD";
         return false;
@@ -435,14 +467,23 @@ static bool read_dlarchive_reply(Transfer *t, char out[URL_CAPACITY]) {
         resolve_host_url(NULL, target, out, HOST_DLARCHIVE);
 }
 
-static bool resolve_mysims(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
+static bool resolve_dlarchive(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
     FichierJob *job = t->job;
+    const char *id = job->dlarchive_id;
+    size_t n = id ? strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") : 0;
+    if (!n || n >= DLARCHIVE_ID_CAPACITY || id[n]) {
+        job->result = "Invalid DLArchive file ID";
+        return false;
+    }
+    char page[160], api[180];
+    snprintf(page, sizeof(page), DLARCHIVE_ORIGIN "/dl/?id=%s", id);
+    snprintf(api, sizeof(api),
+             "https://uptobox.dlarchive.my.id/files_api.php?action=file-url&id=%s", id);
     struct curl_slist *headers = curl_slist_append(NULL, "Origin: " DLARCHIVE_ORIGIN);
     if (!headers) return false;
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_REFERER, DLARCHIVE_ORIGIN "/dl/?id=" MYSIMS_ID);
-    curl_easy_setopt(curl, CURLOPT_URL,
-        "https://uptobox.dlarchive.my.id/files_api.php?action=file-url&id=" MYSIMS_ID);
+    curl_easy_setopt(curl, CURLOPT_REFERER, page);
+    curl_easy_setopt(curl, CURLOPT_URL, api);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     CURLcode code = curl_easy_perform(curl);
@@ -511,7 +552,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.7");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
@@ -522,7 +563,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 
     if (job->dlarchive) {
-        if (!resolve_mysims(curl, &t, url)) goto done;
+        if (!resolve_dlarchive(curl, &t, url)) goto done;
         strcpy(referrer, DLARCHIVE_ORIGIN "/");
     } else if (job->megaup) {
         if (!resolve_host_url(NULL, job->url, url, HOST_MEGAUP)) {

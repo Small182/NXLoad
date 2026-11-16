@@ -1,615 +1,545 @@
 #define _GNU_SOURCE
-#include "fichier.h"
-
+#define SDL_MAIN_HANDLED
+#include <switch.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#include <SDL2/SDL_ttf.h>
 #include <curl/curl.h>
+#include <dirent.h>
 #include <inttypes.h>
-#include <stdbool.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#ifdef __SWITCH__
-#include <switch.h>
-#endif
+#include <sys/stat.h>
+#include <unistd.h>
 
-#define ORIGIN "https://buzzheavier.com"
-#define FILE_ID "kku84raex2i9"
-#define SHARE_URL ORIGIN "/" FILE_ID
-#define DOWNLOAD_PATH "/" FILE_ID "/download"
-#define TITLE "My Cozy Room"
-#define APP_HEADING "Switch Download Probe 0.7"
-#define CONTROLS "L: MegaUp browser     ZL: enter MegaUp link\n" \
-                 "R: WebApplet control  X: A Pretty Odd Bunny\n" \
-                 "Y: 1Fichier link      A: Buzzheavier check\n" \
-                 "ZR: MySims / DLArchive                       +: exit\n"
-#define MEGAUP_SAMPLE_URL "https://megaup.net/bde566e21b5f549831bafb99218f8081/" \
-                          "My_Cozy_Room_%5B0100A21021442000%5D%5Bv0%5D%5BUS%5D.nsp.rar"
-#define MEGAUP_CALLBACK_URL "https://" MEGAUP_FILE_HOST "/"
-#define CONTROL_START_URL "https://httpbingo.org/relative-redirect/1"
-#define CONTROL_CALLBACK_URL "https://httpbingo.org/get"
-#define HTML_LIMIT (256 * 1024)
-#define URL_LIMIT 2048
+#include "catalog.h"
+
+#define ROWS 9
+#define FILE_ROWS 5
+#define HISTORY_LIMIT 96
+
+typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 
 typedef struct {
-    char *body;
-    size_t size;
-    char redirect[URL_LIMIT];
-    int challenge;
-    int attachment;
-} Response;
+    char file[256];
+} SavedFile;
 
 typedef struct {
-    long web_status;
-    long button_status;
-    CURLcode curl_error;
-    const char *summary;
-    char host[128];
-} Probe;
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *cover;
+    TTF_Font *small;
+    TTF_Font *normal;
+    TTF_Font *large;
+    Screen screen, previous;
+    Game games[CATALOG_SEARCH_LIMIT];
+    size_t game_count, game_index, file_index, saved_count, saved_index;
+    unsigned page;
+    bool more, confirm_install, close, catalog_busy, download_busy, download_finished;
+    char query[96], notice[192], game_error[192], file_id[DLARCHIVE_ID_CAPACITY];
+    char transfer_name[CATALOG_TEXT];
+    SavedFile saved[HISTORY_LIMIT];
+    GameDetails details;
+    CatalogJob pending;
+    FichierJob download;
+    Thread catalog_thread, download_thread;
+    uint64_t previous_bytes;
+    double speed;
+    uint64_t speed_time;
+} App;
 
-static size_t receive_body(char *data, size_t size, size_t count, void *arg) {
-    Response *response = arg;
-    size_t bytes = size * count;
-    if (response->attachment || !response->body || bytes > HTML_LIMIT - response->size) return 0;
-    memcpy(response->body + response->size, data, bytes);
-    response->size += bytes;
-    response->body[response->size] = 0;
-    return bytes;
+static App app;
+static const SDL_Color background = {15, 19, 31, 255};
+static const SDL_Color panel = {24, 31, 48, 255};
+static const SDL_Color selected = {35, 63, 104, 255};
+static const SDL_Color white = {241, 244, 250, 255};
+static const SDL_Color gray = {166, 181, 210, 255};
+static const SDL_Color blue = {125, 182, 255, 255};
+
+static void rect(int x, int y, int w, int h, SDL_Color color) {
+    if (w <= 0 || h <= 0) return;
+    SDL_Rect box = { x, y, w, h };
+    SDL_SetRenderDrawColor(app.renderer, color.r, color.g, color.b, color.a);
+    SDL_RenderFillRect(app.renderer, &box);
 }
 
-static size_t receive_header(char *line, size_t size, size_t count, void *arg) {
-    Response *response = arg;
-    size_t bytes = size * count;
-    const char name[] = "HX-Redirect:";
-    const char attachment[] = "Content-Disposition: attachment";
-    if (bytes >= 5 && !memcmp(line, "HTTP/", 5)) {
-        response->redirect[0] = 0;
-        response->challenge = 0;
-        response->attachment = 0;
-    }
-    if (bytes >= sizeof(attachment) - 1 && !strncasecmp(line, attachment, sizeof(attachment) - 1)) {
-        response->attachment = 1;
-    }
-    if (bytes >= 23 && !strncasecmp(line, "cf-mitigated: challenge", 23)) {
-        response->challenge = 1;
-    }
-    if (bytes >= sizeof(name) - 1 && !strncasecmp(line, name, sizeof(name) - 1)) {
-        const char *start = line + sizeof(name) - 1;
-        const char *end = line + bytes;
-        while (start < end && isspace((unsigned char)*start)) ++start;
-        while (end > start && isspace((unsigned char)end[-1])) --end;
-        if ((size_t)(end - start) < sizeof(response->redirect)) {
-            memcpy(response->redirect, start, end - start);
-            response->redirect[end - start] = 0;
+static void text(TTF_Font *font, const char *str, int x, int y, int width, SDL_Color color) {
+    if (!str || !*str || width <= 0) return;
+    char short_text[512];
+    snprintf(short_text, sizeof(short_text), "%s", str);
+    size_t length = strlen(short_text);
+    int pixels = 0;
+    if (TTF_SizeUTF8(font, short_text, &pixels, NULL) == 0 && pixels > width) {
+        while (length > 0) {
+            do { --length; } while (length && (short_text[length] & 0xc0) == 0x80);
+            strcpy(short_text + length, "...");
+            if (TTF_SizeUTF8(font, short_text, &pixels, NULL) == 0 && pixels <= width) break;
         }
     }
-    return bytes;
-}
-
-static int button_url(const char *html, char out[URL_LIMIT]) {
-    const char marker[] = DOWNLOAD_PATH "?t=";
-    const char *path = strstr(html, marker);
-    if (!path) return 0;
-    const char *token = path + sizeof(marker) - 1;
-    size_t n = strspn(token, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-%=+/");
-    if (!n || n + sizeof(ORIGIN) + sizeof(marker) >= URL_LIMIT) return 0;
-    if (token[n] && !strchr("\"'<> \t\r\n),", token[n])) return 0;
-    snprintf(out, URL_LIMIT, "%s%s%.*s", ORIGIN, marker, (int)n, token);
-    return 1;
-}
-
-static int issued_host(const char *redirect, char host[128]) {
-    CURLU *url = curl_url();
-    if (!url) return 0;
-    char *scheme = NULL, *domain = NULL, *path = NULL, *query = NULL;
-    int ok = !curl_url_set(url, CURLUPART_URL, redirect, CURLU_DISALLOW_USER) &&
-        !curl_url_get(url, CURLUPART_SCHEME, &scheme, 0) &&
-        !curl_url_get(url, CURLUPART_HOST, &domain, 0) &&
-        !curl_url_get(url, CURLUPART_PATH, &path, 0) &&
-        !curl_url_get(url, CURLUPART_QUERY, &query, 0);
-    if (ok) {
-        size_t length = strlen(domain);
-        const char suffix[] = ".buzzheavier.com";
-        ok = !strcmp(scheme, "https") && length < 128 &&
-            (!strcasecmp(domain, "buzzheavier.com") ||
-                (length >= sizeof(suffix) && !strcasecmp(domain + length - sizeof(suffix) + 1, suffix))) &&
-            !strcmp(path, "/d/" FILE_ID) && !strncmp(query, "v=", 2) && query[2];
-        if (ok) memcpy(host, domain, length + 1);
+    SDL_Surface *surface = TTF_RenderUTF8_Blended(font, short_text, color);
+    if (!surface) return;
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(app.renderer, surface);
+    if (texture) {
+        SDL_Rect box = {x, y, surface->w, surface->h};
+        SDL_RenderCopy(app.renderer, texture, NULL, &box);
+        SDL_DestroyTexture(texture);
     }
-    curl_free(scheme);
-    curl_free(domain);
-    curl_free(path);
-    curl_free(query);
-    curl_url_cleanup(url);
-    return ok;
+    SDL_FreeSurface(surface);
 }
 
-static int challenged(const Response *response, long status) {
-    return response->challenge ||
-        (status == 403 && strcasestr(response->body, "Just a moment"));
-}
-
-static void run_probe(Probe *result) {
-    CURL *curl = curl_easy_init();
-    Response response = { .body = calloc(HTML_LIMIT + 1, 1) };
-    struct curl_slist *headers = NULL;
-    *result = (Probe){ .summary = "Unable to initialize HTTP client" };
-    if (!curl || !response.body) goto cleanup;
-
-    curl_easy_setopt(curl, CURLOPT_URL, SHARE_URL);
-#if LIBCURL_VERSION_NUM >= 0x075500
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
-#endif
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.6");
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 9000L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, receive_header);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
-
-    result->curl_error = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->web_status);
-    if (challenged(&response, result->web_status)) {
-        result->summary = "Share page: Cloudflare challenge";
-        goto cleanup;
+static void row(size_t i, size_t cursor, int x, int y, int width, const char *label) {
+    if (i == cursor) {
+        rect(x, y, width, 42, selected);
+        rect(x, y, 3, 42, blue);
     }
-    if (response.attachment) {
-        result->curl_error = CURLE_OK;
-        result->summary = "Share page: file response received";
-        goto cleanup;
-    }
-    if (result->curl_error || result->web_status != 200) {
-        result->summary = "Share page: request failed";
-        goto cleanup;
-    }
-
-    char url[URL_LIMIT];
-    if (!button_url(response.body, url)) {
-        result->summary = "Share page: signed Download File action unavailable in HTML";
-        goto cleanup;
-    }
-
-    response.size = 0;
-    response.body[0] = 0;
-    headers = curl_slist_append(NULL, "HX-Request: true");
-    if (!headers) goto cleanup;
-    struct curl_slist *next = curl_slist_append(headers, "HX-Current-URL: " SHARE_URL);
-    if (!next) goto cleanup;
-    headers = next;
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_REFERER, SHARE_URL);
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    result->curl_error = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->button_status);
-    if (challenged(&response, result->button_status)) {
-        result->summary = "Download action: Cloudflare challenge";
-    } else if (result->curl_error || result->button_status != 204) {
-        result->summary = "Download action: expected HTTP 204";
-    } else if (!issued_host(response.redirect, result->host)) {
-        result->summary = response.redirect[0] ?
-            "HTTP 204: unexpected HX-Redirect target" : "HTTP 204: HX-Redirect missing";
-    } else {
-        result->summary = "PASS: HTTP 204 + signed HX-Redirect";
-    }
-
-cleanup:
-    curl_easy_cleanup(curl);
-    curl_slist_free_all(headers);
-    free(response.body);
+    text(app.normal, label, x + 11, y + 8, width - 22, i == cursor ? white : gray);
 }
 
-static void print_result(const Probe *result) {
-    printf("Share page HTTP:      %ld\n", result->web_status);
-    printf("Download action HTTP: %ld\n", result->button_status);
-    if (result->curl_error) printf("libcurl: %s\n", curl_easy_strerror(result->curl_error));
-    printf("\n%s\n", result->summary);
-    if (result->host[0]) printf("File host: %s\n", result->host);
-    printf("\nArchive transfer skipped.\n");
+static size_t first_visible(size_t selected_index, size_t rows) {
+    return selected_index < rows ? 0 : selected_index - rows + 1;
 }
 
-#ifdef __SWITCH__
-static void probe_worker(void *arg) {
-    run_probe(arg);
+static size_t move(size_t current, size_t count, u64 buttons) {
+    if (current && (buttons & (HidNpadButton_Up | HidNpadButton_StickLUp))) --current;
+    if (current + 1 < count && (buttons & (HidNpadButton_Down | HidNpadButton_StickLDown))) ++current;
+    return current;
 }
 
-static void download_worker(void *arg) {
-    fichier_download(arg);
+static void catalog_worker(void *arg) { catalog_request(arg); }
+static void download_worker(void *arg) { fichier_download(arg); }
+
+static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
+    Result rc = threadCreate(thread, function, arg, NULL, 128 * 1024, 0x2c, -2);
+    if (R_FAILED(rc)) return false;
+    rc = threadStart(thread);
+    if (R_FAILED(rc)) threadClose(thread);
+    return R_SUCCEEDED(rc);
 }
 
-static bool enter_link(const char *title, const char *guide,
-                       char input[FICHIER_INPUT_CAPACITY]) {
-    SwkbdConfig keyboard;
-    input[0] = 0;
-    Result rc = swkbdCreate(&keyboard, 0);
-    if (R_FAILED(rc)) {
-        printf("Keyboard unavailable: 0x%08x\n", (unsigned)rc);
-        return false;
+static void start_catalog(CatalogRequest request, unsigned page) {
+    if (app.catalog_busy) return;
+    CatalogJob *job = &app.pending;
+    memset(job, 0, sizeof(*job));
+    atomic_init(&job->cancel, false);
+    atomic_init(&job->searching_page, 0);
+    job->request = request;
+    job->page = page;
+    memcpy(job->query, app.query, sizeof(job->query));
+    if (request == CATALOG_DETAILS) job->game = app.games[app.game_index];
+    app.notice[0] = 0;
+    app.catalog_busy = start_worker(&app.catalog_thread, catalog_worker, job);
+    if (!app.catalog_busy) strcpy(app.notice, "Не вдалося запустити запит");
+}
+
+static void update_cover(void) {
+    SDL_DestroyTexture(app.cover);
+    app.cover = NULL;
+    if (app.details.cover && app.details.cover_bytes) {
+        SDL_RWops *src = SDL_RWFromConstMem(app.details.cover, (int)app.details.cover_bytes);
+        if (src) app.cover = IMG_LoadTexture_RW(app.renderer, src, 1);
     }
-
-    swkbdConfigMakePresetDefault(&keyboard);
-    swkbdConfigSetHeaderText(&keyboard, title);
-    swkbdConfigSetGuideText(&keyboard, guide);
-    swkbdConfigSetOkButtonText(&keyboard, "Start");
-    swkbdConfigSetStringLenMax(&keyboard, FICHIER_INPUT_CAPACITY - 1);
-    swkbdConfigSetReturnButtonFlag(&keyboard, false);
-    rc = swkbdShow(&keyboard, input, FICHIER_INPUT_CAPACITY);
-    swkbdClose(&keyboard);
-    return R_SUCCEEDED(rc) && input[0];
+    free(app.details.cover);
+    app.details.cover = NULL;
+    app.details.cover_bytes = 0;
 }
 
-static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
-    char input[FICHIER_INPUT_CAPACITY] = {0};
-    if (!enter_link("1Fichier", "Enter a 1Fichier link or just the file ID", input)) return false;
-    input[strcspn(input, "\r\n")] = 0;
-    char *code = input;
-    while (isspace((unsigned char)*code)) ++code;
-    const char *prefixes[] = {
-        "https://1fichier.com/?", "https://www.1fichier.com/?",
-        "1fichier.com/?", "www.1fichier.com/?"
+static bool package_name(const char *name) {
+    const char *ext = strrchr(name, '.');
+    return ext && (!strcasecmp(ext, ".nsp") || !strcasecmp(ext, ".xci") ||
+                   !strcasecmp(ext, ".nsz") || !strcasecmp(ext, ".xcz"));
+}
+
+static int file_compare(const void *a, const void *b) {
+    return strcasecmp(((const SavedFile *)a)->file, ((const SavedFile *)b)->file);
+}
+
+static void refresh_saved(void) {
+    app.saved_count = 0;
+    DIR *dir = opendir(DOWNLOAD_DIR);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) && app.saved_count < HISTORY_LIMIT) {
+            size_t n = strlen(entry->d_name);
+            if (n < sizeof(app.saved[0].file) && package_name(entry->d_name)) {
+                strcpy(app.saved[app.saved_count++].file, entry->d_name);
+            }
+        }
+        closedir(dir);
+    }
+    qsort(app.saved, app.saved_count, sizeof(app.saved[0]), file_compare);
+    if (app.saved_index >= app.saved_count) app.saved_index = 0;
+}
+
+static void finish_jobs(void) {
+    if (app.catalog_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.catalog_thread), 0))) {
+        threadWaitForExit(&app.catalog_thread);
+        threadClose(&app.catalog_thread);
+        app.catalog_busy = false;
+        CatalogJob *job = &app.pending;
+        bool cancelled = atomic_load(&job->cancel);
+        if (job->request == CATALOG_DETAILS) {
+            if (!cancelled) {
+                app.details = job->details;
+                strcpy(app.game_error, job->error);
+                update_cover();
+            } else {
+                free(job->details.cover);
+            }
+            job->details.cover = NULL;
+        } else if (!cancelled) {
+            if (job->count || job->request == CATALOG_SEARCH || !job->error[0]) {
+                memcpy(app.games, job->games, job->count * sizeof(Game));
+                app.game_count = job->count;
+                app.game_index = 0;
+                app.page = job->page;
+                app.more = job->more;
+            }
+            strcpy(app.notice, job->error);
+        }
+    }
+    if (app.download_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.download_thread), 0))) {
+        threadWaitForExit(&app.download_thread);
+        threadClose(&app.download_thread);
+        app.download_busy = false;
+        app.download_finished = true;
+        refresh_saved();
+    }
+    if (app.download_busy && SDL_GetTicks64() - app.speed_time >= 500) {
+        uint64_t now = SDL_GetTicks64(), bytes = atomic_load(&app.download.received);
+        app.speed = (bytes - app.previous_bytes) * 1000.0 / (now - app.speed_time);
+        app.previous_bytes = bytes;
+        app.speed_time = now;
+    }
+}
+
+static void start_download(const GameFile *file) {
+    if (app.download_busy) {
+        strcpy(app.notice, "Поточне завантаження ще триває");
+        return;
+    }
+    FichierJob *job = &app.download;
+    memset(job, 0, sizeof(*job));
+    atomic_init(&job->cancelled, false);
+    atomic_init(&job->received, 0);
+    atomic_init(&job->total, 0);
+    atomic_init(&job->waiting, 0);
+    strcpy(app.file_id, file->id);
+    strcpy(app.transfer_name, file->title);
+    job->dlarchive = true;
+    job->dlarchive_id = app.file_id;
+    app.speed_time = SDL_GetTicks64();
+    app.previous_bytes = 0;
+    app.speed = 0;
+    app.download_finished = false;
+    app.download_busy = start_worker(&app.download_thread, download_worker, job);
+    if (!app.download_busy) {
+        strcpy(app.notice, "Не вдалося запустити завантаження");
+        return;
+    }
+    app.notice[0] = 0;
+    app.previous = GAME;
+    app.screen = DOWNLOADS;
+}
+
+static bool keyboard(void) {
+    SwkbdConfig config;
+    char query[sizeof(app.query)] = {0};
+    if (R_FAILED(swkbdCreate(&config, 0))) return false;
+    swkbdConfigMakePresetDefault(&config);
+    swkbdConfigSetHeaderText(&config, "Пошук ігор");
+    swkbdConfigSetGuideText(&config, "Введи назву гри");
+    swkbdConfigSetOkButtonText(&config, "Пошук");
+    swkbdConfigSetInitialText(&config, app.query);
+    swkbdConfigSetStringLenMax(&config, sizeof(query) - 1);
+    Result rc = swkbdShow(&config, query, sizeof(query));
+    swkbdClose(&config);
+    if (R_FAILED(rc)) return false;
+    char *start = query + strspn(query, " \t\r\n");
+    size_t n = strlen(start);
+    while (n && strchr(" \t\r\n", start[n - 1])) --n;
+    if (!n) return false;
+    memcpy(app.query, start, n);
+    app.query[n] = 0;
+    return true;
+}
+
+static void open_installer(void) {
+    const char *paths[] = {
+        "sdmc:/switch/DBI/DBI.nro", "sdmc:/switch/DBI.nro",
+        "sdmc:/switch/DBI/dbi.nro", "sdmc:/switch/dbi.nro"
     };
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
-        size_t n = strlen(prefixes[i]);
-        if (!strncasecmp(code, prefixes[i], n)) {
-            code += n;
-            break;
+    app.confirm_install = false;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        if (!access(paths[i], R_OK) && envHasNextLoad() &&
+            R_SUCCEEDED(envSetNextLoad(paths[i], paths[i]))) {
+            app.close = true;
+            return;
         }
     }
-    size_t length = strspn(code, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
-    char *end = code + length;
-    while (isspace((unsigned char)*end)) ++end;
-    if (length < 6 || length > 64 || (*end && *end != '&')) {
-        printf("Expected a 1Fichier URL or file ID.\n");
-        return false;
-    }
-    snprintf(url, FICHIER_INPUT_CAPACITY, "https://1fichier.com/?%.*s", (int)length, code);
-    return true;
+    strcpy(app.notice, "DBI не знайдено. Потрібен DBI.nro в папці switch/DBI/.");
 }
 
-static Result set_compact_web_whitelist(WebCommonConfig *config, const char *allowed) {
-    // libnx reserves 0x1000 bytes for a whitelist. Along with the URL and callback
-    // fields, that exceeds the 0x2000 argument buffer. Store only the used bytes.
-    unsigned char *buffer = config->arg.data;
-    const size_t capacity = sizeof(config->arg.data);
-    const size_t length = strlen(allowed) + 1;
-    const Result bad_input = MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    WebArgHeader header;
-    memcpy(&header, buffer, sizeof(header));
-    size_t offset = sizeof(header);
-    for (unsigned i = 0; i < header.total_entries; ++i) {
-        if (capacity - offset < sizeof(WebArgTLV)) return bad_input;
-        WebArgTLV tlv;
-        memcpy(&tlv, buffer + offset, sizeof(tlv));
-        offset += sizeof(tlv);
-        if (tlv.size > capacity - offset || tlv.type == WebArgType_Whitelist) return bad_input;
-        offset += tlv.size;
+static void input(u64 buttons) {
+    if (!buttons) return;
+    if (app.confirm_install) {
+        if (buttons & HidNpadButton_A) open_installer();
+        if (buttons & HidNpadButton_B) app.confirm_install = false;
+        return;
     }
-    if (header.total_entries == UINT16_MAX || length > 0x1000 ||
-        capacity - offset < sizeof(WebArgTLV) + length) return bad_input;
-
-    const WebArgTLV tlv = { .type = WebArgType_Whitelist, .size = (u16)length };
-    memcpy(buffer + offset, &tlv, sizeof(tlv));
-    memcpy(buffer + offset + sizeof(tlv), allowed, length);
-    ++header.total_entries;
-    memcpy(buffer, &header, sizeof(header));
-    return 0;
-}
-
-static void print_web_context(void) {
-    u32 version = hosversionGet();
-    printf("Horizon %u.%u.%u | Applet type %d\n\n",
-           (unsigned)((version >> 16) & 0xff), (unsigned)((version >> 8) & 0xff),
-           (unsigned)(version & 0xff), (int)appletGetAppletType());
-}
-
-static bool open_web_callback(const char *initial, const char *allowed, const char *callback,
-                              char result[URL_LIMIT]) {
-    if (appletGetAppletType() != AppletType_Application) {
-        consoleClear();
-        printf(APP_HEADING " | WebApplet\n\n");
-        print_web_context();
-        printf("WebApplet needs Application mode.\n");
-        printf("From HOME, hold R while launching a game to open hbmenu.\n");
-        return false;
-    }
-
-    WebCommonConfig config;
-    WebCommonReply reply;
-    // The control stays on one host, so WebNews can use its initial-host rule.
-    const char *stage = "create";
-    Result rc = allowed ? webPageCreate(&config, initial) : webNewsCreate(&config, initial);
-    if (R_SUCCEEDED(rc) && !allowed) {
-        stage = "control options";
-        rc = webConfigSetEcClientCert(&config, false);
-        if (R_SUCCEEDED(rc)) rc = webConfigSetShopJump(&config, false);
-    }
-    if (R_SUCCEEDED(rc)) {
-        stage = "callback config";
-        rc = webConfigSetCallbackUrl(&config, callback);
-    }
-    if (R_SUCCEEDED(rc) && allowed) {
-        stage = "compact whitelist";
-        rc = set_compact_web_whitelist(&config, allowed);
-    }
-    if (R_SUCCEEDED(rc)) {
-        stage = "launch/reply";
-        rc = webConfigShow(&config, &reply);
-    }
-
-    consoleClear();
-    printf(APP_HEADING " | WebApplet\n\n");
-    print_web_context();
-    if (R_FAILED(rc)) {
-        printf("WebApplet %s: 0x%08x (%u/%u)\n", stage, (unsigned)rc,
-               (unsigned)R_MODULE(rc), (unsigned)R_DESCRIPTION(rc));
-        return false;
-    }
-    WebExitReason reason;
-    rc = webReplyGetExitReason(&reply, &reason);
-    if (R_FAILED(rc)) {
-        printf("Could not read exit reason: 0x%08x\n", (unsigned)rc);
-        return false;
-    }
-    printf("WebApplet exit reason: %u\n", (unsigned)reason);
-    if (reason != WebExitReason_LastUrl) {
-        printf("No redirect to the configured file host was captured.\n");
-        return false;
-    }
-    size_t length = 0;
-    result[0] = 0;
-    rc = webReplyGetLastUrl(&reply, result, URL_LIMIT, &length);
-    if (R_FAILED(rc) || !length || length > URL_LIMIT || !result[0]) {
-        printf("No usable callback address returned.\n");
-        return false;
-    }
-    return true;
-}
-
-static bool megaup_callback(u64 buttons, char callback[URL_LIMIT]) {
-    char custom[FICHIER_INPUT_CAPACITY] = {0};
-    const char *start = MEGAUP_SAMPLE_URL;
-    if (buttons & HidNpadButton_ZL) {
-        if (!enter_link("MegaUp", "Enter an https://megaup.net/ file-page link", custom)) return false;
-        if (strncmp(custom, "https://megaup.net/", sizeof("https://megaup.net/") - 1) ||
-            strpbrk(custom, "\r\n\t ")) {
-            printf("Expected an https://megaup.net/ file-page link.\n");
-            return false;
+    if (buttons & HidNpadButton_Plus) { app.close = true; return; }
+    if (buttons & HidNpadButton_Y) {
+        app.notice[0] = 0;
+        if (app.screen == DOWNLOADS) app.screen = app.previous;
+        else {
+            refresh_saved();
+            app.previous = app.screen;
+            app.screen = DOWNLOADS;
         }
-        start = custom;
+        return;
     }
-
-    printf(APP_HEADING " | MegaUp browser\n\nClick Download in the browser.\n");
-    consoleUpdate(NULL);
-    const char *whitelist =
-        "^https://megaup[.]net/.*\n"
-        "^https://download[.]megaup[.]net/.*\n"
-        "^https://challenges[.]cloudflare[.]com/.*\n"
-        "^https://e13[.]megaupdownup[.]org/.*";
-    return open_web_callback(start, whitelist, MEGAUP_CALLBACK_URL, callback);
+    if (app.screen == DOWNLOADS) {
+        app.saved_index = move(app.saved_index, app.saved_count, buttons);
+        if (buttons & HidNpadButton_B) app.screen = app.previous;
+        if ((buttons & HidNpadButton_X) && app.download_busy)
+            atomic_store(&app.download.cancelled, true);
+        if ((buttons & HidNpadButton_A) && app.saved_count && !app.download_busy)
+            app.confirm_install = true;
+        return;
+    }
+    if (app.catalog_busy) {
+        if (buttons & HidNpadButton_B) {
+            atomic_store(&app.pending.cancel, true);
+            if (app.screen == GAME) app.screen = LIBRARY;
+        }
+        return;
+    }
+    if (app.screen == GAME) {
+        app.file_index = move(app.file_index, app.details.count, buttons);
+        if (buttons & HidNpadButton_B) { app.notice[0] = 0; app.screen = LIBRARY; }
+        if ((buttons & HidNpadButton_A) && app.details.count)
+            start_download(&app.details.files[app.file_index]);
+        return;
+    }
+    app.game_index = move(app.game_index, app.game_count, buttons);
+    if ((buttons & HidNpadButton_X) && keyboard()) {
+        start_catalog(CATALOG_SEARCH, 1);
+    } else if ((buttons & HidNpadButton_B) && app.query[0]) {
+        app.query[0] = 0;
+        start_catalog(CATALOG_PAGE, CATALOG_DEFAULT_PAGE);
+    } else if (!app.query[0] && (buttons & HidNpadButton_L) && app.page > 1) {
+        start_catalog(CATALOG_PAGE, app.page - 1);
+    } else if (!app.query[0] && (buttons & HidNpadButton_R) && app.more) {
+        start_catalog(CATALOG_PAGE, app.page + 1);
+    } else if (buttons & HidNpadButton_A) {
+        if (!app.game_count) {
+            start_catalog(app.query[0] ? CATALOG_SEARCH : CATALOG_PAGE, app.page);
+        } else {
+            memset(&app.details, 0, sizeof(app.details));
+            SDL_DestroyTexture(app.cover);
+            app.cover = NULL;
+            app.game_error[0] = 0;
+            app.file_index = 0;
+            app.screen = GAME;
+            start_catalog(CATALOG_DETAILS, app.page);
+        }
+    }
 }
 
-static void run_web_control(void) {
-    char url[URL_LIMIT] = {0};
-    printf(APP_HEADING " | WebApplet control\n\nOpening a known HTTPS redirect...\n");
-    consoleUpdate(NULL);
-    if (!open_web_callback(CONTROL_START_URL, NULL, CONTROL_CALLBACK_URL, url)) return;
-    if (strcmp(url, CONTROL_CALLBACK_URL)) {
-        printf("Unexpected control callback address.\n");
-        return;
+static void draw_library(void) {
+    rect(40, 106, 500, 530, panel);
+    rect(556, 106, 684, 530, panel);
+    char header[160];
+    snprintf(header, sizeof(header), app.query[0] ? "Пошук · %s" : "Каталог NSRoms", app.query);
+    text(app.normal, header, 60, 125, 450, white);
+    if (!app.query[0]) {
+        snprintf(header, sizeof(header), "Сторінка %u", app.page);
+        text(app.small, header, 60, 603, 420, gray);
     }
-    printf("PASS: WebApplet returned the redirect address.\n");
-    consoleUpdate(NULL);
-
-    char *body = calloc(HTML_LIMIT + 1, 1);
-    CURL *curl = curl_easy_init();
-    if (!body || !curl) {
-        printf("Could not initialize control transfer.\n");
-        free(body);
-        curl_easy_cleanup(curl);
-        return;
-    }
-    Response response = { .body = body };
-    curl_easy_setopt(curl, CURLOPT_URL, CONTROL_CALLBACK_URL);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 12000L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    CURLcode result = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_cleanup(curl);
-    printf("Native GET: HTTP %ld\n", status);
-    if (result != CURLE_OK || status != 200 || !response.size ||
-        !strstr(body, CONTROL_CALLBACK_URL)) {
-        printf("Control request did not return the expected JSON.\n");
-        free(body);
-        return;
-    }
-    const char *dir = "sdmc:/switch/SwitchDownloadProbe";
-    const char *path = "sdmc:/switch/SwitchDownloadProbe/webapplet-test.json";
-    const char *temp = "sdmc:/switch/SwitchDownloadProbe/webapplet-test.json.part";
-    if (mkdir(dir, 0777) && errno != EEXIST) {
-        printf("Could not create the test directory on SD.\n");
-        free(body);
-        return;
-    }
-    FILE *output = fopen(temp, "wb");
-    bool sent = false;
-    if (output) {
-        size_t written = fwrite(body, 1, response.size, output);
-        if (!fclose(output) && written == response.size && !rename(temp, path)) sent = true;
-        if (!sent) remove(temp);
-    }
-    if (sent) printf("PASS: saved %u bytes to webapplet-test.json.\n", (unsigned)response.size);
-    else printf("Could not save the control file on SD.\n");
-    free(body);
-}
-
-static const char *download_title(const FichierJob *job) {
-    if (job->dlarchive) return "MySims / DLArchive";
-    return job->megaup ? "MegaUp file" : "1Fichier";
-}
-
-static void show_download(const FichierJob *job) {
-    uint_fast64_t received = atomic_load(&job->received);
-    uint_fast64_t total = atomic_load(&job->total);
-    unsigned waiting = atomic_load(&job->waiting);
-    consoleClear();
-    printf(APP_HEADING " | %s\n\n", download_title(job));
-    if (job->megaup) printf("WebApplet returned the file address.\n");
-    if (waiting) printf("Host wait: %u s\n", waiting);
-    else if (received) {
-        printf("Received: %" PRIuFAST64 " bytes\n", received);
-        if (total) printf("Total:    %" PRIuFAST64 " bytes\n", total);
+    size_t first = first_visible(app.game_index, ROWS);
+    for (size_t i = first; i < app.game_count && i < first + ROWS; ++i)
+        row(i, app.game_index, 55, 170 + (int)(i - first) * 46, 470, app.games[i].title);
+    if (app.catalog_busy) {
+        unsigned page = atomic_load(&app.pending.searching_page);
+        if (page) snprintf(header, sizeof(header), "Пошук на сторінці %u…", page);
+        else strcpy(header, "Завантаження каталогу…");
+        text(app.normal, header, 588, 152, 604, blue);
+    } else if (app.game_count) {
+        text(app.large, app.games[app.game_index].title, 588, 150, 610, white);
+        text(app.normal, "A  Відкрити картку гри", 588, 216, 604, blue);
     } else {
-        printf("Looking up the download over HTTPS...\n");
+        text(app.normal, app.query[0] ? "Ігор за цим запитом не знайдено" : "Каталог порожній",
+             588, 152, 610, gray);
     }
-    printf("\nB: cancel\n");
+    text(app.small, app.notice, 588, 595, 610, gray);
+}
+
+static void draw_cover(void) {
+    rect(56, 118, 308, 420, panel);
+    if (!app.cover) return;
+    int w, h;
+    if (SDL_QueryTexture(app.cover, NULL, NULL, &w, &h) || w <= 0 || h <= 0) return;
+    double scale = SDL_min(308.0 / w, 420.0 / h);
+    SDL_Rect dst = {56 + (308 - (int)(w * scale)) / 2, 118 + (420 - (int)(h * scale)) / 2,
+                    (int)(w * scale), (int)(h * scale)};
+    SDL_RenderCopy(app.renderer, app.cover, NULL, &dst);
+}
+
+static void draw_game(void) {
+    rect(40, 106, 345, 530, panel);
+    rect(401, 106, 839, 530, panel);
+    draw_cover();
+    const char *title = app.details.title[0] ? app.details.title : app.games[app.game_index].title;
+    text(app.large, title, 430, 130, 772, white);
+    text(app.small, app.details.info, 430, 187, 772, gray);
+    text(app.normal, "Файли DLArchive", 430, 224, 770, blue);
+    if (app.catalog_busy) {
+        text(app.normal, "Завантаження картки…", 430, 275, 770, gray);
+    } else if (app.game_error[0] || !app.details.count) {
+        text(app.normal, app.game_error[0] ? app.game_error : "Для цієї гри немає файлів DLArchive",
+             430, 275, 770, gray);
+    } else {
+        size_t first = first_visible(app.file_index, FILE_ROWS);
+        for (size_t i = first; i < app.details.count && i < first + FILE_ROWS; ++i)
+            row(i, app.file_index, 429, 267 + (int)(i - first) * 48, 782, app.details.files[i].title);
+    }
+    text(app.small, app.notice, 430, 595, 772, gray);
+}
+
+static void draw_downloads(void) {
+    rect(40, 106, 1200, 530, panel);
+    text(app.large, "Завантаження", 66, 128, 1100, white);
+    if (app.download_busy || app.download_finished) {
+        uint64_t have = atomic_load(&app.download.received), total = atomic_load(&app.download.total);
+        double percent = total ? SDL_min(100.0, 100.0 * have / total) : 0;
+        char line[192];
+        text(app.normal, app.transfer_name, 66, 182, 1100, white);
+        rect(66, 225, 1148, 8, selected);
+        rect(66, 225, (int)(1148 * percent / 100.0), 8, blue);
+        if (app.download_busy && total) {
+            snprintf(line, sizeof(line), "%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с",
+                     percent, have / 1048576.0, total / 1048576.0, app.speed / 1048576.0);
+        } else if (app.download_busy && have) {
+            snprintf(line, sizeof(line), "%.1f МіБ  ·  %.1f МіБ/с", have / 1048576.0, app.speed / 1048576.0);
+        } else if (app.download_busy) {
+            strcpy(line, "Запит адреси файлу в DLArchive…");
+        } else if (!strcmp(app.download.result, "Download saved")) {
+            snprintf(line, sizeof(line), "Збережено на microSD  ·  %.1f МіБ", have / 1048576.0);
+        } else {
+            snprintf(line, sizeof(line), "%s  ·  API HTTP %ld  ·  Файл HTTP %ld",
+                     app.download.result, app.download.api_http, app.download.http);
+        }
+        text(app.small, line, 66, 249, 1148, blue);
+    }
+    text(app.normal, "Збережені файли", 66, 290, 1100, white);
+    size_t first = first_visible(app.saved_index, FILE_ROWS);
+    for (size_t i = first; i < app.saved_count && i < first + FILE_ROWS; ++i)
+        row(i, app.saved_index, 66, 335 + (int)(i - first) * 46, 1148, app.saved[i].file);
+    if (!app.saved_count) text(app.normal, "Поки немає збережених файлів", 66, 335, 1100, gray);
+    text(app.small, app.notice, 66, 595, 1148, gray);
+}
+
+static void draw(void) {
+    rect(0, 0, 1280, 720, background);
+    text(app.large, "NXLoad", 40, 24, 320, white);
+    if (app.download_busy)
+        text(app.small, "Завантаження триває", 950, 40, 290, blue);
+    if (app.screen == LIBRARY) draw_library();
+    else if (app.screen == GAME) draw_game();
+    else draw_downloads();
+    const char *footer = app.screen == LIBRARY ?
+        "A  Відкрити     X  Пошук     L / R  Сторінки     Y  Завантаження     +  Вихід" :
+        app.screen == GAME ? "A  Завантажити     B  Каталог     Y  Завантаження     +  Вихід" :
+        "A  Відкрити DBI     X  Скасувати завантаження     B  Назад     +  Вихід";
+    text(app.small, footer, 40, 665, 1200, gray);
+    if (app.confirm_install) {
+        rect(190, 200, 900, 305, selected);
+        text(app.large, "Відкрити встановлювач DBI?", 224, 230, 828, white);
+        text(app.normal, app.saved[app.saved_index].file, 224, 298, 828, white);
+        text(app.small, "У DBI відкрий Browse SD Card → switch → SwitchDownloadProbe", 224, 355, 828, gray);
+        text(app.normal, "A  Відкрити DBI     B  Назад", 224, 428, 828, blue);
+    }
+    SDL_RenderPresent(app.renderer);
+}
+
+static TTF_Font *font_open(const PlFontData *font, int points) {
+    SDL_RWops *memory = SDL_RWFromConstMem(font->address, font->size);
+    return memory ? TTF_OpenFontRW(memory, 1, points) : NULL;
 }
 
 int main(void) {
-    consoleInit(NULL);
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-    PadState pad;
-    padInitializeDefault(&pad);
-
     Result sockets = socketInitializeDefault();
-    CURLcode curl_init = R_SUCCEEDED(sockets) ?
-        curl_global_init(CURL_GLOBAL_DEFAULT) : CURLE_FAILED_INIT;
-    printf(APP_HEADING "\n\n");
-    if (R_FAILED(sockets)) printf("Socket init failed: 0x%08x\n", (unsigned)sockets);
-    else if (curl_init) printf("HTTP init failed: %s\n", curl_easy_strerror(curl_init));
-    else printf(CONTROLS);
-
-    Thread thread;
-    bool busy = false, downloading = false;
-    unsigned frame = 0;
-    Probe result;
-    char entered_url[FICHIER_INPUT_CAPACITY] = {0};
-    char browser_url[URL_LIMIT] = {0};
-    FichierJob job = { .url = BUNNY_NSWGF_URL };
-    atomic_init(&job.cancelled, false);
-    atomic_init(&job.received, 0);
-    atomic_init(&job.total, 0);
-    atomic_init(&job.waiting, 0);
-    while (appletMainLoop()) {
-        padUpdate(&pad);
-        u64 buttons = padGetButtonsDown(&pad);
-        if (!busy && (buttons & HidNpadButton_Plus)) break;
-        if (busy && downloading && (buttons & HidNpadButton_B)) {
-            atomic_store(&job.cancelled, true);
+    bool curl_ready = R_SUCCEEDED(sockets) && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    Result font_service = plInitialize(PlServiceType_User);
+    PlFontData font = {0};
+    bool ok = curl_ready && R_SUCCEEDED(font_service) &&
+        R_SUCCEEDED(plGetSharedFontByType(&font, PlSharedFontType_Standard));
+    SDL_SetMainReady();
+    ok = ok && SDL_Init(SDL_INIT_VIDEO) == 0 && TTF_Init() == 0;
+    if (ok) {
+        IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG | IMG_INIT_WEBP);
+        SDL_CreateWindowAndRenderer(1280, 720, 0, &app.window, &app.renderer);
+        app.small = font_open(&font, 18);
+        app.normal = font_open(&font, 23);
+        app.large = font_open(&font, 39);
+        ok = app.window && app.renderer && app.small && app.normal && app.large;
+    }
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&pad);
+    if (ok) {
+        SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
+        app.page = CATALOG_DEFAULT_PAGE;
+        start_catalog(CATALOG_PAGE, app.page);
+        uint64_t next_frame = 0;
+        while (appletMainLoop() && !app.close) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {}
+            padUpdate(&pad);
+            finish_jobs();
+            u64 buttons = padGetButtonsDown(&pad);
+            input(buttons);
+            uint64_t now = SDL_GetTicks64();
+            if (buttons || now >= next_frame) {
+                draw();
+                next_frame = now + 150;
+            }
+            SDL_Delay(16);
         }
-        if (!busy && !curl_init && (buttons & HidNpadButton_R)) {
-            consoleClear();
-            run_web_control();
-            printf("\n" CONTROLS);
+    } else {
+        SDL_Quit();
+        consoleInit(NULL);
+        printf("NXLoad startup error: %s\n\nPress + to exit.\n", SDL_GetError());
+        while (appletMainLoop()) {
+            padUpdate(&pad);
+            if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
             consoleUpdate(NULL);
-            continue;
         }
-        if (!busy && !curl_init && (buttons & (HidNpadButton_A | HidNpadButton_X |
-                                              HidNpadButton_Y | HidNpadButton_L |
-                                              HidNpadButton_ZL | HidNpadButton_ZR))) {
-            job.dlarchive = (buttons & HidNpadButton_ZR) != 0;
-            job.megaup = !job.dlarchive && (buttons & (HidNpadButton_L | HidNpadButton_ZL));
-            downloading = job.dlarchive || job.megaup || !(buttons & HidNpadButton_A);
-            consoleClear();
-            if (downloading) {
-                job.url = BUNNY_NSWGF_URL;
-                if (job.megaup) {
-                    if (!megaup_callback(buttons, browser_url)) {
-                        printf("\n" CONTROLS);
-                        consoleUpdate(NULL);
-                        continue;
-                    }
-                    job.url = browser_url;
-                } else if (!job.dlarchive && (buttons & HidNpadButton_Y)) {
-                    if (!enter_fichier_url(entered_url)) {
-                        printf("\n" CONTROLS);
-                        consoleUpdate(NULL);
-                        continue;
-                    }
-                    job.url = entered_url;
-                }
-                atomic_store(&job.cancelled, false);
-                atomic_store(&job.received, 0);
-                atomic_store(&job.total, 0);
-                atomic_store(&job.waiting, 0);
-                job.path[0] = 0;
-                job.http = 0;
-                job.api_http = 0;
-                show_download(&job);
-            } else {
-                printf(APP_HEADING " | " TITLE " / Buzzheavier\n\nChecking over HTTPS...\n");
-            }
-            ThreadFunc task = downloading ? download_worker : probe_worker;
-            void *arg = downloading ? (void *)&job : (void *)&result;
-            Result status = threadCreate(&thread, task, arg, NULL, 128 * 1024, 0x2c, -2);
-            if (R_SUCCEEDED(status)) {
-                status = threadStart(&thread);
-                if (R_SUCCEEDED(status)) busy = true;
-                else threadClose(&thread);
-            }
-            if (!busy) printf("Thread error: 0x%08x\n" CONTROLS, (unsigned)status);
-        }
-        if (busy && R_SUCCEEDED(waitSingle(waiterForThread(&thread), 0))) {
-            threadWaitForExit(&thread);
-            threadClose(&thread);
-            busy = false;
-            consoleClear();
-            if (downloading) {
-                printf(APP_HEADING " | %s\n\n", job.megaup ? "MegaUp file" : "1Fichier");
-                if (job.megaup) printf("WebApplet returned the file address.\n");
-                if (job.dlarchive) printf("DLArchive API HTTP: %ld\n", job.api_http);
-                printf("%sHTTP: %ld\n%s\n", job.dlarchive ? "File host " : "", job.http, job.result);
-                printf("Received: %" PRIuFAST64 " bytes\n", atomic_load(&job.received));
-                if (!strcmp(job.result, "Download saved")) printf("\n%s\n", job.path);
-            } else {
-                printf(APP_HEADING " | " TITLE " / Buzzheavier\n\n");
-                print_result(&result);
-            }
-            printf("\n" CONTROLS);
-        } else if (busy && downloading && ++frame % 30 == 0) {
-            show_download(&job);
-        }
-        consoleUpdate(NULL);
+        consoleExit(NULL);
     }
-    if (busy) {
-        if (downloading) atomic_store(&job.cancelled, true);
-        threadWaitForExit(&thread);
-        threadClose(&thread);
+    if (app.catalog_busy) {
+        atomic_store(&app.pending.cancel, true);
+        threadWaitForExit(&app.catalog_thread);
+        threadClose(&app.catalog_thread);
+        free(app.pending.details.cover);
     }
-    if (!curl_init) curl_global_cleanup();
+    if (app.download_busy) {
+        atomic_store(&app.download.cancelled, true);
+        threadWaitForExit(&app.download_thread);
+        threadClose(&app.download_thread);
+    }
+    SDL_DestroyTexture(app.cover);
+    if (app.small) TTF_CloseFont(app.small);
+    if (app.normal) TTF_CloseFont(app.normal);
+    if (app.large) TTF_CloseFont(app.large);
+    if (app.renderer) SDL_DestroyRenderer(app.renderer);
+    if (app.window) SDL_DestroyWindow(app.window);
+    IMG_Quit();
+    TTF_Quit();
+    SDL_Quit();
+    if (R_SUCCEEDED(font_service)) plExit();
+    if (curl_ready) curl_global_cleanup();
     if (R_SUCCEEDED(sockets)) socketExit();
-    consoleExit(NULL);
     return 0;
 }
-#else
-int main(int argc, char **argv) {
-    CURLcode init = curl_global_init(CURL_GLOBAL_DEFAULT);
-    if (init) return 1;
-    if (argc > 1 && !strcmp(argv[1], "1fichier")) {
-        FichierJob job = { .url = argc > 2 ? argv[2] : BUNNY_NSWGF_URL };
-        atomic_init(&job.cancelled, false);
-        atomic_init(&job.received, 0);
-        atomic_init(&job.total, 0);
-        atomic_init(&job.waiting, 0);
-        fichier_download(&job);
-        printf("HTTP: %ld\n%s\nReceived: %" PRIuFAST64 " bytes\n",
-               job.http, job.result, atomic_load(&job.received));
-        curl_global_cleanup();
-        return strcmp(job.result, "Download saved") != 0;
-    }
-    Probe result;
-    run_probe(&result);
-    print_result(&result);
-    curl_global_cleanup();
-    return result.host[0] ? 0 : 1;
-}
-#endif

@@ -1,20 +1,17 @@
-# Switch Download Probe
+# NXLoad
 
-Нативна діагностика завантажень на Nintendo Switch через інтернет із записом на microSD.
+Нативний каталог Nintendo Switch та завантажувач DLArchive для microSD.
 
-## Запуск v0.7
+Скопіюй `NXLoad.nro` у `switch/` і запусти через Homebrew Menu.
 
-Скопіюй `Switch-Download-Probe.nro` до `switch/`. Для браузерних тестів утримуй **R** під час запуску гри з HOME, щоб відкрити Homebrew Menu в Application mode, а потім вибери `.nro`.
+- **A** відкриває картку гри, а в картці завантажує вибраний файл DLArchive. У списку можуть бути окремі файли базової гри, оновлення й DLC.
+- **L / R** гортають сторінки каталогу NSRoms. **X** відкриває пошук за назвою по всьому каталогу.
+- **Y** перемикає екран завантажень. На ньому видно прогрес і вже збережені файли. **X** скасовує активне завантаження.
+- **A** на екрані збережених файлів відкриває DBI, якщо він є на карті. У DBI вибери файл у `switch/SwitchDownloadProbe/` через Browse SD Card.
+- **B** повертає назад. **+** виходить.
 
-- **ZR** отримує актуальну адресу MySims від DLArchive й завантажує файл на SD напряму. Для цього тесту можна запускати Probe через Альбом. На екрані видно HTTP-коди API та файлового хоста.
-- **R** перевіряє WebApplet на контрольному перенаправленні. Якщо все спрацює, програма отримає адресу, виконає власний GET і запише `switch/SwitchDownloadProbe/webapplet-test.json`.
-- **L** відкриває MegaUp для My Cozy Room в системному браузері. Натисни справжню кнопку завантаження на сторінці й дочекайся штатного таймера. Якщо WebApplet повертає адресу на `e13.megaupdownup.org`, програма виконує власний GET і зберігає файл на SD.
-- **ZL** дає ввести іншу адресу `https://megaup.net/` для того самого браузерного тесту. Збірка очікує перенаправлення на `e13.megaupdownup.org`, який був у попередньому тесті. Інший файловий домен не дасть того самого callback.
-- **X** запускає попередній тест A Pretty Odd Bunny через NSWGF та 1Fichier. **Y** приймає адресу 1Fichier вручну. **A** запускає перевірку Buzzheavier.
-- **B** скасовує фонову передачу або повертає з WebApplet. **+** закриває програму.
-
-Готові файли зберігаються в `switch/SwitchDownloadProbe/`. Підписана адреса MegaUp використовується в пам'яті для одного завантаження.
+NXLoad читає каталог з NSRoms і отримує актуальне посилання від API DLArchive перед кожним завантаженням. Готові файли зберігаються в `switch/SwitchDownloadProbe/`, тож файли попередньої тестової версії доступні в NXLoad.
 
 ## Збірка
 
-У devkitPro потрібні devkitA64, libnx, switch-tools, switch-curl, switch-zlib і switch-libxml2. Запусти `make`. GitHub Actions зберігає готовий NRO як артефакт.
+Потрібні devkitA64, libnx, switch-tools, switch-pkg-config, switch-sdl2, switch-sdl2_ttf, switch-sdl2_image, switch-curl і switch-libxml2. Запусти `make`. GitHub Actions зберігає готовий `NXLoad.nro` в артефакті `NXLoad`.

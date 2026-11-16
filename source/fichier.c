@@ -32,6 +32,7 @@ typedef struct {
     bool text;
     bool attachment;
     bool binary;
+    bool allow_file;
     FILE *file;
     char partial[256];
     const char *error;
@@ -142,7 +143,8 @@ static size_t on_body(char *data, size_t size, size_t count, void *arg) {
     Transfer *t = arg;
     size_t n = size * count;
     if (atomic_load(&t->job->cancelled)) return 0;
-    if (t->status == 200 && !t->challenge && !t->text && (t->attachment || t->binary)) {
+    if (t->allow_file && t->status == 200 && !t->challenge && !t->text &&
+        (t->attachment || t->binary)) {
         if (!t->file && !open_partial(t)) return 0;
         size_t written = fwrite(data, 1, n, t->file);
         atomic_fetch_add(&t->job->received, written);
@@ -267,6 +269,70 @@ static bool download_anchor(xmlNodePtr node, const char *base, char next[URL_CAP
     return false;
 }
 
+static bool in_download_spoiler(xmlNodePtr node) {
+    for (xmlNodePtr parent = node->parent; parent; parent = parent->parent) {
+        if (!node_is(parent, "div")) continue;
+        xmlChar *classes = xmlGetProp(parent, BAD_CAST "class");
+        bool match = classes && strstr((const char *)classes, "su-spoiler-content");
+        xmlFree(classes);
+        if (match) return true;
+    }
+    return false;
+}
+
+static bool base_game_row(xmlNodePtr node) {
+    xmlChar *text = xmlNodeGetContent(node);
+    if (!text) return false;
+    const char *p = (const char *)text;
+    while (isspace((unsigned char)*p)) ++p;
+    bool match = !strncasecmp(p, "game:", 5) ||
+        !strncasecmp(p, "base game", 9) ||
+        !strncasecmp(p, "base:", 5);
+    xmlFree(text);
+    return match;
+}
+
+static bool fichier_link(xmlNodePtr node, char out[URL_CAPACITY]) {
+    for (; node; node = node->next) {
+        if (node_is(node, "a")) {
+            xmlChar *href = xmlGetProp(node, BAD_CAST "href");
+            bool valid = href && resolve_url(NULL, (const char *)href, out);
+            xmlFree(href);
+            if (valid) return true;
+        }
+        if (fichier_link(node->children, out)) return true;
+    }
+    return false;
+}
+
+static bool find_base_mirror(xmlNodePtr node, char out[URL_CAPACITY]) {
+    for (; node; node = node->next) {
+        if (node_is(node, "p") && in_download_spoiler(node) &&
+            base_game_row(node) && fichier_link(node->children, out)) return true;
+        if (find_base_mirror(node->children, out)) return true;
+    }
+    return false;
+}
+
+static bool resolve_bunny(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
+    FichierJob *job = t->job;
+    curl_easy_setopt(curl, CURLOPT_URL, BUNNY_NSWGF_URL);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    CURLcode code = curl_easy_perform(curl);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->http);
+    if (code != CURLE_OK || job->http != 200 || t->challenge) {
+        job->result = "NSWGF unavailable. Use Y to enter a 1Fichier link.";
+        return false;
+    }
+    htmlDocPtr doc = htmlReadMemory(t->html, (int)t->length, NULL, NULL,
+        HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
+    bool found = doc && find_base_mirror(xmlDocGetRootElement(doc), out);
+    xmlFreeDoc(doc);
+    if (!found) job->result = "No base-game 1Fichier link found. Use Y.";
+    return found;
+}
+
 static const char *page_error(const Transfer *t) {
     if (t->challenge || strcasestr(t->html, "just a moment") ||
         strcasestr(t->html, "cf-turnstile") || strcasestr(t->html, "h-captcha") ||
@@ -300,7 +366,7 @@ void fichier_download(FichierJob *job) {
     char url[URL_CAPACITY], next[URL_CAPACITY], referrer[URL_CAPACITY] = {0};
     bool posting = false;
     unsigned forms = 0;
-    if (!curl || !data || !t.html || !resolve_url(NULL, job->url, url)) goto done;
+    if (!curl || !data || !t.html) goto done;
 
 #if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
@@ -311,7 +377,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.3");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.4");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
@@ -320,6 +386,17 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_progress);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &t);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+    if (!strcmp(job->url, BUNNY_NSWGF_URL)) {
+        if (!resolve_bunny(curl, &t, url)) goto done;
+        job->http = 0;
+    } else if (!resolve_url(NULL, job->url, url)) {
+        job->result = "Invalid 1Fichier link";
+        goto done;
+    }
+    t.allow_file = true;
+    char initial_url[URL_CAPACITY];
+    strcpy(initial_url, url);
 
     for (unsigned hop = 0; hop < 10 && !atomic_load(&job->cancelled); ++hop) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -377,7 +454,7 @@ void fichier_download(FichierJob *job) {
                 }
                 atomic_store(&job->waiting, 0);
                 if (atomic_load(&job->cancelled)) goto done;
-                snprintf(next, sizeof(next), "%s", job->url);
+                strcpy(next, initial_url);
                 forms = 0;
                 posting = false;
             } else {

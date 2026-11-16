@@ -18,8 +18,8 @@
 #define SHARE_URL ORIGIN "/" FILE_ID
 #define DOWNLOAD_PATH "/" FILE_ID "/download"
 #define TITLE "My Cozy Room"
-#define APP_HEADING "Switch Download Probe 0.3\n" TITLE
-#define CONTROLS "A: Buzzheavier    X: 1Fichier    +: exit\n"
+#define APP_HEADING "Switch Download Probe 0.4"
+#define CONTROLS "X: A Pretty Odd Bunny    Y: enter 1Fichier link\nA: Buzzheavier check     +: exit\n"
 #define HTML_LIMIT (256 * 1024)
 #define URL_LIMIT 2048
 
@@ -134,7 +134,7 @@ static void run_probe(Probe *result) {
 #else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
 #endif
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.3");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.4");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 9000L);
@@ -214,6 +214,50 @@ static void download_worker(void *arg) {
     fichier_download(arg);
 }
 
+static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
+    SwkbdConfig keyboard;
+    char input[FICHIER_INPUT_CAPACITY] = {0};
+    Result rc = swkbdCreate(&keyboard, 0);
+    if (R_FAILED(rc)) {
+        printf("Keyboard unavailable: 0x%08x\n", (unsigned)rc);
+        return false;
+    }
+
+    swkbdConfigMakePresetDefault(&keyboard);
+    swkbdConfigSetHeaderText(&keyboard, "1Fichier");
+    swkbdConfigSetGuideText(&keyboard, "Enter a 1Fichier link or just the file ID");
+    swkbdConfigSetOkButtonText(&keyboard, "Start");
+    swkbdConfigSetStringLenMax(&keyboard, FICHIER_INPUT_CAPACITY - 1);
+    swkbdConfigSetReturnButtonFlag(&keyboard, false);
+    rc = swkbdShow(&keyboard, input, sizeof(input));
+    swkbdClose(&keyboard);
+    if (R_FAILED(rc) || !input[0]) return false;
+
+    input[strcspn(input, "\r\n")] = 0;
+    char *code = input;
+    while (isspace((unsigned char)*code)) ++code;
+    const char *prefixes[] = {
+        "https://1fichier.com/?", "https://www.1fichier.com/?",
+        "1fichier.com/?", "www.1fichier.com/?"
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
+        size_t n = strlen(prefixes[i]);
+        if (!strncasecmp(code, prefixes[i], n)) {
+            code += n;
+            break;
+        }
+    }
+    size_t length = strspn(code, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
+    char *end = code + length;
+    while (isspace((unsigned char)*end)) ++end;
+    if (length < 6 || length > 64 || (*end && *end != '&')) {
+        printf("Expected a 1Fichier URL or file ID.\n");
+        return false;
+    }
+    snprintf(url, FICHIER_INPUT_CAPACITY, "https://1fichier.com/?%.*s", (int)length, code);
+    return true;
+}
+
 static void show_download(const FichierJob *job) {
     uint_fast64_t received = atomic_load(&job->received);
     uint_fast64_t total = atomic_load(&job->total);
@@ -225,7 +269,7 @@ static void show_download(const FichierJob *job) {
         printf("Received: %" PRIuFAST64 " bytes\n", received);
         if (total) printf("Total:    %" PRIuFAST64 " bytes\n", total);
     } else {
-        printf("Opening 1Fichier over HTTPS...\n");
+        printf("Looking up the download over HTTPS...\n");
     }
     printf("\nB: cancel\n");
 }
@@ -248,7 +292,8 @@ int main(void) {
     bool busy = false, downloading = false;
     unsigned frame = 0;
     Probe result;
-    FichierJob job = { .url = FICHIER_SHARE_URL };
+    char entered_url[FICHIER_INPUT_CAPACITY] = {0};
+    FichierJob job = { .url = BUNNY_NSWGF_URL };
     atomic_init(&job.cancelled, false);
     atomic_init(&job.received, 0);
     atomic_init(&job.total, 0);
@@ -260,10 +305,19 @@ int main(void) {
         if (busy && downloading && (buttons & HidNpadButton_B)) {
             atomic_store(&job.cancelled, true);
         }
-        if (!busy && !curl_init && (buttons & (HidNpadButton_A | HidNpadButton_X))) {
+        if (!busy && !curl_init && (buttons & (HidNpadButton_A | HidNpadButton_X | HidNpadButton_Y))) {
             downloading = !(buttons & HidNpadButton_A);
             consoleClear();
             if (downloading) {
+                job.url = BUNNY_NSWGF_URL;
+                if (buttons & HidNpadButton_Y) {
+                    if (!enter_fichier_url(entered_url)) {
+                        printf("\n" CONTROLS);
+                        consoleUpdate(NULL);
+                        continue;
+                    }
+                    job.url = entered_url;
+                }
                 atomic_store(&job.cancelled, false);
                 atomic_store(&job.received, 0);
                 atomic_store(&job.total, 0);
@@ -272,7 +326,7 @@ int main(void) {
                 job.http = 0;
                 show_download(&job);
             } else {
-                printf(APP_HEADING " | Buzzheavier\n\nChecking over HTTPS...\n");
+                printf(APP_HEADING " | " TITLE " / Buzzheavier\n\nChecking over HTTPS...\n");
             }
             ThreadFunc task = downloading ? download_worker : probe_worker;
             void *arg = downloading ? (void *)&job : (void *)&result;
@@ -294,7 +348,7 @@ int main(void) {
                 printf("Received: %" PRIuFAST64 " bytes\n", atomic_load(&job.received));
                 if (!strcmp(job.result, "Download saved")) printf("\n%s\n", job.path);
             } else {
-                printf(APP_HEADING " | Buzzheavier\n\n");
+                printf(APP_HEADING " | " TITLE " / Buzzheavier\n\n");
                 print_result(&result);
             }
             printf("\n" CONTROLS);
@@ -318,7 +372,7 @@ int main(int argc, char **argv) {
     CURLcode init = curl_global_init(CURL_GLOBAL_DEFAULT);
     if (init) return 1;
     if (argc > 1 && !strcmp(argv[1], "1fichier")) {
-        FichierJob job = { .url = argc > 2 ? argv[2] : FICHIER_SHARE_URL };
+        FichierJob job = { .url = argc > 2 ? argv[2] : BUNNY_NSWGF_URL };
         atomic_init(&job.cancelled, false);
         atomic_init(&job.received, 0);
         atomic_init(&job.total, 0);

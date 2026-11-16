@@ -4,7 +4,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
-#define FICHIER_SHARE_URL "https://1fichier.com/?u5n5c73gd1sgod2gegpx"
+#define FICHIER_INPUT_CAPACITY 256
+#define BUNNY_NSWGF_URL "https://nswgf.com/a-pretty-odd-bunny-nintendo-switch-nsp-xci-nsz-download-free/"
 
 typedef struct {
     atomic_bool cancelled;

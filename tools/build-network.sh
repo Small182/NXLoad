@@ -24,7 +24,6 @@ checkout mbedtls https://github.com/Mbed-TLS/mbedtls.git 068ff080b369adfac81509f
 checkout curl https://github.com/curl/curl.git 3163ec065643ba20709f190111f42c3e1fe95273
 
 source "$DEVKITPRO/switchvars.sh"
-export LDFLAGS="$LDFLAGS -specs=$DEVKITPRO/libnx/switch.specs"
 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$PORTLIBS_PREFIX/lib/pkgconfig"
 
 config="$deps/mbedtls/include/mbedtls/mbedtls_config.h"

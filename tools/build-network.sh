@@ -30,6 +30,10 @@ config="$deps/mbedtls/include/mbedtls/mbedtls_config.h"
 config_py="$deps/mbedtls/scripts/config.py"
 python3 "$config_py" -f "$config" set MBEDTLS_ENTROPY_HARDWARE_ALT
 python3 "$config_py" -f "$config" set MBEDTLS_NO_PLATFORM_ENTROPY
+python3 "$config_py" -f "$config" set MBEDTLS_PLATFORM_MS_TIME_ALT
+python3 "$config_py" -f "$config" set MBEDTLS_THREADING_C
+python3 "$config_py" -f "$config" set MBEDTLS_THREADING_ALT
+cp "$repo/tools/threading_alt.h" "$deps/mbedtls/include/mbedtls/threading_alt.h"
 python3 "$config_py" -f "$config" unset MBEDTLS_NET_C
 python3 "$config_py" -f "$config" unset MBEDTLS_TIMING_C
 for option in MBEDTLS_SSL_PROTO_DTLS MBEDTLS_SSL_DTLS_CONNECTION_ID \

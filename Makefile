@@ -37,7 +37,7 @@ all:
 clean:
 	rm -rf build $(TARGET).elf $(TARGET).nacp $(TARGET).nro
 else
-OFILES := main.o catalog.o fichier.o tls_entropy.o
+OFILES := main.o catalog.o fichier.o tls_platform.o
 all: $(OUTPUT).nro
 $(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp
 $(OUTPUT).elf: $(OFILES)

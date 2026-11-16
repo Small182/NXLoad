@@ -630,7 +630,11 @@ static TTF_Font *font_open(const PlFontData *font, int points) {
     return memory ? TTF_OpenFontRW(memory, 1, points) : NULL;
 }
 
+void nx_tls_threading_init(void);
+void nx_tls_threading_exit(void);
+
 int main(void) {
+    nx_tls_threading_init();
     bool romfs_ready = R_SUCCEEDED(romfsInit());
     Result entropy = csrngInitialize();
     Result sockets = socketInitializeDefault();
@@ -721,6 +725,7 @@ int main(void) {
     SDL_Quit();
     if (R_SUCCEEDED(font_service)) plExit();
     if (curl_ready) curl_global_cleanup();
+    nx_tls_threading_exit();
     if (R_SUCCEEDED(sockets)) socketExit();
     if (R_SUCCEEDED(entropy)) csrngExit();
     if (romfs_ready) romfsExit();

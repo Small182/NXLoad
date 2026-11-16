@@ -17,5 +17,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: NXLoad
-          path: Switch-Download-Probe.nro
+          path: NXLoad.nro
           if-no-files-found: error

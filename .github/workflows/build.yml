@@ -13,6 +13,8 @@ jobs:
     container: devkitpro/devkita64:latest
     steps:
       - uses: actions/checkout@v4
+      - name: Build curl and Mbed TLS for Switch
+        run: bash tools/build-network.sh
       - run: make -j2
       - name: Check DLArchive TLS chain
         continue-on-error: true
@@ -20,7 +22,7 @@ jobs:
           status=0
           timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
             -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
-            -verify_return_error -CAfile romfs/dlarchive-roots.pem -no-CApath -no-CAstore \
+            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
             < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
           sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
           exit "$status"

@@ -14,6 +14,6 @@ NXLoad читає каталог з NSRoms і отримує актуальне 
 
 ## Збірка
 
-Потрібні devkitA64, libnx, switch-tools, switch-pkg-config, switch-sdl2, switch-sdl2_ttf, switch-sdl2_image, switch-curl і switch-libxml2. Запусти `make`. GitHub Actions зберігає готовий `NXLoad.nro` в артефакті `NXLoad`.
+Потрібні devkitA64, libnx, switch-tools, switch-pkg-config, switch-sdl2, switch-sdl2_ttf, switch-sdl2_image, switch-libxml2 і switch-zlib. Запусти `bash tools/build-network.sh`, потім `make`. GitHub Actions зберігає готовий `NXLoad.nro` в артефакті `NXLoad`.
 
-Для повторної TLS-перевірки файлового сервера NXLoad містить набір публічних кореневих сертифікатів [Mozilla CA](https://curl.se/docs/caextract.html), ліцензія MPL 2.0.
+NXLoad перевіряє HTTPS через Mbed TLS з вбудованим набором публічних кореневих сертифікатів [Mozilla CA](https://curl.se/docs/caextract.html), ліцензія MPL 2.0.

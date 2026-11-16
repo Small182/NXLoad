@@ -2,3 +2,5 @@
 /*.elf
 /*.nacp
 /*.nro
+/.nxdeps/
+/romfs/licenses/

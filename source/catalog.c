@@ -58,7 +58,8 @@ static Buffer fetch(atomic_bool *cancel, const char *url, size_t limit, long *st
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 16L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.2");
+    curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);

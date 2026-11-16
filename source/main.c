@@ -590,6 +590,8 @@ static void draw_downloads(void) {
                      app.download.result, app.download.api_http, app.download.http);
         }
         text(app.small, line, 66, 249, 1148, blue);
+        if (app.download_finished)
+            text(app.small, app.download.tls_detail, 66, 270, 1148, gray);
     }
     text(app.normal, "Збережені файли", 66, 290, 1100, white);
     size_t first = first_visible(app.saved_index, FILE_ROWS);
@@ -602,7 +604,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.1", 206, 44, 120, gray);
+    text(app.small, "1.0.2", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -630,8 +632,9 @@ static TTF_Font *font_open(const PlFontData *font, int points) {
 
 int main(void) {
     bool romfs_ready = R_SUCCEEDED(romfsInit());
+    Result entropy = csrngInitialize();
     Result sockets = socketInitializeDefault();
-    bool curl_ready = R_SUCCEEDED(sockets) && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    bool curl_ready = romfs_ready && R_SUCCEEDED(entropy) && R_SUCCEEDED(sockets) && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     Result font_service = plInitialize(PlServiceType_User);
     PlFontData font = {0};
     bool ok = curl_ready && R_SUCCEEDED(font_service) &&
@@ -719,6 +722,7 @@ int main(void) {
     if (R_SUCCEEDED(font_service)) plExit();
     if (curl_ready) curl_global_cleanup();
     if (R_SUCCEEDED(sockets)) socketExit();
+    if (R_SUCCEEDED(entropy)) csrngExit();
     if (romfs_ready) romfsExit();
     return 0;
 }

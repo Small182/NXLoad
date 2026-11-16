@@ -8,7 +8,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := Switch-Download-Probe
 APP_TITLE := Switch Download Probe
 APP_AUTHOR := Homebrew
-APP_VERSION := 0.5.0
+APP_VERSION := 0.6.0
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)

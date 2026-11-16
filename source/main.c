@@ -20,7 +20,7 @@
 #define SHARE_URL ORIGIN "/" FILE_ID
 #define DOWNLOAD_PATH "/" FILE_ID "/download"
 #define TITLE "My Cozy Room"
-#define APP_HEADING "Switch Download Probe 0.5"
+#define APP_HEADING "Switch Download Probe 0.6"
 #define CONTROLS "L: MegaUp browser     ZL: enter MegaUp link\n" \
                  "R: WebApplet control  X: A Pretty Odd Bunny\n" \
                  "Y: 1Fichier link      A: Buzzheavier check    +: exit\n"
@@ -143,7 +143,7 @@ static void run_probe(Probe *result) {
 #else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
 #endif
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.5");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.6");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 9000L);
@@ -272,19 +272,82 @@ static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
     return true;
 }
 
+static Result set_compact_web_whitelist(WebCommonConfig *config, const char *allowed) {
+    // libnx reserves 0x1000 bytes for a whitelist. Along with the URL and callback
+    // fields, that exceeds the 0x2000 argument buffer. Store only the used bytes.
+    unsigned char *buffer = config->arg.data;
+    const size_t capacity = sizeof(config->arg.data);
+    const size_t length = strlen(allowed) + 1;
+    const Result bad_input = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    WebArgHeader header;
+    memcpy(&header, buffer, sizeof(header));
+    size_t offset = sizeof(header);
+    for (unsigned i = 0; i < header.total_entries; ++i) {
+        if (capacity - offset < sizeof(WebArgTLV)) return bad_input;
+        WebArgTLV tlv;
+        memcpy(&tlv, buffer + offset, sizeof(tlv));
+        offset += sizeof(tlv);
+        if (tlv.size > capacity - offset || tlv.type == WebArgType_Whitelist) return bad_input;
+        offset += tlv.size;
+    }
+    if (header.total_entries == UINT16_MAX || length > 0x1000 ||
+        capacity - offset < sizeof(WebArgTLV) + length) return bad_input;
+
+    const WebArgTLV tlv = { .type = WebArgType_Whitelist, .size = (u16)length };
+    memcpy(buffer + offset, &tlv, sizeof(tlv));
+    memcpy(buffer + offset + sizeof(tlv), allowed, length);
+    ++header.total_entries;
+    memcpy(buffer, &header, sizeof(header));
+    return 0;
+}
+
+static void print_web_context(void) {
+    u32 version = hosversionGet();
+    printf("Horizon %u.%u.%u | Applet type %d\n\n",
+           (unsigned)((version >> 16) & 0xff), (unsigned)((version >> 8) & 0xff),
+           (unsigned)(version & 0xff), (int)appletGetAppletType());
+}
+
 static bool open_web_callback(const char *initial, const char *allowed, const char *callback,
                               char result[URL_LIMIT]) {
+    if (appletGetAppletType() != AppletType_Application) {
+        consoleClear();
+        printf(APP_HEADING " | WebApplet\n\n");
+        print_web_context();
+        printf("WebApplet needs Application mode.\n");
+        printf("From HOME, hold R while launching a game to open hbmenu.\n");
+        return false;
+    }
+
     WebCommonConfig config;
     WebCommonReply reply;
-    Result rc = webPageCreate(&config, initial);
-    if (R_SUCCEEDED(rc)) rc = webConfigSetWhitelist(&config, allowed);
-    if (R_SUCCEEDED(rc)) rc = webConfigSetCallbackUrl(&config, callback);
-    if (R_SUCCEEDED(rc)) rc = webConfigShow(&config, &reply);
+    // The control stays on one host, so WebNews can use its initial-host rule.
+    const char *stage = "create";
+    Result rc = allowed ? webPageCreate(&config, initial) : webNewsCreate(&config, initial);
+    if (R_SUCCEEDED(rc) && !allowed) {
+        stage = "control options";
+        rc = webConfigSetEcClientCert(&config, false);
+        if (R_SUCCEEDED(rc)) rc = webConfigSetShopJump(&config, false);
+    }
+    if (R_SUCCEEDED(rc)) {
+        stage = "callback config";
+        rc = webConfigSetCallbackUrl(&config, callback);
+    }
+    if (R_SUCCEEDED(rc) && allowed) {
+        stage = "compact whitelist";
+        rc = set_compact_web_whitelist(&config, allowed);
+    }
+    if (R_SUCCEEDED(rc)) {
+        stage = "launch/reply";
+        rc = webConfigShow(&config, &reply);
+    }
 
     consoleClear();
     printf(APP_HEADING " | WebApplet\n\n");
+    print_web_context();
     if (R_FAILED(rc)) {
-        printf("WebApplet error: 0x%08x\n", (unsigned)rc);
+        printf("WebApplet %s: 0x%08x (%u/%u)\n", stage, (unsigned)rc,
+               (unsigned)R_MODULE(rc), (unsigned)R_DESCRIPTION(rc));
         return false;
     }
     WebExitReason reason;
@@ -327,7 +390,7 @@ static bool megaup_callback(u64 buttons, char callback[URL_LIMIT]) {
         "^https://megaup[.]net/.*\n"
         "^https://download[.]megaup[.]net/.*\n"
         "^https://challenges[.]cloudflare[.]com/.*\n"
-        "^https://e13[.]megaupdownup[.]org/.*\n";
+        "^https://e13[.]megaupdownup[.]org/.*";
     return open_web_callback(start, whitelist, MEGAUP_CALLBACK_URL, callback);
 }
 
@@ -335,8 +398,7 @@ static void run_web_control(void) {
     char url[URL_LIMIT] = {0};
     printf(APP_HEADING " | WebApplet control\n\nOpening a known HTTPS redirect...\n");
     consoleUpdate(NULL);
-    if (!open_web_callback(CONTROL_START_URL, "^https://httpbingo[.]org/.*\n",
-                           CONTROL_CALLBACK_URL, url)) return;
+    if (!open_web_callback(CONTROL_START_URL, NULL, CONTROL_CALLBACK_URL, url)) return;
     if (strcmp(url, CONTROL_CALLBACK_URL)) {
         printf("Unexpected control callback address.\n");
         return;

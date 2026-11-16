@@ -2,9 +2,9 @@
 
 Нативна діагностика завантажень на Nintendo Switch через інтернет із записом на microSD.
 
-## Запуск v0.5
+## Запуск v0.6
 
-Скопіюй `Switch-Download-Probe.nro` до `switch/` і запусти через Homebrew Menu.
+Скопіюй `Switch-Download-Probe.nro` до `switch/`. Для браузерних тестів утримуй **R** під час запуску гри з HOME, щоб відкрити Homebrew Menu в Application mode, а потім вибери `.nro`.
 
 - **R** перевіряє WebApplet на контрольному перенаправленні. Якщо все спрацює, програма отримає адресу, виконає власний GET і запише `switch/SwitchDownloadProbe/webapplet-test.json`.
 - **L** відкриває MegaUp для My Cozy Room в системному браузері. Натисни справжню кнопку завантаження на сторінці й дочекайся штатного таймера. Якщо WebApplet повертає адресу на `e13.megaupdownup.org`, програма виконує власний GET і зберігає файл на SD.

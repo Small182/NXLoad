@@ -48,7 +48,9 @@ aarch64-none-elf-cmake -S "$deps/mbedtls" -B "$deps/mbedtls-build" \
 cmake --build "$deps/mbedtls-build" --parallel 4
 cmake --install "$deps/mbedtls-build"
 
+CFLAGS="-I$prefix/include $CFLAGS" \
 aarch64-none-elf-cmake -S "$deps/curl" -B "$deps/curl-build" \
+    -DCMAKE_NO_SYSTEM_FROM_IMPORTED=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_CURL_EXE=OFF \
     -DBUILD_TESTING=OFF -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF \
@@ -61,6 +63,17 @@ aarch64-none-elf-cmake -S "$deps/curl" -B "$deps/curl-build" \
     -DMBEDTLS_LIBRARY="$prefix/lib/libmbedtls.a" \
     -DMBEDX509_LIBRARY="$prefix/lib/libmbedx509.a" \
     -DMBEDCRYPTO_LIBRARY="$prefix/lib/libmbedcrypto.a"
+python3 - "$deps/curl-build/compile_commands.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    commands = json.load(f)
+for item in commands:
+    if item["file"].endswith("/lib/md5.c"):
+        print(item["command"])
+        break
+PY
 cmake --build "$deps/curl-build" --parallel 4
 cmake --install "$deps/curl-build"
 

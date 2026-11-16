@@ -48,6 +48,7 @@ aarch64-none-elf-cmake -S "$deps/mbedtls" -B "$deps/mbedtls-build" \
 cmake --build "$deps/mbedtls-build" --parallel 4
 cmake --install "$deps/mbedtls-build"
 
+cp "$PORTLIBS_PREFIX/include/zlib.h" "$PORTLIBS_PREFIX/include/zconf.h" "$prefix/include/"
 CFLAGS="-I$prefix/include $CFLAGS" \
 aarch64-none-elf-cmake -S "$deps/curl" -B "$deps/curl-build" \
     -DCMAKE_NO_SYSTEM_FROM_IMPORTED=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
@@ -55,8 +56,10 @@ aarch64-none-elf-cmake -S "$deps/curl" -B "$deps/curl-build" \
     -DBUILD_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_CURL_EXE=OFF \
     -DBUILD_TESTING=OFF -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF \
     -DHTTP_ONLY=ON -DENABLE_IPV6=OFF -DENABLE_UNIX_SOCKETS=OFF \
-    -DENABLE_THREADED_RESOLVER=OFF -DUSE_ARES=OFF -DUSE_NGHTTP2=OFF \
+    -DENABLE_THREADED_RESOLVER=OFF -DENABLE_ARES=OFF -DUSE_NGHTTP2=OFF \
     -DCURL_USE_LIBPSL=OFF -DCURL_USE_OPENSSL=OFF -DCURL_USE_MBEDTLS=ON \
+    -DCURL_USE_LIBSSH2=OFF -DUSE_LIBIDN2=OFF \
+    -DZLIB_INCLUDE_DIR="$prefix/include" -DZLIB_LIBRARY="$PORTLIBS_PREFIX/lib/libz.a" \
     -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DCURL_ZLIB=ON \
     -DCURL_CA_BUNDLE=romfs:/cacert.pem -DCURL_CA_PATH=none \
     -DMBEDTLS_INCLUDE_DIR="$prefix/include" \

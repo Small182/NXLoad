@@ -44,25 +44,36 @@ static bool in_domain(const char *host, const char *domain) {
         (n > m && host[n - m - 1] == '.' && !strcasecmp(host + n - m, domain));
 }
 
-static bool resolve_url(const char *base, const char *target, char out[URL_CAPACITY]) {
+static bool resolve_host_url(const char *base, const char *target,
+                             char out[URL_CAPACITY], bool megaup) {
     if (!target || !*target) return false;
     CURLU *parsed = curl_url();
     if (!parsed) return false;
-    char *scheme = NULL, *host = NULL, *url = NULL, *port = NULL;
+    char *scheme = NULL, *host = NULL, *url = NULL, *port = NULL, *query = NULL;
     bool ok = (!base || !curl_url_set(parsed, CURLUPART_URL, base, CURLU_DISALLOW_USER)) &&
         !curl_url_set(parsed, CURLUPART_URL, target, CURLU_DISALLOW_USER) &&
         !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) && !strcmp(scheme, "https") &&
         !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
-        (in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
+        (megaup ? !strcasecmp(host, MEGAUP_FILE_HOST) :
+            in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
         !curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) && !strcmp(port, "443") &&
         !curl_url_get(parsed, CURLUPART_URL, &url, 0) && strlen(url) < URL_CAPACITY;
+    if (ok && megaup) {
+        ok = !curl_url_get(parsed, CURLUPART_QUERY, &query, 0) &&
+            !strncmp(query, "download_token=", 15) && query[15] && query[15] != '&';
+    }
     if (ok) strcpy(out, url);
+    curl_free(query);
     curl_free(scheme);
     curl_free(host);
     curl_free(url);
     curl_free(port);
     curl_url_cleanup(parsed);
     return ok;
+}
+
+static bool resolve_url(const char *base, const char *target, char out[URL_CAPACITY]) {
+    return resolve_host_url(base, target, out, false);
 }
 
 static bool same_host(const char *a, const char *b) {
@@ -116,7 +127,8 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
 }
 
 static bool open_partial(Transfer *t) {
-    const char *name = t->name[0] ? t->name : "1fichier-download.bin";
+    const char *fallback = t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
+    const char *name = t->name[0] ? t->name : fallback;
     snprintf(t->job->path, sizeof(t->job->path), "%s/%s", OUTPUT_DIR, name);
     snprintf(t->partial, sizeof(t->partial), "%s/%s.part", OUTPUT_DIR, name);
     struct stat info;
@@ -355,7 +367,7 @@ static unsigned wait_seconds(const char *html) {
 }
 
 void fichier_download(FichierJob *job) {
-    job->result = "1Fichier setup failed";
+    job->result = "Download setup failed";
     if (mkdir(OUTPUT_DIR, 0777) && errno != EEXIST) {
         job->result = "Cannot create download directory on SD";
         return;
@@ -377,7 +389,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.4");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.5");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
@@ -387,7 +399,12 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &t);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 
-    if (!strcmp(job->url, BUNNY_NSWGF_URL)) {
+    if (job->megaup) {
+        if (!resolve_host_url(NULL, job->url, url, true)) {
+            job->result = "Unexpected MegaUp file address";
+            goto done;
+        }
+    } else if (!strcmp(job->url, BUNNY_NSWGF_URL)) {
         if (!resolve_bunny(curl, &t, url)) goto done;
         job->http = 0;
     } else if (!resolve_url(NULL, job->url, url)) {
@@ -425,6 +442,12 @@ void fichier_download(FichierJob *job) {
         }
         if (code != CURLE_OK || t.error) {
             job->result = t.error ? t.error : curl_easy_strerror(code);
+            goto done;
+        }
+        if (job->megaup) {
+            job->result = t.status == 401 || t.status == 403 || t.challenge ?
+                "MegaUp file host rejected the native GET" :
+                "MegaUp file host did not return an archive";
             goto done;
         }
         const char *error = page_error(&t);

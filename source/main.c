@@ -4,6 +4,8 @@
 #include <curl/curl.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,8 +20,15 @@
 #define SHARE_URL ORIGIN "/" FILE_ID
 #define DOWNLOAD_PATH "/" FILE_ID "/download"
 #define TITLE "My Cozy Room"
-#define APP_HEADING "Switch Download Probe 0.4"
-#define CONTROLS "X: A Pretty Odd Bunny    Y: enter 1Fichier link\nA: Buzzheavier check     +: exit\n"
+#define APP_HEADING "Switch Download Probe 0.5"
+#define CONTROLS "L: MegaUp browser     ZL: enter MegaUp link\n" \
+                 "R: WebApplet control  X: A Pretty Odd Bunny\n" \
+                 "Y: 1Fichier link      A: Buzzheavier check    +: exit\n"
+#define MEGAUP_SAMPLE_URL "https://megaup.net/bde566e21b5f549831bafb99218f8081/" \
+                          "My_Cozy_Room_%5B0100A21021442000%5D%5Bv0%5D%5BUS%5D.nsp.rar"
+#define MEGAUP_CALLBACK_URL "https://" MEGAUP_FILE_HOST "/"
+#define CONTROL_START_URL "https://httpbingo.org/relative-redirect/1"
+#define CONTROL_CALLBACK_URL "https://httpbingo.org/get"
 #define HTML_LIMIT (256 * 1024)
 #define URL_LIMIT 2048
 
@@ -134,7 +143,7 @@ static void run_probe(Probe *result) {
 #else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
 #endif
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.4");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.5");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 9000L);
@@ -214,9 +223,10 @@ static void download_worker(void *arg) {
     fichier_download(arg);
 }
 
-static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
+static bool enter_link(const char *title, const char *guide,
+                       char input[FICHIER_INPUT_CAPACITY]) {
     SwkbdConfig keyboard;
-    char input[FICHIER_INPUT_CAPACITY] = {0};
+    input[0] = 0;
     Result rc = swkbdCreate(&keyboard, 0);
     if (R_FAILED(rc)) {
         printf("Keyboard unavailable: 0x%08x\n", (unsigned)rc);
@@ -224,15 +234,19 @@ static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
     }
 
     swkbdConfigMakePresetDefault(&keyboard);
-    swkbdConfigSetHeaderText(&keyboard, "1Fichier");
-    swkbdConfigSetGuideText(&keyboard, "Enter a 1Fichier link or just the file ID");
+    swkbdConfigSetHeaderText(&keyboard, title);
+    swkbdConfigSetGuideText(&keyboard, guide);
     swkbdConfigSetOkButtonText(&keyboard, "Start");
     swkbdConfigSetStringLenMax(&keyboard, FICHIER_INPUT_CAPACITY - 1);
     swkbdConfigSetReturnButtonFlag(&keyboard, false);
-    rc = swkbdShow(&keyboard, input, sizeof(input));
+    rc = swkbdShow(&keyboard, input, FICHIER_INPUT_CAPACITY);
     swkbdClose(&keyboard);
-    if (R_FAILED(rc) || !input[0]) return false;
+    return R_SUCCEEDED(rc) && input[0];
+}
 
+static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
+    char input[FICHIER_INPUT_CAPACITY] = {0};
+    if (!enter_link("1Fichier", "Enter a 1Fichier link or just the file ID", input)) return false;
     input[strcspn(input, "\r\n")] = 0;
     char *code = input;
     while (isspace((unsigned char)*code)) ++code;
@@ -258,12 +272,130 @@ static bool enter_fichier_url(char url[FICHIER_INPUT_CAPACITY]) {
     return true;
 }
 
+static bool open_web_callback(const char *initial, const char *allowed, const char *callback,
+                              char result[URL_LIMIT]) {
+    WebCommonConfig config;
+    WebCommonReply reply;
+    Result rc = webPageCreate(&config, initial);
+    if (R_SUCCEEDED(rc)) rc = webConfigSetWhitelist(&config, allowed);
+    if (R_SUCCEEDED(rc)) rc = webConfigSetCallbackUrl(&config, callback);
+    if (R_SUCCEEDED(rc)) rc = webConfigShow(&config, &reply);
+
+    consoleClear();
+    printf(APP_HEADING " | WebApplet\n\n");
+    if (R_FAILED(rc)) {
+        printf("WebApplet error: 0x%08x\n", (unsigned)rc);
+        return false;
+    }
+    WebExitReason reason;
+    rc = webReplyGetExitReason(&reply, &reason);
+    if (R_FAILED(rc)) {
+        printf("Could not read exit reason: 0x%08x\n", (unsigned)rc);
+        return false;
+    }
+    printf("WebApplet exit reason: %u\n", (unsigned)reason);
+    if (reason != WebExitReason_LastUrl) {
+        printf("No redirect to the configured file host was captured.\n");
+        return false;
+    }
+    size_t length = 0;
+    result[0] = 0;
+    rc = webReplyGetLastUrl(&reply, result, URL_LIMIT, &length);
+    if (R_FAILED(rc) || !length || length > URL_LIMIT || !result[0]) {
+        printf("No usable callback address returned.\n");
+        return false;
+    }
+    return true;
+}
+
+static bool megaup_callback(u64 buttons, char callback[URL_LIMIT]) {
+    char custom[FICHIER_INPUT_CAPACITY] = {0};
+    const char *start = MEGAUP_SAMPLE_URL;
+    if (buttons & HidNpadButton_ZL) {
+        if (!enter_link("MegaUp", "Enter an https://megaup.net/ file-page link", custom)) return false;
+        if (strncmp(custom, "https://megaup.net/", sizeof("https://megaup.net/") - 1) ||
+            strpbrk(custom, "\r\n\t ")) {
+            printf("Expected an https://megaup.net/ file-page link.\n");
+            return false;
+        }
+        start = custom;
+    }
+
+    printf(APP_HEADING " | MegaUp browser\n\nClick Download in the browser.\n");
+    consoleUpdate(NULL);
+    const char *whitelist =
+        "^https://megaup[.]net/.*\n"
+        "^https://download[.]megaup[.]net/.*\n"
+        "^https://challenges[.]cloudflare[.]com/.*\n"
+        "^https://e13[.]megaupdownup[.]org/.*\n";
+    return open_web_callback(start, whitelist, MEGAUP_CALLBACK_URL, callback);
+}
+
+static void run_web_control(void) {
+    char url[URL_LIMIT] = {0};
+    printf(APP_HEADING " | WebApplet control\n\nOpening a known HTTPS redirect...\n");
+    consoleUpdate(NULL);
+    if (!open_web_callback(CONTROL_START_URL, "^https://httpbingo[.]org/.*\n",
+                           CONTROL_CALLBACK_URL, url)) return;
+    if (strcmp(url, CONTROL_CALLBACK_URL)) {
+        printf("Unexpected control callback address.\n");
+        return;
+    }
+    printf("PASS: WebApplet returned the redirect address.\n");
+    consoleUpdate(NULL);
+
+    char *body = calloc(HTML_LIMIT + 1, 1);
+    CURL *curl = curl_easy_init();
+    if (!body || !curl) {
+        printf("Could not initialize control transfer.\n");
+        free(body);
+        curl_easy_cleanup(curl);
+        return;
+    }
+    Response response = { .body = body };
+    curl_easy_setopt(curl, CURLOPT_URL, CONTROL_CALLBACK_URL);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 12000L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    CURLcode result = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    printf("Native GET: HTTP %ld\n", status);
+    if (result != CURLE_OK || status != 200 || !response.size ||
+        !strstr(body, CONTROL_CALLBACK_URL)) {
+        printf("Control request did not return the expected JSON.\n");
+        free(body);
+        return;
+    }
+    const char *dir = "sdmc:/switch/SwitchDownloadProbe";
+    const char *path = "sdmc:/switch/SwitchDownloadProbe/webapplet-test.json";
+    const char *temp = "sdmc:/switch/SwitchDownloadProbe/webapplet-test.json.part";
+    if (mkdir(dir, 0777) && errno != EEXIST) {
+        printf("Could not create the test directory on SD.\n");
+        free(body);
+        return;
+    }
+    FILE *output = fopen(temp, "wb");
+    bool sent = false;
+    if (output) {
+        size_t written = fwrite(body, 1, response.size, output);
+        if (!fclose(output) && written == response.size && !rename(temp, path)) sent = true;
+        if (!sent) remove(temp);
+    }
+    if (sent) printf("PASS: saved %u bytes to webapplet-test.json.\n", (unsigned)response.size);
+    else printf("Could not save the control file on SD.\n");
+    free(body);
+}
+
 static void show_download(const FichierJob *job) {
     uint_fast64_t received = atomic_load(&job->received);
     uint_fast64_t total = atomic_load(&job->total);
     unsigned waiting = atomic_load(&job->waiting);
     consoleClear();
-    printf(APP_HEADING " | 1Fichier\n\n");
+    printf(APP_HEADING " | %s\n\n", job->megaup ? "MegaUp file" : "1Fichier");
+    if (job->megaup) printf("WebApplet returned the file address.\n");
     if (waiting) printf("Host wait: %u s\n", waiting);
     else if (received) {
         printf("Received: %" PRIuFAST64 " bytes\n", received);
@@ -293,6 +425,7 @@ int main(void) {
     unsigned frame = 0;
     Probe result;
     char entered_url[FICHIER_INPUT_CAPACITY] = {0};
+    char browser_url[URL_LIMIT] = {0};
     FichierJob job = { .url = BUNNY_NSWGF_URL };
     atomic_init(&job.cancelled, false);
     atomic_init(&job.received, 0);
@@ -305,12 +438,28 @@ int main(void) {
         if (busy && downloading && (buttons & HidNpadButton_B)) {
             atomic_store(&job.cancelled, true);
         }
-        if (!busy && !curl_init && (buttons & (HidNpadButton_A | HidNpadButton_X | HidNpadButton_Y))) {
-            downloading = !(buttons & HidNpadButton_A);
+        if (!busy && !curl_init && (buttons & HidNpadButton_R)) {
+            consoleClear();
+            run_web_control();
+            printf("\n" CONTROLS);
+            consoleUpdate(NULL);
+            continue;
+        }
+        if (!busy && !curl_init && (buttons & (HidNpadButton_A | HidNpadButton_X |
+                                              HidNpadButton_Y | HidNpadButton_L | HidNpadButton_ZL))) {
+            job.megaup = (buttons & (HidNpadButton_L | HidNpadButton_ZL)) != 0;
+            downloading = job.megaup || !(buttons & HidNpadButton_A);
             consoleClear();
             if (downloading) {
                 job.url = BUNNY_NSWGF_URL;
-                if (buttons & HidNpadButton_Y) {
+                if (job.megaup) {
+                    if (!megaup_callback(buttons, browser_url)) {
+                        printf("\n" CONTROLS);
+                        consoleUpdate(NULL);
+                        continue;
+                    }
+                    job.url = browser_url;
+                } else if (buttons & HidNpadButton_Y) {
                     if (!enter_fichier_url(entered_url)) {
                         printf("\n" CONTROLS);
                         consoleUpdate(NULL);
@@ -344,7 +493,9 @@ int main(void) {
             busy = false;
             consoleClear();
             if (downloading) {
-                printf(APP_HEADING " | 1Fichier\n\nHTTP: %ld\n%s\n", job.http, job.result);
+                printf(APP_HEADING " | %s\n\n", job.megaup ? "MegaUp file" : "1Fichier");
+                if (job.megaup) printf("WebApplet returned the file address.\n");
+                printf("HTTP: %ld\n%s\n", job.http, job.result);
                 printf("Received: %" PRIuFAST64 " bytes\n", atomic_load(&job.received));
                 if (!strcmp(job.result, "Download saved")) printf("\n%s\n", job.path);
             } else {

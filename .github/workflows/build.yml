@@ -1,6 +1,7 @@
 name: Build Switch probe
 on:
   push:
+  pull_request:
   workflow_dispatch:
 
 permissions:

@@ -19,6 +19,8 @@ typedef struct {
     char path[256];
     const char *url;
     bool megaup;
+    bool megaup_native;
+    const char *stage;
 } FichierJob;
 
 void fichier_download(FichierJob *job);

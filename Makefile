@@ -5,10 +5,20 @@ endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
+ifeq ($(MEGAUP_ONLY),1)
+TARGET := MegaUp-Downloader
+APP_TITLE := MegaUp Downloader
+APP_VERSION := 0.1.0
+ENTRY_OBJECT := megaup_app.o
+BUILD_DIR := build-megaup
+else
 TARGET := Switch-Download-Probe
 APP_TITLE := Switch Download Probe
-APP_AUTHOR := Homebrew
 APP_VERSION := 0.5.0
+ENTRY_OBJECT := main.o
+BUILD_DIR := build
+endif
+APP_AUTHOR := Homebrew
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)
@@ -19,7 +29,7 @@ ifeq ($(TOPDIR),$(CURDIR))
 export TOPDIR
 export OUTPUT := $(CURDIR)/$(TARGET)
 export VPATH := $(CURDIR)/source
-export DEPSDIR := $(CURDIR)/build
+export DEPSDIR := $(CURDIR)/$(BUILD_DIR)
 export INCLUDE := -I$(PORTLIBS)/include -I$(LIBNX)/include -I$(PORTLIBS)/include/libxml2
 export LIBPATHS := -L$(PORTLIBS)/lib -L$(LIBNX)/lib
 export NROFLAGS := --icon=$(LIBNX)/default_icon.jpg --nacp=$(OUTPUT).nacp
@@ -27,13 +37,13 @@ export LD := $(CC)
 
 .PHONY: all clean
 all:
-	@mkdir -p build
-	@$(MAKE) --no-print-directory -C build -f $(TOPDIR)/Makefile
+	@mkdir -p $(BUILD_DIR)
+	@$(MAKE) --no-print-directory -C $(BUILD_DIR) -f $(TOPDIR)/Makefile
 
 clean:
-	rm -rf build $(TARGET).elf $(TARGET).nacp $(TARGET).nro
+	rm -rf $(BUILD_DIR) $(TARGET).elf $(TARGET).nacp $(TARGET).nro
 else
-OFILES := main.o fichier.o
+OFILES := $(ENTRY_OBJECT) fichier.o
 all: $(OUTPUT).nro
 $(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp
 $(OUTPUT).elf: $(OFILES)

@@ -14,8 +14,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make -j2
+      - run: make -j2 MEGAUP_ONLY=1
       - uses: actions/upload-artifact@v4
         with:
           name: Switch-Download-Probe
           path: Switch-Download-Probe.nro
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MegaUp-Downloader
+          path: MegaUp-Downloader.nro
+          if-no-files-found: error
+  megaup-flow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libxml2-dev
+      - run: |
+          cc -std=gnu11 -Wall -Wextra -Werror tests/megaup-flow.c -o /tmp/megaup-flow $(pkg-config --cflags --libs libcurl libxml-2.0)
+          /tmp/megaup-flow

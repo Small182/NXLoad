@@ -18,8 +18,10 @@
 #define URL_CAPACITY 2048
 #ifdef __SWITCH__
 #define OUTPUT_DIR "sdmc:/switch/SwitchDownloadProbe"
+#define MEGAUP_DIR "sdmc:/switch/MegaUpDownloader"
 #else
 #define OUTPUT_DIR "./SwitchDownloadProbe"
+#define MEGAUP_DIR "./MegaUpDownloader"
 #endif
 
 typedef struct {
@@ -33,6 +35,7 @@ typedef struct {
     bool attachment;
     bool binary;
     bool allow_file;
+    bool html_type;
     FILE *file;
     char partial[256];
     const char *error;
@@ -44,36 +47,91 @@ static bool in_domain(const char *host, const char *domain) {
         (n > m && host[n - m - 1] == '.' && !strcasecmp(host + n - m, domain));
 }
 
-static bool resolve_host_url(const char *base, const char *target,
-                             char out[URL_CAPACITY], bool megaup) {
+typedef enum {
+    MEGAUP_INVALID,
+    MEGAUP_SHARE,
+    MEGAUP_GATE,
+    MEGAUP_CONTINUE,
+    MEGAUP_FILE
+} MegaUpStep;
+
+static bool has_query_value(const char *query, const char *key) {
+    size_t key_length = strlen(key);
+    for (const char *field = query; field && *field;) {
+        size_t length = strcspn(field, "&");
+        if (length > key_length + 1 && field[key_length] == '=' &&
+            !strncmp(field, key, key_length)) return true;
+        field += length;
+        if (*field == '&') ++field;
+    }
+    return false;
+}
+
+static MegaUpStep megaup_url(const char *base, const char *target, char out[URL_CAPACITY]) {
+    if (!target || !*target || strpbrk(target, "\r\n\t ")) return MEGAUP_INVALID;
+
+    CURLU *parsed = curl_url();
+    if (!parsed) return MEGAUP_INVALID;
+    char *scheme = NULL, *host = NULL, *port = NULL, *path = NULL;
+    char *query = NULL, *full = NULL;
+    MegaUpStep step = MEGAUP_INVALID;
+    if ((base && curl_url_set(parsed, CURLUPART_URL, base, CURLU_DISALLOW_USER)) ||
+        curl_url_set(parsed, CURLUPART_URL, target, CURLU_DISALLOW_USER) ||
+        curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) || strcmp(scheme, "https") ||
+        curl_url_get(parsed, CURLUPART_HOST, &host, 0) ||
+        curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) || strcmp(port, "443") ||
+        curl_url_get(parsed, CURLUPART_PATH, &path, 0)) goto done;
+
+    curl_url_get(parsed, CURLUPART_QUERY, &query, 0);
+    if (!strcasecmp(host, "download.megaup.net") && !strcmp(path, "/") &&
+        (has_query_value(query, "url") || has_query_value(query, "idurl"))) {
+        step = MEGAUP_GATE;
+    } else if ((!strcasecmp(host, "megaup.net") || !strcasecmp(host, "www.megaup.net")) &&
+               path[0] == '/' && path[1]) {
+        step = has_query_value(query, "pt") ? MEGAUP_CONTINUE : MEGAUP_SHARE;
+    } else if (in_domain(host, "megaupdownup.org") && path[0] == '/' && path[1] &&
+               has_query_value(query, "download_token")) {
+        step = MEGAUP_FILE;
+    }
+
+    if (step != MEGAUP_INVALID) {
+        curl_url_set(parsed, CURLUPART_FRAGMENT, NULL, 0);
+        if (curl_url_get(parsed, CURLUPART_URL, &full, 0) || strlen(full) >= URL_CAPACITY)
+            step = MEGAUP_INVALID;
+        else
+            strcpy(out, full);
+    }
+
+done:
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_free(path);
+    curl_free(query);
+    curl_free(full);
+    curl_url_cleanup(parsed);
+    return step;
+}
+
+static bool resolve_url(const char *base, const char *target, char out[URL_CAPACITY]) {
     if (!target || !*target) return false;
     CURLU *parsed = curl_url();
     if (!parsed) return false;
-    char *scheme = NULL, *host = NULL, *url = NULL, *port = NULL, *query = NULL;
+    char *scheme = NULL, *host = NULL, *url = NULL, *port = NULL;
     bool ok = (!base || !curl_url_set(parsed, CURLUPART_URL, base, CURLU_DISALLOW_USER)) &&
         !curl_url_set(parsed, CURLUPART_URL, target, CURLU_DISALLOW_USER) &&
         !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) && !strcmp(scheme, "https") &&
         !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
-        (megaup ? !strcasecmp(host, MEGAUP_FILE_HOST) :
-            in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
+        (in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
         !curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) && !strcmp(port, "443") &&
         !curl_url_get(parsed, CURLUPART_URL, &url, 0) && strlen(url) < URL_CAPACITY;
-    if (ok && megaup) {
-        ok = !curl_url_get(parsed, CURLUPART_QUERY, &query, 0) &&
-            !strncmp(query, "download_token=", 15) && query[15] && query[15] != '&';
-    }
     if (ok) strcpy(out, url);
-    curl_free(query);
     curl_free(scheme);
     curl_free(host);
     curl_free(url);
     curl_free(port);
     curl_url_cleanup(parsed);
     return ok;
-}
-
-static bool resolve_url(const char *base, const char *target, char out[URL_CAPACITY]) {
-    return resolve_host_url(base, target, out, false);
 }
 
 static bool same_host(const char *a, const char *b) {
@@ -111,13 +169,14 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
         t->length = 0;
         t->html[0] = 0;
         t->name[0] = 0;
-        t->challenge = t->text = t->attachment = t->binary = false;
+        t->challenge = t->text = t->html_type = t->attachment = t->binary = false;
     } else if (!strncasecmp(line, "cf-mitigated:", 13)) {
         t->challenge = strcasestr(line, "challenge") != NULL;
     } else if (!strncasecmp(line, "content-disposition:", 20)) {
         t->attachment = strcasestr(line, "attachment") != NULL;
         read_filename(t, line);
     } else if (!strncasecmp(line, "content-type:", 13)) {
+        t->html_type = strcasestr(line, "text/html") || strcasestr(line, "application/xhtml");
         t->text = strcasestr(line, "text/") || strcasestr(line, "html") || strcasestr(line, "json");
         t->binary = strcasestr(line, "application/octet-stream") ||
             strcasestr(line, "application/x-rar") || strcasestr(line, "application/vnd.rar") ||
@@ -129,8 +188,9 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
 static bool open_partial(Transfer *t) {
     const char *fallback = t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
     const char *name = t->name[0] ? t->name : fallback;
-    snprintf(t->job->path, sizeof(t->job->path), "%s/%s", OUTPUT_DIR, name);
-    snprintf(t->partial, sizeof(t->partial), "%s/%s.part", OUTPUT_DIR, name);
+    const char *dir = t->job->megaup_native ? MEGAUP_DIR : OUTPUT_DIR;
+    snprintf(t->job->path, sizeof(t->job->path), "%s/%s", dir, name);
+    snprintf(t->partial, sizeof(t->partial), "%s/%s.part", dir, name);
     struct stat info;
     if (!stat(t->job->path, &info)) {
         t->error = "Destination file already exists";
@@ -155,8 +215,10 @@ static size_t on_body(char *data, size_t size, size_t count, void *arg) {
     Transfer *t = arg;
     size_t n = size * count;
     if (atomic_load(&t->job->cancelled)) return 0;
-    if (t->allow_file && t->status == 200 && !t->challenge && !t->text &&
-        (t->attachment || t->binary)) {
+    if (t->job->megaup && t->status >= 300 && t->status < 400) return n;
+    bool file_body = t->job->megaup ? !t->html_type && (t->attachment || t->binary) :
+        !t->text && (t->attachment || t->binary);
+    if (t->allow_file && t->status == 200 && !t->challenge && file_body) {
         if (!t->file && !open_partial(t)) return 0;
         size_t written = fwrite(data, 1, n, t->file);
         atomic_fetch_add(&t->job->received, written);
@@ -366,9 +428,96 @@ static unsigned wait_seconds(const char *html) {
     return seconds > 120 ? 121 : (unsigned)seconds;
 }
 
+static bool megaup_action_allowed(MegaUpStep page, MegaUpStep action) {
+    if (page == MEGAUP_SHARE) return action == MEGAUP_GATE;
+    return action == MEGAUP_CONTINUE || action == MEGAUP_FILE;
+}
+
+static MegaUpStep megaup_anchor(xmlNodePtr node, const char *base, MegaUpStep page,
+                                char next[URL_CAPACITY]) {
+    for (; node; node = node->next) {
+        if (node_is(node, "a")) {
+            xmlChar *href = xmlGetProp(node, BAD_CAST "href");
+            MegaUpStep step = megaup_url(base, (const char *)href, next);
+            xmlFree(href);
+            if (megaup_action_allowed(page, step)) return step;
+        }
+        MegaUpStep child = megaup_anchor(node->children, base, page, next);
+        if (child != MEGAUP_INVALID) return child;
+    }
+    return MEGAUP_INVALID;
+}
+
+static MegaUpStep megaup_action(const Transfer *t, const char *base, MegaUpStep page,
+                                char next[URL_CAPACITY]) {
+    if (!t->length) return MEGAUP_INVALID;
+    htmlDocPtr doc = htmlReadMemory(t->html, (int)t->length, NULL, NULL,
+        HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
+    if (!doc) return MEGAUP_INVALID;
+    MegaUpStep step = megaup_anchor(xmlDocGetRootElement(doc), base, page, next);
+    xmlFreeDoc(doc);
+    if (step != MEGAUP_INVALID || page != MEGAUP_SHARE) return step;
+
+    // Some share pages place a literal download-button href in their timer script.
+    // Parse just that attribute as HTML so any escaped query separators are decoded.
+    for (const char *timer = strcasestr(t->html, ".download-timer"); timer;
+         timer = strcasestr(timer + 15, ".download-timer")) {
+        const char *script_end = strcasestr(timer, "</script");
+        const char *href = strcasestr(timer, "href=");
+        if (!href || !script_end || href >= script_end) continue;
+        const char *value = href + 5;
+        char quote = *value++;
+        if (quote != '\'' && quote != '"') continue;
+        const char *end = strchr(value, quote);
+        if (!end || end >= script_end || end - value >= URL_CAPACITY) continue;
+        char tag[URL_CAPACITY + 20];
+        snprintf(tag, sizeof(tag), "<a %.*s></a>", (int)(end - href + 1), href);
+        doc = htmlReadMemory(tag, (int)strlen(tag), NULL, NULL,
+            HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
+        if (!doc) continue;
+        step = megaup_anchor(xmlDocGetRootElement(doc), base, page, next);
+        xmlFreeDoc(doc);
+        if (step != MEGAUP_INVALID) return step;
+    }
+    return MEGAUP_INVALID;
+}
+
+static const char *megaup_error(const Transfer *t, MegaUpStep step) {
+    if (t->challenge || t->status == 401 || t->status == 403)
+        return "MegaUp refused the request or requires browser verification";
+    if (t->status == 429) return "MegaUp rate limit. Try again later.";
+    if (t->status == 404 || t->status == 410 || strcasestr(t->html, "file not found") ||
+        strcasestr(t->html, "file was deleted")) {
+        return step == MEGAUP_FILE ? "MegaUp file link expired or storage returned not found" :
+            "MegaUp reports that the shared file is unavailable";
+    }
+    if (t->status >= 400) return "MegaUp returned an HTTP error";
+    return NULL;
+}
+
+static void megaup_wait(FichierJob *job) {
+    // Allow the normal page countdown to elapse before requesting its link.
+    for (unsigned seconds = 15; seconds && !atomic_load(&job->cancelled); --seconds) {
+        atomic_store(&job->waiting, seconds);
+        sleep(1);
+    }
+    atomic_store(&job->waiting, 0);
+}
+
+static const char *megaup_stage(MegaUpStep step) {
+    switch (step) {
+        case MEGAUP_SHARE: return "Share page";
+        case MEGAUP_GATE: return "Download page";
+        case MEGAUP_CONTINUE: return "Countdown link";
+        case MEGAUP_FILE: return "File server";
+        default: return "URL validation";
+    }
+}
+
 void fichier_download(FichierJob *job) {
     job->result = "Download setup failed";
-    if (mkdir(OUTPUT_DIR, 0777) && errno != EEXIST) {
+    const char *dir = job->megaup_native ? MEGAUP_DIR : OUTPUT_DIR;
+    if (mkdir(dir, 0777) && errno != EEXIST) {
         job->result = "Cannot create download directory on SD";
         return;
     }
@@ -378,6 +527,8 @@ void fichier_download(FichierJob *job) {
     char url[URL_CAPACITY], next[URL_CAPACITY], referrer[URL_CAPACITY] = {0};
     bool posting = false;
     unsigned forms = 0;
+    bool checked_early = false;
+    MegaUpStep mega_step = MEGAUP_INVALID;
     if (!curl || !data || !t.html) goto done;
 
 #if LIBCURL_VERSION_NUM >= 0x075500
@@ -391,6 +542,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Switch-Download-Probe/0.5");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+    if (job->megaup_native) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, on_header);
@@ -400,8 +552,10 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 
     if (job->megaup) {
-        if (!resolve_host_url(NULL, job->url, url, true)) {
-            job->result = "Unexpected MegaUp file address";
+        job->stage = megaup_stage(MEGAUP_INVALID);
+        mega_step = megaup_url(NULL, job->url, url);
+        if (mega_step == MEGAUP_INVALID || (!job->megaup_native && mega_step != MEGAUP_FILE)) {
+            job->result = "Enter a valid HTTPS MegaUp file link";
             goto done;
         }
     } else if (!strcmp(job->url, BUNNY_NSWGF_URL)) {
@@ -416,6 +570,10 @@ void fichier_download(FichierJob *job) {
     strcpy(initial_url, url);
 
     for (unsigned hop = 0; hop < 10 && !atomic_load(&job->cancelled); ++hop) {
+        if (job->megaup) {
+            job->stage = megaup_stage(mega_step);
+            t.allow_file = mega_step == MEGAUP_FILE;
+        }
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_REFERER, referrer[0] ? referrer : NULL);
         if (posting) {
@@ -445,10 +603,36 @@ void fichier_download(FichierJob *job) {
             goto done;
         }
         if (job->megaup) {
-            job->result = t.status == 401 || t.status == 403 || t.challenge ?
-                "MegaUp file host rejected the native GET" :
-                "MegaUp file host did not return an archive";
-            goto done;
+            const char *error = megaup_error(&t, mega_step);
+            if (error) {
+                job->result = error;
+                goto done;
+            }
+            char *location = NULL;
+            curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &location);
+            bool redirect = t.status >= 300 && t.status < 400 && location;
+            MegaUpStep next_step = redirect ? megaup_url(url, location, next) :
+                (mega_step == MEGAUP_FILE ? MEGAUP_INVALID :
+                 megaup_action(&t, url, mega_step, next));
+            if (!redirect && mega_step == MEGAUP_CONTINUE && t.status == 200 &&
+                (next_step == MEGAUP_INVALID || !strcmp(url, next)) && !checked_early) {
+                checked_early = true;
+                megaup_wait(job);
+                continue;
+            }
+            if (next_step == MEGAUP_INVALID || !strcmp(url, next)) {
+                job->result = redirect ? "Unexpected MegaUp redirect" :
+                    mega_step == MEGAUP_FILE ? "File server did not send a downloadable file" :
+                    mega_step == MEGAUP_CONTINUE ? "MegaUp has not released the download link" :
+                    "No download link found on this MegaUp page";
+                goto done;
+            }
+            if (!redirect) megaup_wait(job);
+            strcpy(referrer, url);
+            strcpy(url, next);
+            mega_step = next_step;
+            job->result = "MegaUp reached the request limit";
+            continue;
         }
         const char *error = page_error(&t);
         if (error) {

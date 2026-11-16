@@ -47,8 +47,13 @@ static Buffer fetch(CatalogJob *job, const char *url, size_t limit, long *status
     }
     *status = 0;
     curl_easy_setopt(curl, CURLOPT_URL, url);
+#if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, (long)CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);

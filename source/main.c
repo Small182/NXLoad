@@ -68,7 +68,7 @@ static void rect(int x, int y, int w, int h, SDL_Color color) {
 static void text(TTF_Font *font, const char *str, int x, int y, int width, SDL_Color color) {
     if (!str || !*str || width <= 0) return;
     char short_text[512];
-    snprintf(short_text, sizeof(short_text), "%s", str);
+    snprintf(short_text, sizeof(short_text), "%.*s", (int)sizeof(short_text) - 4, str);
     size_t length = strlen(short_text);
     int pixels = 0;
     if (TTF_SizeUTF8(font, short_text, &pixels, NULL) == 0 && pixels > width) {

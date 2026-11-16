@@ -98,7 +98,7 @@ static void copy_filename(char *out, size_t capacity, const char *name, size_t n
     if (n == 0 || n >= capacity || name[0] == '.') return;
     for (size_t i = 0; i < n; ++i) {
         unsigned char ch = (unsigned char)name[i];
-        if (ch < 32 || ch >= 127 || strchr("/\\:<>|?*\"", ch)) return;
+        if (ch < 32 || ch == 127 || strchr("/\\:<>|?*\"", ch)) return;
     }
     memcpy(out, name, n);
     out[n] = 0;
@@ -395,6 +395,19 @@ static void skip_json_space(const char **p) {
     while (isspace((unsigned char)**p)) ++*p;
 }
 
+static bool json_hex4(const char **s, unsigned *value) {
+    const char *hex = "0123456789abcdef";
+    *value = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        int digit = tolower((unsigned char)**s);
+        const char *p = digit ? strchr(hex, digit) : NULL;
+        if (!p) return false;
+        *value = 16 * *value + (unsigned)(p - hex);
+        ++*s;
+    }
+    return true;
+}
+
 static bool read_json_string(const char **p, char *out, size_t capacity) {
     if (**p != '"') return false;
     const char *s = *p + 1;
@@ -409,15 +422,29 @@ static bool read_json_string(const char **p, char *out, size_t capacity) {
             if (escape) {
                 ch = (unsigned char)"\"\\/\b\f\n\r\t"[escape - simple];
             } else if (ch == 'u') {
-                unsigned code = 0;
-                const char *hex = "0123456789abcdef";
-                for (unsigned i = 0; i < 4; ++i) {
-                    int digit = tolower((unsigned char)*s++);
-                    const char *value = digit ? strchr(hex, digit) : NULL;
-                    if (!value) return false;
-                    code = 16 * code + (unsigned)(value - hex);
+                unsigned code;
+                if (!json_hex4(&s, &code) || !code) return false;
+                if (code >= 0xd800 && code <= 0xdbff) {
+                    if (s[0] != '\\' || s[1] != 'u') return false;
+                    s += 2;
+                    unsigned low;
+                    if (!json_hex4(&s, &low) || low < 0xdc00 || low > 0xdfff) return false;
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                } else if (code >= 0xdc00 && code <= 0xdfff) {
+                    return false;
                 }
-                if (!code || code > 0x7f) return false;
+                if (code > 0x7f) {
+                    unsigned width = code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+                    if (n + width >= capacity) return false;
+                    for (unsigned i = width - 1; i > 0; --i) {
+                        out[n + i] = (char)(0x80 | (code & 0x3f));
+                        code >>= 6;
+                    }
+                    const unsigned char prefix[] = {0, 0, 0xc0, 0xe0, 0xf0};
+                    out[n] = (char)(prefix[width] | code);
+                    n += width;
+                    continue;
+                }
                 ch = (unsigned char)code;
             } else {
                 return false;

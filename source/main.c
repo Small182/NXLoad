@@ -19,12 +19,26 @@
 #define ROWS 9
 #define FILE_ROWS 5
 #define HISTORY_LIMIT 96
+#define COVER_SLOTS 24
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 
 typedef struct {
     char file[256];
 } SavedFile;
+
+typedef struct {
+    char url[CATALOG_URL];
+    SDL_Texture *texture;
+    uint64_t last_used;
+} CachedCover;
+
+typedef struct {
+    char url[CATALOG_URL];
+    atomic_bool cancel;
+    unsigned char *bytes;
+    size_t count;
+} CoverJob;
 
 typedef struct {
     SDL_Window *window;
@@ -37,6 +51,7 @@ typedef struct {
     Game games[CATALOG_SEARCH_LIMIT];
     size_t game_count, game_index, file_index, saved_count, saved_index;
     unsigned page;
+    size_t page_start[CATALOG_MAX_PAGES + 1];
     bool more, confirm_install, close, catalog_busy, download_busy, download_finished;
     char query[96], notice[192], game_error[192], file_id[DLARCHIVE_ID_CAPACITY];
     char transfer_name[CATALOG_TEXT];
@@ -44,13 +59,18 @@ typedef struct {
     GameDetails details;
     CatalogJob pending;
     FichierJob download;
-    Thread catalog_thread, download_thread;
+    Thread catalog_thread, download_thread, cover_thread;
+    bool cover_busy;
+    CoverJob cover_job;
+    CachedCover covers[COVER_SLOTS];
     uint64_t previous_bytes;
     double speed;
     uint64_t speed_time;
 } App;
 
 static App app;
+static const u64 up_buttons = HidNpadButton_Up | HidNpadButton_StickLUp;
+static const u64 down_buttons = HidNpadButton_Down | HidNpadButton_StickLDown;
 static const SDL_Color background = {15, 19, 31, 255};
 static const SDL_Color panel = {24, 31, 48, 255};
 static const SDL_Color selected = {35, 63, 104, 255};
@@ -102,8 +122,8 @@ static size_t first_visible(size_t selected_index, size_t rows) {
 }
 
 static size_t move(size_t current, size_t count, u64 buttons) {
-    if (current && (buttons & (HidNpadButton_Up | HidNpadButton_StickLUp))) --current;
-    if (current + 1 < count && (buttons & (HidNpadButton_Down | HidNpadButton_StickLDown))) ++current;
+    if (current && (buttons & up_buttons)) --current;
+    if (current + 1 < count && (buttons & down_buttons)) ++current;
     return current;
 }
 
@@ -133,13 +153,92 @@ static void start_catalog(CatalogRequest request, unsigned page) {
     if (!app.catalog_busy) strcpy(app.notice, "Не вдалося запустити запит");
 }
 
+static SDL_Texture *decode_cover(const unsigned char *bytes, size_t count) {
+    if (!bytes || !count) return NULL;
+    SDL_RWops *src = SDL_RWFromConstMem(bytes, (int)count);
+    SDL_Surface *image = src ? IMG_Load_RW(src, 1) : NULL;
+    if (!image) return NULL;
+
+    SDL_Surface *scaled = NULL;
+    double factor = SDL_min(480.0 / image->w, 420.0 / image->h);
+    if (factor < 1.0) {
+        int w = SDL_max(1, (int)(factor * image->w));
+        int h = SDL_max(1, (int)(factor * image->h));
+        scaled = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_RGBA32);
+        if (scaled && SDL_BlitScaled(image, NULL, scaled, NULL) < 0) {
+            SDL_FreeSurface(scaled);
+            scaled = NULL;
+        }
+    }
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(app.renderer, scaled ? scaled : image);
+    if (scaled) SDL_FreeSurface(scaled);
+    SDL_FreeSurface(image);
+    return texture;
+}
+
+static void cover_worker(void *arg) {
+    CoverJob *job = arg;
+    job->bytes = catalog_fetch_cover(job->url, &job->cancel, &job->count);
+}
+
+static CachedCover *find_cover(const char *url) {
+    if (!url[0]) return NULL;
+    for (size_t i = 0; i < COVER_SLOTS; ++i) {
+        if (!strcmp(app.covers[i].url, url)) {
+            app.covers[i].last_used = SDL_GetTicks64();
+            return &app.covers[i];
+        }
+    }
+    return NULL;
+}
+
+static void pump_covers(void) {
+    CoverJob *job = &app.cover_job;
+    if (app.cover_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.cover_thread), 0))) {
+        threadWaitForExit(&app.cover_thread);
+        threadClose(&app.cover_thread);
+        app.cover_busy = false;
+        CachedCover *entry = &app.covers[0];
+        for (size_t i = 0; i < COVER_SLOTS; ++i) {
+            CachedCover *candidate = &app.covers[i];
+            if (!candidate->url[0]) {
+                entry = candidate;
+                break;
+            }
+            if (candidate->last_used < entry->last_used) entry = candidate;
+        }
+        SDL_DestroyTexture(entry->texture);
+        strcpy(entry->url, job->url);
+        entry->texture = decode_cover(job->bytes, job->count);
+        entry->last_used = SDL_GetTicks64();
+        free(job->bytes);
+        job->bytes = NULL;
+    }
+    if (app.cover_busy || app.screen != LIBRARY || !app.game_count) return;
+
+    const char *url = app.games[app.game_index].cover;
+    if (!url[0] || find_cover(url)) {
+        url = NULL;
+        size_t first = first_visible(app.game_index, ROWS);
+        for (size_t i = first; i < app.game_count && i < first + ROWS; ++i) {
+            const char *candidate = app.games[i].cover;
+            if (candidate[0] && !find_cover(candidate)) {
+                url = candidate;
+                break;
+            }
+        }
+    }
+    if (url) {
+        strcpy(job->url, url);
+        atomic_init(&job->cancel, false);
+        job->count = 0;
+        app.cover_busy = start_worker(&app.cover_thread, cover_worker, job);
+    }
+}
+
 static void update_cover(void) {
     SDL_DestroyTexture(app.cover);
-    app.cover = NULL;
-    if (app.details.cover && app.details.cover_bytes) {
-        SDL_RWops *src = SDL_RWFromConstMem(app.details.cover, (int)app.details.cover_bytes);
-        if (src) app.cover = IMG_LoadTexture_RW(app.renderer, src, 1);
-    }
+    app.cover = decode_cover(app.details.cover, app.details.cover_bytes);
     free(app.details.cover);
     app.details.cover = NULL;
     app.details.cover_bytes = 0;
@@ -172,6 +271,48 @@ static void refresh_saved(void) {
     if (app.saved_index >= app.saved_count) app.saved_index = 0;
 }
 
+static bool in_library(const Game *game) {
+    for (size_t i = 0; i < app.game_count; ++i)
+        if (!strcmp(app.games[i].page, game->page)) return true;
+    return false;
+}
+
+static void show_catalog_page(const CatalogJob *job) {
+    strcpy(app.notice, job->error);
+    if (job->request == CATALOG_SEARCH) {
+        memcpy(app.games, job->games, job->count * sizeof(Game));
+        app.game_count = job->count;
+        app.game_index = 0;
+        app.page = CATALOG_DEFAULT_PAGE;
+        app.more = false;
+    } else if (job->page == CATALOG_DEFAULT_PAGE) {
+        if (job->error[0]) return;
+        memcpy(app.games, job->games, job->count * sizeof(Game));
+        app.game_count = job->count;
+        app.game_index = 0;
+        app.page = CATALOG_DEFAULT_PAGE;
+        app.page_start[app.page] = 0;
+        app.more = job->more;
+    } else if (!job->error[0]) {
+        const size_t first = app.game_count;
+        for (size_t i = 0; i < job->count && app.game_count < CATALOG_SEARCH_LIMIT; ++i) {
+            if (!in_library(&job->games[i])) app.games[app.game_count++] = job->games[i];
+        }
+        if (app.game_count > first) {
+            app.page = job->page;
+            app.page_start[app.page] = first;
+            app.game_index = first;
+        }
+        app.more = app.game_count > first && app.game_count < CATALOG_SEARCH_LIMIT && job->more;
+    }
+}
+
+static unsigned selected_page(void) {
+    unsigned page = app.page;
+    while (page > CATALOG_DEFAULT_PAGE && app.game_index < app.page_start[page]) --page;
+    return page;
+}
+
 static void finish_jobs(void) {
     if (app.catalog_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.catalog_thread), 0))) {
         threadWaitForExit(&app.catalog_thread);
@@ -189,14 +330,7 @@ static void finish_jobs(void) {
             }
             job->details.cover = NULL;
         } else if (!cancelled) {
-            if (job->count || job->request == CATALOG_SEARCH || !job->error[0]) {
-                memcpy(app.games, job->games, job->count * sizeof(Game));
-                app.game_count = job->count;
-                app.game_index = 0;
-                app.page = job->page;
-                app.more = job->more;
-            }
-            strcpy(app.notice, job->error);
+            show_catalog_page(job);
         }
     }
     if (app.download_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.download_thread), 0))) {
@@ -322,15 +456,21 @@ static void input(u64 buttons) {
             start_download(&app.details.files[app.file_index]);
         return;
     }
+    size_t old_index = app.game_index;
     app.game_index = move(app.game_index, app.game_count, buttons);
+    unsigned page = selected_page();
     if ((buttons & HidNpadButton_X) && keyboard()) {
         start_catalog(CATALOG_SEARCH, 1);
     } else if ((buttons & HidNpadButton_B) && app.query[0]) {
         app.query[0] = 0;
         start_catalog(CATALOG_PAGE, CATALOG_DEFAULT_PAGE);
-    } else if (!app.query[0] && (buttons & HidNpadButton_L) && app.page > 1) {
-        start_catalog(CATALOG_PAGE, app.page - 1);
-    } else if (!app.query[0] && (buttons & HidNpadButton_R) && app.more) {
+    } else if (!app.query[0] && (buttons & HidNpadButton_L) && page > CATALOG_DEFAULT_PAGE) {
+        app.game_index = app.page_start[page - 1];
+    } else if (!app.query[0] && (buttons & HidNpadButton_R)) {
+        if (page < app.page) app.game_index = app.page_start[page + 1];
+        else if (app.more) start_catalog(CATALOG_PAGE, app.page + 1);
+    } else if (!app.query[0] && app.more && app.game_count && (buttons & down_buttons) &&
+               app.game_index == old_index && old_index + 1 == app.game_count) {
         start_catalog(CATALOG_PAGE, app.page + 1);
     } else if (buttons & HidNpadButton_A) {
         if (!app.game_count) {
@@ -347,6 +487,15 @@ static void input(u64 buttons) {
     }
 }
 
+static void fit_cover(SDL_Texture *texture, int x, int y, int width, int height) {
+    int w, h;
+    if (!texture || SDL_QueryTexture(texture, NULL, NULL, &w, &h) || w <= 0 || h <= 0) return;
+    double scale = SDL_min((double)width / w, (double)height / h);
+    int dw = SDL_max(1, (int)(w * scale)), dh = SDL_max(1, (int)(h * scale));
+    SDL_Rect dst = { x + (width - dw) / 2, y + (height - dh) / 2, dw, dh };
+    SDL_RenderCopy(app.renderer, texture, NULL, &dst);
+}
+
 static void draw_library(void) {
     rect(40, 106, 500, 530, panel);
     rect(556, 106, 684, 530, panel);
@@ -354,20 +503,35 @@ static void draw_library(void) {
     snprintf(header, sizeof(header), app.query[0] ? "Пошук · %s" : "Каталог NSRoms", app.query);
     text(app.normal, header, 60, 125, 450, white);
     if (!app.query[0]) {
-        snprintf(header, sizeof(header), "Сторінка %u", app.page);
+        snprintf(header, sizeof(header), "Сторінка %u", selected_page());
         text(app.small, header, 60, 603, 420, gray);
     }
     size_t first = first_visible(app.game_index, ROWS);
-    for (size_t i = first; i < app.game_count && i < first + ROWS; ++i)
-        row(i, app.game_index, 55, 170 + (int)(i - first) * 46, 470, app.games[i].title);
+    for (size_t i = first; i < app.game_count && i < first + ROWS; ++i) {
+        int y = 170 + (int)(i - first) * 46;
+        if (i == app.game_index) {
+            rect(55, y, 470, 42, selected);
+            rect(55, y, 3, 42, blue);
+        }
+        CachedCover *cover = find_cover(app.games[i].cover);
+        if (cover) fit_cover(cover->texture, 64, y + 3, 41, 36);
+        text(app.normal, app.games[i].title, 116, y + 8, 398,
+             i == app.game_index ? white : gray);
+    }
     if (app.catalog_busy) {
         unsigned page = atomic_load(&app.pending.searching_page);
         if (page) snprintf(header, sizeof(header), "Пошук на сторінці %u…", page);
+        else if (app.pending.page > CATALOG_DEFAULT_PAGE)
+            snprintf(header, sizeof(header), "Підвантаження сторінки %u…", app.pending.page);
         else strcpy(header, "Завантаження каталогу…");
         text(app.normal, header, 588, 152, 604, blue);
     } else if (app.game_count) {
         text(app.large, app.games[app.game_index].title, 588, 150, 610, white);
-        text(app.normal, "A  Відкрити картку гри", 588, 216, 604, blue);
+        CachedCover *cover = find_cover(app.games[app.game_index].cover);
+        if (cover) fit_cover(cover->texture, 588, 214, 620, 314);
+        text(app.normal, "A  Відкрити картку гри", 588, 541, 604, blue);
+        if (!app.query[0] && app.more && app.game_index + 1 == app.game_count)
+            text(app.small, "↓  Підвантажити наступні ігри", 588, 575, 604, gray);
     } else {
         text(app.normal, app.query[0] ? "Ігор за цим запитом не знайдено" : "Каталог порожній",
              588, 152, 610, gray);
@@ -377,13 +541,8 @@ static void draw_library(void) {
 
 static void draw_cover(void) {
     rect(56, 118, 308, 420, panel);
-    if (!app.cover) return;
-    int w, h;
-    if (SDL_QueryTexture(app.cover, NULL, NULL, &w, &h) || w <= 0 || h <= 0) return;
-    double scale = SDL_min(308.0 / w, 420.0 / h);
-    SDL_Rect dst = {56 + (308 - (int)(w * scale)) / 2, 118 + (420 - (int)(h * scale)) / 2,
-                    (int)(w * scale), (int)(h * scale)};
-    SDL_RenderCopy(app.renderer, app.cover, NULL, &dst);
+    CachedCover *preview = find_cover(app.games[app.game_index].cover);
+    fit_cover(app.cover ? app.cover : preview ? preview->texture : NULL, 56, 118, 308, 420);
 }
 
 static void draw_game(void) {
@@ -443,6 +602,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
+    text(app.small, "1.0.1", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -469,6 +629,7 @@ static TTF_Font *font_open(const PlFontData *font, int points) {
 }
 
 int main(void) {
+    bool romfs_ready = R_SUCCEEDED(romfsInit());
     Result sockets = socketInitializeDefault();
     bool curl_ready = R_SUCCEEDED(sockets) && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     Result font_service = plInitialize(PlServiceType_User);
@@ -492,15 +653,25 @@ int main(void) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
         app.page = CATALOG_DEFAULT_PAGE;
         start_catalog(CATALOG_PAGE, app.page);
-        uint64_t next_frame = 0;
+        uint64_t next_frame = 0, next_scroll = 0;
+        u64 held = 0;
         while (appletMainLoop() && !app.close) {
             SDL_Event event;
             while (SDL_PollEvent(&event)) {}
             padUpdate(&pad);
             finish_jobs();
             u64 buttons = padGetButtonsDown(&pad);
-            input(buttons);
+            u64 vertical = padGetButtons(&pad) & (up_buttons | down_buttons);
             uint64_t now = SDL_GetTicks64();
+            if (held != vertical || (buttons & (up_buttons | down_buttons))) {
+                next_scroll = now + 280;
+            } else if (vertical && now >= next_scroll) {
+                buttons |= vertical;
+                next_scroll = now + 110;
+            }
+            held = vertical;
+            input(buttons);
+            pump_covers();
             if (buttons || now >= next_frame) {
                 draw();
                 next_frame = now + 150;
@@ -529,6 +700,13 @@ int main(void) {
         threadWaitForExit(&app.download_thread);
         threadClose(&app.download_thread);
     }
+    if (app.cover_busy) {
+        atomic_store(&app.cover_job.cancel, true);
+        threadWaitForExit(&app.cover_thread);
+        threadClose(&app.cover_thread);
+        free(app.cover_job.bytes);
+    }
+    for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
     SDL_DestroyTexture(app.cover);
     if (app.small) TTF_CloseFont(app.small);
     if (app.normal) TTF_CloseFont(app.normal);
@@ -541,5 +719,6 @@ int main(void) {
     if (R_SUCCEEDED(font_service)) plExit();
     if (curl_ready) curl_global_cleanup();
     if (R_SUCCEEDED(sockets)) socketExit();
+    if (romfs_ready) romfsExit();
     return 0;
 }

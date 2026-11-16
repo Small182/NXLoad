@@ -8,7 +8,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := NXLoad
 APP_TITLE := NXLoad
 APP_AUTHOR := Small182
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)
@@ -24,7 +24,7 @@ export VPATH := $(CURDIR)/source
 export DEPSDIR := $(CURDIR)/build
 export INCLUDE := -I$(PORTLIBS)/include -I$(LIBNX)/include -I$(PORTLIBS)/include/libxml2
 export LIBPATHS := -L$(PORTLIBS)/lib -L$(LIBNX)/lib
-export NROFLAGS := --icon=$(TOPDIR)/icon.jpg --nacp=$(OUTPUT).nacp
+export NROFLAGS := --icon=$(TOPDIR)/icon.jpg --nacp=$(OUTPUT).nacp --romfsdir=$(TOPDIR)/romfs
 export LD := $(CC)
 
 .PHONY: all clean

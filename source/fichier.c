@@ -579,7 +579,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.1");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
@@ -608,6 +608,9 @@ void fichier_download(FichierJob *job) {
     char initial_url[URL_CAPACITY];
     strcpy(initial_url, url);
 
+#ifdef __SWITCH__
+    bool tried_roots = false;
+#endif
     for (unsigned hop = 0; hop < 10 && !atomic_load(&job->cancelled); ++hop) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_REFERER, referrer[0] ? referrer : NULL);
@@ -618,6 +621,14 @@ void fichier_download(FichierJob *job) {
             curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
         }
         CURLcode code = curl_easy_perform(curl);
+#ifdef __SWITCH__
+        if (job->dlarchive && code == CURLE_PEER_FAILED_VERIFICATION && !tried_roots &&
+            !atomic_load(&job->cancelled)) {
+            tried_roots = true;
+            curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/dlarchive-roots.pem");
+            code = curl_easy_perform(curl);
+        }
+#endif
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->http);
         if (t.file) {
             bool closed = fclose(t.file) == 0;
@@ -634,7 +645,12 @@ void fichier_download(FichierJob *job) {
             goto done;
         }
         if (code != CURLE_OK || t.error) {
-            job->result = t.error ? t.error : curl_easy_strerror(code);
+            if (job->dlarchive && code == CURLE_PEER_FAILED_VERIFICATION)
+                job->result = "Сертифікат файлового сервера не пройшов перевірку";
+            else if (job->dlarchive && code == CURLE_SSL_CACERT_BADFILE)
+                job->result = "Не вдалося завантажити довірені сертифікати";
+            else
+                job->result = t.error ? t.error : curl_easy_strerror(code);
             goto done;
         }
         if (job->dlarchive) {

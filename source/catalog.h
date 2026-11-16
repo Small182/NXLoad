@@ -11,6 +11,7 @@
 #define CATALOG_PAGE_GAMES 64
 #define CATALOG_SEARCH_LIMIT 4096
 #define CATALOG_DEFAULT_PAGE 1
+#define CATALOG_MAX_PAGES 120
 #define CATALOG_FILE_COUNT 24
 
 typedef struct {
@@ -51,5 +52,6 @@ typedef struct {
 } CatalogJob;
 
 void catalog_request(CatalogJob *job);
+unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes);
 
 #endif

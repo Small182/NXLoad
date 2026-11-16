@@ -15,7 +15,6 @@
 #define DRIVE_PREFIX "https://drive.dlarchive.my.id/dl/?id="
 #define PAGE_BYTES (4 * 1024 * 1024)
 #define COVER_BYTES (2 * 1024 * 1024)
-#define MAX_SCAN_PAGES 120
 
 typedef struct {
     unsigned char *data;
@@ -34,10 +33,10 @@ static size_t receive(void *data, size_t width, size_t count, void *ptr) {
 
 static int should_cancel(void *ptr, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
     (void)a; (void)b; (void)c; (void)d;
-    return atomic_load(&((CatalogJob *)ptr)->cancel);
+    return atomic_load((atomic_bool *)ptr);
 }
 
-static Buffer fetch(CatalogJob *job, const char *url, size_t limit, long *status) {
+static Buffer fetch(atomic_bool *cancel, const char *url, size_t limit, long *status) {
     Buffer buf = { .data = malloc(limit + 1), .capacity = limit };
     if (!buf.data) return (Buffer){0};
     CURL *curl = curl_easy_init();
@@ -64,7 +63,7 @@ static Buffer fetch(CatalogJob *job, const char *url, size_t limit, long *status
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, should_cancel);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, job);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     CURLcode result = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
@@ -77,8 +76,15 @@ static Buffer fetch(CatalogJob *job, const char *url, size_t limit, long *status
     return buf;
 }
 
+unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
+    long status = 0;
+    Buffer image = fetch(cancel, url, COVER_BYTES, &status);
+    *bytes = image.size;
+    return image.data;
+}
+
 static htmlDocPtr fetch_page(CatalogJob *job, const char *url) {
-    Buffer buf = fetch(job, url, PAGE_BYTES, &job->http);
+    Buffer buf = fetch(&job->cancel, url, PAGE_BYTES, &job->http);
     if (!buf.data) return NULL;
     htmlDocPtr doc = htmlReadMemory((char *)buf.data, (int)buf.size, url, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);
@@ -153,10 +159,14 @@ static bool game_page(const xmlChar *href, char out[CATALOG_URL]) {
 
 static void read_cover(xmlNodePtr img, char out[CATALOG_URL]) {
     if (!img) return;
-    for (unsigned i = 0; i < 3; ++i) {
-        const char *key = i == 0 ? "data-src" : i == 1 ? "data-lazy-src" : "src";
-        xmlChar *value = xmlGetProp(img, BAD_CAST key);
-        bool ok = site_url(value, out);
+    const char *keys[] = {"data-src", "data-lazy-src", "data-srcset", "srcset", "src"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        xmlChar *value = xmlGetProp(img, BAD_CAST keys[i]);
+        if (value && strstr(keys[i], "srcset")) {
+            size_t first = strcspn((char *)value, " \t,\r\n");
+            value[first] = 0;
+        }
+        bool ok = value && *value && site_url(value, out);
         xmlFree(value);
         if (ok) return;
     }
@@ -211,7 +221,7 @@ static unsigned declared_pages(xmlDocPtr doc) {
     node_text(title, text);
     const char *page = strcasestr(text, " of ");
     unsigned count = page ? (unsigned)strtoul(page + 4, NULL, 10) : 0;
-    return count <= MAX_SCAN_PAGES ? count : 0;
+    return count <= CATALOG_MAX_PAGES ? count : 0;
 }
 
 static bool load_page(CatalogJob *job, unsigned page, Game *games, size_t *count,
@@ -278,10 +288,7 @@ static void load_details(CatalogJob *job) {
         snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна (HTTP %ld)", job->http);
     }
     if (cover[0] && !atomic_load(&job->cancel)) {
-        long status = 0;
-        Buffer image = fetch(job, cover, COVER_BYTES, &status);
-        details->cover = image.data;
-        details->cover_bytes = image.size;
+        details->cover = catalog_fetch_cover(cover, &job->cancel, &details->cover_bytes);
     }
 }
 
@@ -293,7 +300,7 @@ static void search_pages(CatalogJob *job) {
     }
     char first[CATALOG_URL] = {0};
     unsigned last = 0;
-    for (unsigned page = 1; page <= (last ? last : MAX_SCAN_PAGES) &&
+    for (unsigned page = 1; page <= (last ? last : CATALOG_MAX_PAGES) &&
          job->count < CATALOG_SEARCH_LIMIT && !atomic_load(&job->cancel); ++page) {
         atomic_store(&job->searching_page, page);
         size_t count = 0;
@@ -324,6 +331,6 @@ void catalog_request(CatalogJob *job) {
         unsigned last = 0;
         if (!load_page(job, job->page, job->games, &job->count, &last))
             snprintf(job->error, sizeof(job->error), "Каталог недоступний (HTTP %ld)", job->http);
-        job->more = job->count && (!last || job->page < last);
+        job->more = job->count && job->page < CATALOG_MAX_PAGES && (!last || job->page < last);
     }
 }

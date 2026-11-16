@@ -21,6 +21,8 @@
 
 #define HTML_CAPACITY (512 * 1024)
 #define URL_CAPACITY 2048
+#define FILE_WRITE_BUFFER (512 * 1024)
+#define FILE_RECEIVE_BUFFER (256 * 1024)
 #define DLARCHIVE_ORIGIN "https://drive.dlarchive.my.id"
 #define DLARCHIVE_FILE_HOST "direct-stor.berkasdrive.com"
 
@@ -46,6 +48,7 @@ typedef struct {
     bool binary;
     bool allow_file;
     FILE *file;
+    char *write_buffer;
     char partial[256];
     const char *error;
 } Transfer;
@@ -193,6 +196,11 @@ static bool open_partial(Transfer *t) {
         unlink(t->partial);
         t->error = "Cannot open output stream";
         return false;
+    }
+    t->write_buffer = malloc(FILE_WRITE_BUFFER);
+    if (t->write_buffer && setvbuf(t->file, t->write_buffer, _IOFBF, FILE_WRITE_BUFFER)) {
+        free(t->write_buffer);
+        t->write_buffer = NULL;
     }
     return true;
 }
@@ -580,7 +588,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.2");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.3");
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
@@ -607,6 +615,7 @@ void fichier_download(FichierJob *job) {
         goto done;
     }
     t.allow_file = true;
+    if (job->dlarchive) curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, (long)FILE_RECEIVE_BUFFER);
     char initial_url[URL_CAPACITY];
     strcpy(initial_url, url);
 
@@ -622,8 +631,13 @@ void fichier_download(FichierJob *job) {
         CURLcode code = curl_easy_perform(curl);
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->http);
         if (t.file) {
+            curl_off_t speed = 0;
+            curl_easy_getinfo(curl, CURLINFO_SPEED_DOWNLOAD_T, &speed);
+            job->avg_speed = speed > 0 ? (uint64_t)speed : 0;
             bool closed = fclose(t.file) == 0;
             t.file = NULL;
+            free(t.write_buffer);
+            t.write_buffer = NULL;
             if (code == CURLE_OK && closed && !atomic_load(&job->cancelled)) {
                 if (!rename(t.partial, job->path)) {
                     job->result = "Download saved";

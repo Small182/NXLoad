@@ -9,12 +9,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 #define SITE "https://nsroms.net"
 #define LIST_URL SITE "/roms/"
 #define DRIVE_PREFIX "https://drive.dlarchive.my.id/dl/?id="
 #define PAGE_BYTES (4 * 1024 * 1024)
 #define COVER_BYTES (2 * 1024 * 1024)
+#ifdef __SWITCH__
+#define CACHE_DIR "sdmc:/switch/NXLoad"
+#else
+#define CACHE_DIR "./NXLoad-cache"
+#endif
+#define CACHE_FILE CACHE_DIR "/catalog.bin"
+#define CACHE_TEMP CACHE_DIR "/catalog.tmp"
+#define CACHE_BACKUP CACHE_DIR "/catalog.prev"
+#define CACHE_MAGIC "NXLCAT02"
 
 typedef struct {
     unsigned char *data;
@@ -36,15 +52,10 @@ static int should_cancel(void *ptr, curl_off_t a, curl_off_t b, curl_off_t c, cu
     return atomic_load((atomic_bool *)ptr);
 }
 
-static Buffer fetch(atomic_bool *cancel, const char *url, size_t limit, long *status) {
+static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t limit, long *status) {
+    *status = 0;
     Buffer buf = { .data = malloc(limit + 1), .capacity = limit };
     if (!buf.data) return (Buffer){0};
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        free(buf.data);
-        return (Buffer){0};
-    }
-    *status = 0;
     curl_easy_setopt(curl, CURLOPT_URL, url);
 #if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
@@ -58,7 +69,7 @@ static Buffer fetch(atomic_bool *cancel, const char *url, size_t limit, long *st
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 16L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.2");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.3");
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive);
@@ -68,7 +79,6 @@ static Buffer fetch(atomic_bool *cancel, const char *url, size_t limit, long *st
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     CURLcode result = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
-    curl_easy_cleanup(curl);
     if (result != CURLE_OK || *status != 200 || !buf.size) {
         free(buf.data);
         return (Buffer){0};
@@ -78,14 +88,18 @@ static Buffer fetch(atomic_bool *cancel, const char *url, size_t limit, long *st
 }
 
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
+    *bytes = 0;
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
     long status = 0;
-    Buffer image = fetch(cancel, url, COVER_BYTES, &status);
+    Buffer image = fetch(curl, cancel, url, COVER_BYTES, &status);
+    curl_easy_cleanup(curl);
     *bytes = image.size;
     return image.data;
 }
 
-static htmlDocPtr fetch_page(CatalogJob *job, const char *url) {
-    Buffer buf = fetch(&job->cancel, url, PAGE_BYTES, &job->http);
+static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, long *status) {
+    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status);
     if (!buf.data) return NULL;
     htmlDocPtr doc = htmlReadMemory((char *)buf.data, (int)buf.size, url, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);
@@ -225,15 +239,16 @@ static unsigned declared_pages(xmlDocPtr doc) {
     return count <= CATALOG_MAX_PAGES ? count : 0;
 }
 
-static bool load_page(CatalogJob *job, unsigned page, Game *games, size_t *count,
-                      unsigned *pages) {
+static bool load_page(CURL *curl, CatalogIndexJob *job, unsigned page,
+                      Game *games, size_t *count, long *status) {
     char url[CATALOG_URL] = LIST_URL;
     if (page > 1) snprintf(url, sizeof(url), LIST_URL "page/%u/", page);
-    htmlDocPtr doc = fetch_page(job, url);
+    htmlDocPtr doc = fetch_page(curl, &job->cancel, url, status);
     if (!doc) return false;
     *count = 0;
     read_catalog(xmlDocGetRootElement(doc), games, count);
-    if (!*pages) *pages = declared_pages(doc);
+    unsigned pages = declared_pages(doc);
+    if (pages) atomic_store(&job->pages, pages);
     xmlFreeDoc(doc);
     return true;
 }
@@ -267,7 +282,9 @@ static void load_details(CatalogJob *job) {
     strcpy(details->title, job->game.title);
     char cover[CATALOG_URL];
     strcpy(cover, job->game.cover);
-    htmlDocPtr doc = fetch_page(job, job->game.page);
+    CURL *curl = curl_easy_init();
+    htmlDocPtr doc = curl ? fetch_page(curl, &job->cancel, job->game.page, &job->http) : NULL;
+    if (curl) curl_easy_cleanup(curl);
     if (doc) {
         xmlNodePtr root = xmlDocGetRootElement(doc);
         read_files(root, details);
@@ -293,45 +310,143 @@ static void load_details(CatalogJob *job) {
     }
 }
 
-static void search_pages(CatalogJob *job) {
-    Game *games = calloc(CATALOG_PAGE_GAMES, sizeof(*games));
-    if (!games) {
-        strcpy(job->error, "Недостатньо пам’яті для пошуку");
-        return;
-    }
-    char first[CATALOG_URL] = {0};
-    unsigned last = 0;
-    for (unsigned page = 1; page <= (last ? last : CATALOG_MAX_PAGES) &&
-         job->count < CATALOG_SEARCH_LIMIT && !atomic_load(&job->cancel); ++page) {
-        atomic_store(&job->searching_page, page);
-        size_t count = 0;
-        if (!load_page(job, page, games, &count, &last)) {
-            if (job->http != 404 || page == 1)
-                snprintf(job->error, sizeof(job->error), "Пошук зупинився на сторінці %u (HTTP %ld)", page, job->http);
-            break;
-        }
-        if (!count || !strcmp(games[0].page, first)) break;
-        if (page == 1) strcpy(first, games[0].page);
-        for (size_t i = 0; i < count && job->count < CATALOG_SEARCH_LIMIT; ++i) {
-            if ((strcasestr(games[i].title, job->query) ||
-                 strcasestr(games[i].page + sizeof(LIST_URL) - 1, job->query)) &&
-                !contains(job->games, job->count, games[i].page)) {
-                job->games[job->count++] = games[i];
-            }
-        }
-    }
-    free(games);
+void catalog_request(CatalogJob *job) {
+    load_details(job);
 }
 
-void catalog_request(CatalogJob *job) {
-    if (job->request == CATALOG_DETAILS) {
-        load_details(job);
-    } else if (job->request == CATALOG_SEARCH) {
-        search_pages(job);
-    } else {
-        unsigned last = 0;
-        if (!load_page(job, job->page, job->games, &job->count, &last))
-            snprintf(job->error, sizeof(job->error), "Каталог недоступний (HTTP %ld)", job->http);
-        job->more = job->count && job->page < CATALOG_MAX_PAGES && (!last || job->page < last);
+static bool valid_game(const Game *game) {
+    if (!game->title[0] || !memchr(game->title, 0, sizeof(game->title)) ||
+        !memchr(game->page, 0, sizeof(game->page)) ||
+        !memchr(game->cover, 0, sizeof(game->cover))) return false;
+    char normalized[CATALOG_URL];
+    return game_page(BAD_CAST game->page, normalized) && !strcmp(normalized, game->page) &&
+        (!game->cover[0] || (site_url(BAD_CAST game->cover, normalized) &&
+                            !strcmp(normalized, game->cover)));
+}
+
+static bool read_cache_path(const char *path, CatalogIndex *index) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    char magic[8];
+    uint32_t count = 0;
+    int64_t saved_at = 0;
+    bool ok = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+       !memcmp(magic, CACHE_MAGIC, sizeof(magic)) &&
+       fread(&count, sizeof(count), 1, file) == 1 && count && count <= CATALOG_CAPACITY &&
+       fread(&saved_at, sizeof(saved_at), 1, file) == 1 &&
+       fread(index->games, sizeof(Game), count, file) == count &&
+       fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    for (size_t i = 0; ok && i < count; ++i) ok = valid_game(&index->games[i]);
+    if (ok) {
+        index->count = count;
+        index->saved_at = (time_t)saved_at;
     }
+    return ok;
+}
+
+bool catalog_read_cache(CatalogIndex *index) {
+    index->count = 0;
+    index->saved_at = 0;
+    return read_cache_path(CACHE_FILE, index) || read_cache_path(CACHE_BACKUP, index);
+}
+
+static bool save_cache(const CatalogIndex *index) {
+    if (mkdir(CACHE_DIR, 0777) && errno != EEXIST) return false;
+    FILE *file = fopen(CACHE_TEMP, "wb");
+    if (!file) return false;
+    const uint32_t count = (uint32_t)index->count;
+    const int64_t saved_at = index->saved_at;
+    bool ok = fwrite(CACHE_MAGIC, 1, 8, file) == 8 &&
+        fwrite(&count, sizeof(count), 1, file) == 1 &&
+        fwrite(&saved_at, sizeof(saved_at), 1, file) == 1 &&
+        fwrite(index->games, sizeof(Game), count, file) == count &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (fclose(file)) ok = false;
+
+    bool moved = false;
+    if (ok) {
+        struct stat st;
+        if (!stat(CACHE_FILE, &st)) {
+            unlink(CACHE_BACKUP);
+            moved = rename(CACHE_FILE, CACHE_BACKUP) == 0;
+            ok = moved;
+        } else {
+            ok = errno == ENOENT;
+        }
+        if (ok) ok = rename(CACHE_TEMP, CACHE_FILE) == 0;
+        if (ok) unlink(CACHE_BACKUP);
+        else if (moved) rename(CACHE_BACKUP, CACHE_FILE);
+    }
+    if (!ok) unlink(CACHE_TEMP);
+    return ok;
+}
+
+static void index_delay(void) {
+#ifdef __SWITCH__
+    svcSleepThread(200000000L);
+#else
+    usleep(200000);
+#endif
+}
+
+static bool wait_until_idle(CatalogIndexJob *job) {
+    while (atomic_load(&job->paused) && !atomic_load(&job->cancel)) index_delay();
+    return !atomic_load(&job->cancel);
+}
+
+void catalog_build_index(CatalogIndexJob *job) {
+    Game *games = calloc(CATALOG_PAGE_GAMES, sizeof(*games));
+    CURL *curl = curl_easy_init();
+    if (!games || !curl) {
+        strcpy(job->error, "Не вдалося підготувати індекс каталогу");
+        goto done;
+    }
+    for (unsigned page = 1; page <= CATALOG_MAX_PAGES && wait_until_idle(job); ++page) {
+        atomic_store(&job->page, page);
+        long status = 0;
+        size_t count = 0;
+        bool loaded = load_page(curl, job, page, games, &count, &status);
+        if (!loaded && (status == 0 || status >= 500) && wait_until_idle(job)) {
+            index_delay();
+            loaded = load_page(curl, job, page, games, &count, &status);
+        }
+        if (atomic_load(&job->cancel)) break;
+        unsigned pages = atomic_load(&job->pages);
+        if (!loaded) {
+            if (!pages && page > 1 && status == 404) job->complete = true;
+            else snprintf(job->error, sizeof(job->error), "Каталог · сторінка %u · HTTP %ld", page, status);
+            break;
+        }
+
+        size_t previous = job->index.count;
+        for (size_t i = 0; i < count; ++i) {
+            if (contains(job->index.games, job->index.count, games[i].page)) continue;
+            if (job->index.count == CATALOG_CAPACITY) {
+                strcpy(job->error, "Каталог перевищує місткість індексу");
+                goto done;
+            }
+            job->index.games[job->index.count++] = games[i];
+        }
+        atomic_store(&job->published, job->index.count);
+
+        if (job->index.count == previous) {
+            if (previous && !pages) job->complete = true;
+            else snprintf(job->error, sizeof(job->error), "Каталог · немає ігор на сторінці %u", page);
+            break;
+        }
+        if (pages && page >= pages) {
+            job->complete = true;
+            break;
+        }
+    }
+    if (wait_until_idle(job) && job->complete) {
+        job->index.saved_at = time(NULL);
+        if (!save_cache(&job->index)) strcpy(job->error, "Каталог завантажився. Кеш на microSD недоступний.");
+    } else if (!atomic_load(&job->cancel) && !job->error[0]) {
+        strcpy(job->error, "Оновлення каталогу не завершилося");
+    }
+done:
+    if (curl) curl_easy_cleanup(curl);
+    free(games);
 }

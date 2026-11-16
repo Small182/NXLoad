@@ -19,6 +19,7 @@ typedef struct {
     const char *result;
     long http;
     long api_http;
+    uint64_t avg_speed;
     char tls_detail[128];
     char path[256];
     const char *url;

@@ -1,4 +1,4 @@
-name: Inspect TitleDB and Nintendo Life
+name: Verify Nintendo Life game search
 on: [pull_request]
 permissions:
   contents: read
@@ -6,38 +6,20 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Retrieve the source catalog and example galleries
-        shell: bash
-        run: |
-          curl -fLsS --retry 1 'https://raw.githubusercontent.com/blawar/titledb/master/US.en.json' -o /tmp/titles.json &
-          curl -fLsS --retry 1 'https://www.nintendolife.com/games/nintendo-switch/1-2-switch' -o /tmp/1-2.html &
-          curl -fLsS --retry 1 'https://www.nintendolife.com/games/switch-eshop/mysims_cozy_bundle' -o /tmp/mysims.html &
-          curl -fLsS --retry 1 'https://www.nintendolife.com/search?term=MySims+Cozy+Bundle' -o /tmp/search.html &
+      - run: |
+          curl -fLsS 'https://www.nintendolife.com/games/nintendo-switch/1-2-switch' -o /tmp/first.html &
+          curl -fLsS 'https://www.nintendolife.com/games/switch-eshop/mysims_cozy_bundle' -o /tmp/second.html &
+          curl -fLsS 'https://www.nintendolife.com/search?q=MySims%20Cozy%20Bundle' -o /tmp/search.html &
+          curl -fLsS 'https://www.nintendolife.com/search?q=1-2-Switch' -o /tmp/search2.html &
           wait
           python3 - <<'PY'
-          import json, pathlib, re
-          from html.parser import HTMLParser
-          p=pathlib.Path('/tmp/titles.json')
-          d=json.loads(p.read_text())
-          print('TITLEDB', p.stat().st_size, type(d).__name__, len(d))
-          for key, record in d.items():
-              title=record.get('name', '')
-              norm=re.sub(r'[^a-z0-9]', '', title.lower()) if title else ''
-              if norm in ('12switch','mysimscozybundle','everybody12switch','12switch2'):
-                  print('RECORD', key, {k:(f'{len(v)} chars' if k in ('description','intro') and isinstance(v,str) else v) for k,v in record.items() if k not in ('screenshots',)})
-          class P(HTMLParser):
-              def handle_starttag(self, tag, attrs):
-                  a=dict(attrs)
-                  if tag == 'form' and ('search' in str(a) or 'search' in a.get('action','')): print('FORM', a)
-                  if tag == 'input' and (a.get('type')=='search' or a.get('name') in ('q','term','query')): print('INPUT', a)
-                  if tag == 'a' and a.get('href','').startswith('/games/') and 'search.html' in path.name:
-                      print('GAME_LINK', a.get('href'))
-                  if tag in ('section','div','ul','li','a','img','figure') and (
-                       any(term in str(a).lower() for term in ('screenshot', 'gallery', '#screenshots'))):
-                      print('GALLERY_MARKUP', tag, str(a)[:620])
-          for name in ('1-2.html','mysims.html','search.html'):
-              path=pathlib.Path('/tmp/'+name)
-              if path.exists():
-                  print('HTMLFILE', path.name, path.stat().st_size)
-                  P().feed(path.read_text())
+          import pathlib, re
+          for p in pathlib.Path('/tmp').glob('*.html'):
+              s=p.read_text()
+              print(p.name)
+              for a in re.findall(r'<h1\b[^>]*>.*?</h1>',s,re.S): print('HEADING',a[:500])
+              for a in re.findall(r'<(?:meta|link)\b[^>]*(?:canonical|og:title)[^>]+>',s): print('META',a[:500])
+              if 'search' in p.name:
+                  for a in re.findall(r'<a\b[^>]*href="[^"]*(?:1-2-switch|mysims_cozy_bundle)[^"]*"[^>]*>.*?</a>',s,re.S):
+                      print('SEARCH',a[:500])
           PY

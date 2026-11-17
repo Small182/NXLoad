@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #include "catalog.h"
-#include "eshop.h"
+#include "game_info.h"
 
 #define ROWS 9
 #define FILE_ROWS 5
@@ -64,10 +64,11 @@ typedef struct {
     GameTab game_tab;
     size_t screenshot_index;
     int description_scroll;
-    EshopGame shop;
-    EshopJob shop_job;
-    Thread shop_thread;
-    bool shop_busy, shop_requested;
+    GameMetadata metadata;
+    GameGallery gallery;
+    GalleryJob gallery_job;
+    Thread gallery_thread;
+    bool gallery_busy, gallery_requested;
     bool confirm_install, close, catalog_busy, download_busy, download_finished;
     char query[96], notice[192], game_error[192], file_id[DLARCHIVE_ID_CAPACITY];
     char transfer_name[CATALOG_TEXT];
@@ -144,7 +145,7 @@ static size_t move(size_t current, size_t count, u64 buttons) {
 }
 
 static void catalog_worker(void *arg) { catalog_request(arg); }
-static void shop_worker(void *arg) { eshop_lookup(arg); }
+static void gallery_worker(void *arg) { load_game_gallery(arg); }
 static void index_worker(void *arg) { catalog_build_index(arg); }
 static void download_worker(void *arg) { fichier_download(arg); }
 
@@ -281,19 +282,18 @@ static void pump_covers(void) {
         free(job->bytes);
         job->bytes = NULL;
     }
-    if (app.cover_busy || app.download_busy || app.shop_busy) return;
+    if (app.cover_busy || app.download_busy || app.gallery_busy) return;
 
     const char *url = NULL;
     bool screenshot = false;
     if (app.screen == GAME) {
-        if (app.game_tab == GAME_SCREENSHOTS && app.shop.screenshot_count) {
-            const char *image = app.shop.screenshots[app.screenshot_index];
+        if (app.game_tab == GAME_SCREENSHOTS && app.gallery.count) {
+            const char *image = app.gallery.screenshots[app.screenshot_index];
             if (!find_cover(image)) {
                 screenshot = true;
                 url = image;
             }
         }
-        if (!url && app.shop.cover[0] && !find_cover(app.shop.cover)) url = app.shop.cover;
     } else if (app.screen == LIBRARY && app.game_count) {
         const char *selected_cover = game_at(app.game_index)->cover;
         if (selected_cover[0] && !find_cover(selected_cover)) {
@@ -330,7 +330,7 @@ static void update_description(void) {
     SDL_DestroyTexture(app.description);
     app.description = NULL;
     app.description_scroll = 0;
-    const char *summary = app.shop.description;
+    const char *summary = app.metadata.description;
     if (!*summary) return;
     SDL_Surface *paragraph = TTF_RenderUTF8_Blended_Wrapped(app.normal, summary, gray, 750);
     if (!paragraph) return;
@@ -338,27 +338,28 @@ static void update_description(void) {
     SDL_FreeSurface(paragraph);
 }
 
-static void pump_shop(void) {
-    EshopJob *job = &app.shop_job;
-    if (app.shop_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.shop_thread), 0))) {
-        threadWaitForExit(&app.shop_thread);
-        threadClose(&app.shop_thread);
-        app.shop_busy = false;
-        if (!atomic_load(&job->cancel) && !strcmp(job->game.page, app.active_game.page)) {
-            app.shop = job->match;
-            update_description();
-        }
+static void pump_gallery(void) {
+    GalleryJob *job = &app.gallery_job;
+    if (app.gallery_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.gallery_thread), 0))) {
+        threadWaitForExit(&app.gallery_thread);
+        threadClose(&app.gallery_thread);
+        app.gallery_busy = false;
+        if (!atomic_load(&job->cancel) && !strcmp(job->page, app.active_game.page))
+            app.gallery = job->result;
     }
-    if (app.screen == GAME && !app.shop_busy && !app.shop_requested &&
+    if (app.screen == GAME && app.game_tab == GAME_SCREENSHOTS &&
+        !app.gallery_busy && !app.gallery_requested &&
         !app.download_busy && !app.catalog_busy && !app.cover_busy) {
         memset(job, 0, sizeof(*job));
         atomic_init(&job->cancel, false);
-        job->game = app.active_game;
-        if (app.details.title[0])
-            strcpy(job->heading, app.details.title);
-        app.shop_requested = true;
-        app.shop_busy = start_worker(&app.shop_thread, shop_worker, job);
-        if (!app.shop_busy) strcpy(app.shop.issue, "Не вдалося запустити запит Nintendo eShop");
+        strcpy(job->page, app.active_game.page);
+        strcpy(job->title, app.metadata.title);
+        strcpy(job->heading, app.details.title);
+        strcpy(job->catalog_title, app.active_game.title);
+        app.gallery_requested = true;
+        app.gallery_busy = start_worker(&app.gallery_thread, gallery_worker, job);
+        if (!app.gallery_busy)
+            strcpy(app.gallery.issue, "Не вдалося запустити запит Nintendo Life");
     }
 }
 
@@ -392,7 +393,9 @@ static void refresh_saved(void) {
 static void pump_index(void) {
     if (!app.index_busy) return;
     CatalogIndexJob *job = &app.index_job;
-    bool game_request = app.screen == GAME && (app.catalog_busy || app.shop_busy || !app.shop_requested);
+    bool game_request = app.screen == GAME &&
+        (app.catalog_busy || app.gallery_busy ||
+         (app.game_tab == GAME_SCREENSHOTS && !app.gallery_requested));
     atomic_store(&job->paused, app.download_busy || game_request);
     size_t published = atomic_load(&job->published);
     if (app.show_partial_index && published > app.catalog.count) {
@@ -428,6 +431,9 @@ static void finish_jobs(void) {
             app.details = job->details;
             strcpy(app.game_error, job->error);
             update_cover();
+            if (!app.metadata.title[0] &&
+                read_game_metadata(&app.metadata, app.active_game.title, app.details.title))
+                update_description();
         } else {
             free(job->details.cover);
         }
@@ -547,7 +553,7 @@ static void input(u64 buttons) {
     if (app.screen == GAME) {
         if (buttons & HidNpadButton_B) {
             if (app.catalog_busy) atomic_store(&app.pending.cancel, true);
-            if (app.shop_busy) atomic_store(&app.shop_job.cancel, true);
+            if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
             app.notice[0] = 0;
             app.screen = LIBRARY;
             return;
@@ -561,7 +567,7 @@ static void input(u64 buttons) {
         } else if (app.game_tab == GAME_SCREENSHOTS) {
             if (app.screenshot_index && (buttons & (HidNpadButton_Left | HidNpadButton_StickLLeft)))
                 --app.screenshot_index;
-            if (app.screenshot_index + 1 < app.shop.screenshot_count &&
+            if (app.screenshot_index + 1 < app.gallery.count &&
                 (buttons & (HidNpadButton_Right | HidNpadButton_StickLRight))) ++app.screenshot_index;
             if (buttons & HidNpadButton_A) app.game_tab = GAME_FILES;
         } else {
@@ -592,8 +598,10 @@ static void input(u64 buttons) {
         } else if (!app.catalog_busy) {
             app.active_game = *game_at(app.game_index);
             memset(&app.details, 0, sizeof(app.details));
-            memset(&app.shop, 0, sizeof(app.shop));
-            app.shop_requested = false;
+            memset(&app.metadata, 0, sizeof(app.metadata));
+            memset(&app.gallery, 0, sizeof(app.gallery));
+            read_game_metadata(&app.metadata, app.active_game.title, "");
+            app.gallery_requested = false;
             SDL_DestroyTexture(app.cover);
             app.cover = NULL;
             update_description();
@@ -660,20 +668,18 @@ static void draw_library(void) {
 
 static void draw_cover(void) {
     rect(56, 127, 308, 308, background);
-    CachedCover *official = find_cover(app.shop.cover);
     CachedCover *preview = find_cover(app.active_game.cover);
-    SDL_Texture *cover = official && official->texture ? official->texture :
-                         app.cover ? app.cover : preview ? preview->texture : NULL;
+    SDL_Texture *cover = app.cover ? app.cover : preview ? preview->texture : NULL;
     fit_cover(cover, 56, 127, 308, 308);
     text(app.normal, "Nintendo Switch", 65, 459, 293, white);
-    text(app.small, app.shop.publisher, 65, 498, 293, gray);
-    if (app.shop.released[0]) {
+    text(app.small, app.metadata.publisher, 65, 498, 293, gray);
+    if (app.metadata.released[0]) {
         char release[48];
-        snprintf(release, sizeof(release), "Вихід · %s", app.shop.released);
+        snprintf(release, sizeof(release), "Вихід · %s", app.metadata.released);
         text(app.small, release, 65, 529, 293, gray);
     }
-    if (app.shop.page[0])
-        text(app.small, "Дані Nintendo eShop", 65, 596, 293, blue);
+    if (app.metadata.title[0])
+        text(app.small, "Дані TitleDB", 65, 596, 293, blue);
 }
 
 static void draw_game_overview(void) {
@@ -688,23 +694,22 @@ static void draw_game_overview(void) {
                 text(app.small, "↑ / ↓  Читати опис", 430, 522, 769, gray);
         }
     } else {
-        text(app.normal, app.shop_busy || !app.shop_requested ? "Завантаження опису…" :
-             app.shop.issue[0] ? app.shop.issue : "Опис із Nintendo eShop недоступний", 430, 269, 769, gray);
+        text(app.normal, !app.metadata.title[0] && app.catalog_busy ? "Пошук у TitleDB…" :
+             "Опису в TitleDB немає", 430, 269, 769, gray);
     }
     text(app.small, app.catalog_busy ? "Перевірка файлів NSRoms…" :
          "A  Перейти до файлів", 430, 577, 769, blue);
 }
 
 static void draw_game_screenshots(void) {
-    if (!app.shop.screenshot_count) {
-        const char *status = app.shop_busy || !app.shop_requested ? "Пошук скриншотів…" :
-                             app.shop.issue[0] ? app.shop.issue :
-                             app.shop.page[0] ? "Скриншоти Nintendo eShop недоступні" :
-                             "Дані гри в Nintendo eShop недоступні";
+    if (!app.gallery.count) {
+        const char *status = app.gallery_busy || !app.gallery_requested ? "Пошук скриншотів…" :
+                             app.gallery.issue[0] ? app.gallery.issue :
+                             "Скриншоти Nintendo Life недоступні";
         text(app.normal, status, 430, 273, 769, gray);
         return;
     }
-    const char *url = app.shop.screenshots[app.screenshot_index];
+    const char *url = app.gallery.screenshots[app.screenshot_index];
     CachedCover *shot = find_cover(url);
     rect(430, 259, 774, 309, background);
     if (shot && shot->texture) fit_cover(shot->texture, 430, 259, 774, 309);
@@ -712,7 +717,7 @@ static void draw_game_screenshots(void) {
               app.download_busy ? "Перегляд доступний після завершення завантаження" :
               "Завантаження скриншота…", 452, 281, 724, gray);
     char count[80];
-    snprintf(count, sizeof(count), "← / →   %zu / %zu", app.screenshot_index + 1, app.shop.screenshot_count);
+    snprintf(count, sizeof(count), "← / →   %zu / %zu  ·  Nintendo Life", app.screenshot_index + 1, app.gallery.count);
     text(app.small, count, 430, 584, 769, blue);
 }
 
@@ -735,7 +740,7 @@ static void draw_game(void) {
     rect(40, 106, 345, 530, panel);
     rect(401, 106, 839, 530, panel);
     draw_cover();
-    const char *title = app.shop.title[0] ? app.shop.title :
+    const char *title = app.metadata.title[0] ? app.metadata.title :
                         app.details.title[0] ? app.details.title : app.active_game.title;
     text(app.large, title, 430, 130, 772, white);
     const char *tabs[] = {"Огляд", "Скриншоти", "Файли"};
@@ -796,7 +801,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.8", 206, 44, 120, gray);
+    text(app.small, "1.0.9", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -881,7 +886,7 @@ int main(void) {
             held = vertical;
             input(buttons);
             pump_index();
-            pump_shop();
+            pump_gallery();
             pump_covers();
             if (buttons || now >= next_frame) {
                 draw();
@@ -901,7 +906,7 @@ int main(void) {
         consoleExit(NULL);
     }
     if (app.index_busy) atomic_store(&app.index_job.cancel, true);
-    if (app.shop_busy) atomic_store(&app.shop_job.cancel, true);
+    if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
     if (app.catalog_busy) {
         atomic_store(&app.pending.cancel, true);
         threadWaitForExit(&app.catalog_thread);
@@ -923,9 +928,9 @@ int main(void) {
         threadWaitForExit(&app.index_thread);
         threadClose(&app.index_thread);
     }
-    if (app.shop_busy) {
-        threadWaitForExit(&app.shop_thread);
-        threadClose(&app.shop_thread);
+    if (app.gallery_busy) {
+        threadWaitForExit(&app.gallery_thread);
+        threadClose(&app.gallery_thread);
     }
     for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
     SDL_DestroyTexture(app.cover);

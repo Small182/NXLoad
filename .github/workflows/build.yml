@@ -1,25 +1,95 @@
-name: Verify Nintendo Life game search
-on: [pull_request]
+name: Build NXLoad
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
-  inspect:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build curl and Mbed TLS for Switch
+        run: bash tools/build-network.sh
+      - run: make -j2
+      - name: Check DLArchive TLS chain
+        continue-on-error: true
+        run: |
+          status=0
+          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
+            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
+            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
+            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
+          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NXLoad
+          path: NXLoad.nro
+          if-no-files-found: error
+
+  metadata-smoke:
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          curl -fLsS 'https://www.nintendolife.com/games/nintendo-switch/1-2-switch' -o /tmp/first.html &
-          curl -fLsS 'https://www.nintendolife.com/games/switch-eshop/mysims_cozy_bundle' -o /tmp/second.html &
-          curl -fLsS 'https://www.nintendolife.com/search?q=MySims%20Cozy%20Bundle' -o /tmp/search.html &
-          curl -fLsS 'https://www.nintendolife.com/search?q=1-2-Switch' -o /tmp/search2.html &
-          wait
-          python3 - <<'PY'
-          import pathlib, re
-          for p in pathlib.Path('/tmp').glob('*.html'):
-              s=p.read_text()
-              print(p.name)
-              for a in re.findall(r'<h1\b[^>]*>.*?</h1>',s,re.S): print('HEADING',a[:500])
-              for a in re.findall(r'<(?:meta|link)\b[^>]*(?:canonical|og:title)[^>]+>',s): print('META',a[:500])
-              if 'search' in p.name:
-                  for a in re.findall(r'<a\b[^>]*href="[^"]*(?:1-2-switch|mysims_cozy_bundle)[^"]*"[^>]*>.*?</a>',s,re.S):
-                      print('SEARCH',a[:500])
-          PY
+      - uses: actions/checkout@v4
+      - name: Verify bundled TitleDB and both live Nintendo Life galleries
+        run: |
+          if ! pkg-config --exists libxml-2.0 libcurl zlib; then
+            sudo apt-get update
+            sudo apt-get install -y libxml2-dev libcurl4-openssl-dev zlib1g-dev
+          fi
+          python3 tools/build-metadata.py /tmp/titledb.bin
+          mkdir 'romfs:'
+          ln -s ../romfs/cacert.pem 'romfs:/cacert.pem'
+          cat > /tmp/nxload-metadata.c <<'C'
+          #include "game_info.h"
+          #include <curl/curl.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          int main(void) {
+              struct {
+                  const char *catalog, *heading, *title, *publisher, *date, *slug;
+                  size_t screenshots;
+              } cases[] = {
+                  {"1-2 Switch NSP ROM Download", "", "1-2-Switch™", "Nintendo", "2017-03-03",
+                   "1-2-switch", 9},
+                  {"MySims Cozy Bundle Switch", "MySims Cozy Bundle Switch ROM Download",
+                   "MySims™: Cozy Bundle", "Electronic Arts", "2024-11-19", "mysims-cozy-bundle-switch", 15},
+              };
+              for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+                  GameMetadata game = {0};
+                  if (!read_game_metadata(&game, cases[i].catalog, cases[i].heading)) {
+                      fprintf(stderr, "No local match for %s\n", cases[i].catalog);
+                      return 1;
+                  }
+                  printf("TitleDB: %s · %s · %s · %zu description bytes\n",
+                         game.title, game.publisher, game.released, strlen(game.description));
+                  if (strcmp(game.title, cases[i].title) || strcmp(game.publisher, cases[i].publisher) ||
+                      strcmp(game.released, cases[i].date) || strlen(game.description) < 100) return 2;
+                  GalleryJob gallery = {0};
+                  snprintf(gallery.page, sizeof(gallery.page), "https://nsroms.net/roms/%s/", cases[i].slug);
+                  strcpy(gallery.title, game.title);
+                  if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 3;
+                  load_game_gallery(&gallery);
+                  printf("Nintendo Life: %s · %zu screenshots · %s\n",
+                         game.title, gallery.result.count, gallery.result.issue);
+                  if (gallery.result.count != cases[i].screenshots) return 4;
+                  size_t size;
+                  unsigned char *image = catalog_fetch_cover(gallery.result.screenshots[0], &gallery.cancel, &size);
+                  if (!image || size < 2 || image[0] != 0xff || image[1] != 0xd8) return 5;
+                  printf("Nintendo Life JPEG: %zu bytes\n", size);
+                  free(image);
+                  curl_global_cleanup();
+              }
+              GameMetadata invalid = {0};
+              if (read_game_metadata(&invalid, "1-2 Switch Deluxe NSP ROM Download", "")) return 6;
+              return 0;
+          }
+          C
+          cc -std=c11 -Wall -Wextra -Werror -DTITLEDB_PATH='"/tmp/titledb.bin"' -I source /tmp/nxload-metadata.c source/game_info.c source/catalog.c $(pkg-config --cflags --libs libxml-2.0 libcurl zlib) -o /tmp/nxload-metadata
+          /tmp/nxload-metadata

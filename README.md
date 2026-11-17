@@ -1,6 +1,8 @@
 # NXLoad
 
-Відкрий картку гри кнопкою **A**. **L/R** перемикають огляд, скриншоти та файли. У галереї гортай стрілками **←/→**. Опис, обкладинка та скриншоти надходять із європейського Nintendo eShop за підходом [favna/nintendo-switch-eshop](https://github.com/favna/nintendo-switch-eshop). NXLoad зіставляє назву гри з однозначним записом для Nintendo Switch. Файли картки надходять із вибраної сторінки NSRoms через DLArchive.
+Відкрий картку гри кнопкою **A**. **L/R** перемикають огляд, скриншоти та файли. У галереї гортай стрілками **←/→**.
+
+Назва, опис, видавець і дата виходу беруться з англомовного індексу [TitleDB](https://github.com/blawar/titledb), вбудованого в `NXLoad.nro`. Для читання цих даних інтернет не потрібен. Галерея завантажує знімки з [Nintendo Life](https://www.nintendolife.com/games) після відкриття вкладки «Скриншоти». Обкладинка та перелік файлів надходять зі сторінки NSRoms. Завантаження файлів іде через DLArchive.
 
 Файли від 32 МіБ NXLoad завантажує у 4 з’єднання, а від 512 МіБ у 8. Сервер DLArchive має підтримувати HTTP Range і надавати сильний ETag. Окремий потік записує отримані блоки на microSD, поки триває передача. Якщо сервер ігнорує запити по частинах, NXLoad використовує один потік.
 
@@ -18,7 +20,7 @@ NXLoad читає каталог з NSRoms і отримує актуальне 
 
 ## Збірка
 
-Потрібні devkitA64, libnx, switch-tools, switch-pkg-config, switch-sdl2, switch-sdl2_ttf, switch-sdl2_image, switch-libxml2 і switch-zlib. Запусти `bash tools/build-network.sh`, потім `make`. GitHub Actions зберігає готовий `NXLoad.nro` в артефакті `NXLoad`.
+Потрібні Python 3, devkitA64, libnx, switch-tools, switch-pkg-config, switch-sdl2, switch-sdl2_ttf, switch-sdl2_image, switch-libxml2 і switch-zlib. Запусти `bash tools/build-network.sh`, потім `make`. Під час першої збірки Make завантажує зафіксований знімок TitleDB і формує індекс ROMFS. GitHub Actions зберігає готовий `NXLoad.nro` в артефакті `NXLoad`.
 
 NXLoad перевіряє HTTPS через Mbed TLS з вбудованим набором публічних кореневих сертифікатів [Mozilla CA](https://curl.se/docs/caextract.html), ліцензія MPL 2.0.
 

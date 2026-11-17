@@ -36,7 +36,7 @@ all: $(TITLEDB) $(GALLERIES)
 	@mkdir -p build
 	@$(MAKE) --no-print-directory -C build -f $(TOPDIR)/Makefile
 
-$(TITLEDB): $(TOPDIR)/tools/build-metadata.py $(TOPDIR)/tools/descriptions.uk.json $(TOPDIR)/tools/title_db.py $(wildcard $(TOPDIR)/tools/translations.uk.json.gz) $(wildcard $(TOPDIR)/tools/translations.ai.uk.json.gz)
+$(TITLEDB): $(TOPDIR)/tools/build-metadata.py $(TOPDIR)/tools/descriptions.uk.json $(TOPDIR)/tools/title_db.py $(wildcard $(TOPDIR)/tools/translations.uk.json.gz) $(wildcard $(TOPDIR)/tools/translations.ai.uk.json.gz) $(wildcard $(TOPDIR)/tools/translations.local.uk.json.gz)
 	python3 $< $@
 
 $(GALLERIES): $(TOPDIR)/tools/build-galleries.py

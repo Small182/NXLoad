@@ -13,6 +13,7 @@
 
 typedef struct {
     atomic_bool cancelled;
+    atomic_bool unpacking;
     atomic_uint_fast64_t received;
     atomic_uint_fast64_t total;
     atomic_uint streams;
@@ -26,7 +27,11 @@ typedef struct {
     const char *url;
     bool megaup;
     bool dlarchive;
+    bool datanodes;
+    bool romshq;
+    bool local_unpack;
     const char *dlarchive_id;
+    const char *romshq_id;
 } FichierJob;
 
 void fichier_download(FichierJob *job);

@@ -14,6 +14,10 @@
 #define CATALOG_MAX_PAGES 120
 #define CATALOG_CACHE_TTL (24 * 60 * 60)
 #define CATALOG_FILE_COUNT 24
+#define CATALOG_SCREENSHOTS 32
+
+typedef enum { CATALOG_NSROMS, CATALOG_ROMSHQ } CatalogSource;
+typedef enum { FILE_DLARCHIVE, FILE_ROMSHQ_SIGNED, FILE_DATANODES, FILE_1FICHIER } GameFileSource;
 
 typedef struct {
     char title[CATALOG_TEXT];
@@ -24,18 +28,23 @@ typedef struct {
 typedef struct {
     char title[CATALOG_TEXT];
     char id[DLARCHIVE_ID_CAPACITY];
+    char url[CATALOG_URL];
+    GameFileSource source;
 } GameFile;
 
 typedef struct {
     char title[CATALOG_TEXT];
     GameFile files[CATALOG_FILE_COUNT];
     size_t count;
+    char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL];
+    size_t screenshot_count;
     unsigned char *cover;
     size_t cover_bytes;
 } GameDetails;
 
 typedef struct {
     Game game;
+    CatalogSource source;
     atomic_bool cancel;
     long http;
     char error[CATALOG_TEXT];
@@ -55,6 +64,7 @@ typedef struct {
 
 typedef struct {
     CatalogIndex index;
+    CatalogSource source;
     atomic_bool cancel;
     atomic_bool paused;
     atomic_size_t published;
@@ -66,7 +76,7 @@ typedef struct {
 
 void catalog_request(CatalogJob *job);
 void catalog_build_index(CatalogIndexJob *job);
-bool catalog_read_cache(CatalogIndex *index);
+bool catalog_read_cache(CatalogIndex *index, CatalogSource source);
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes);
 unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
                                       CatalogFetchStatus *status);

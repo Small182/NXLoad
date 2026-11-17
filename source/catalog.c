@@ -19,6 +19,9 @@
 
 #define SITE "https://nsroms.net"
 #define LIST_URL SITE "/roms/"
+#define ROMSHQ "https://romshq.com"
+#define ROMSHQ_GAME ROMSHQ "/game/"
+#define ROMSHQ_LIST ROMSHQ "/browse?scene=62"
 #define DRIVE_PREFIX "https://drive.dlarchive.my.id/dl/?id="
 #define PAGE_BYTES (4 * 1024 * 1024)
 #define COVER_BYTES (2 * 1024 * 1024)
@@ -27,9 +30,6 @@
 #else
 #define CACHE_DIR "./NXLoad-cache"
 #endif
-#define CACHE_FILE CACHE_DIR "/catalog.bin"
-#define CACHE_TEMP CACHE_DIR "/catalog.tmp"
-#define CACHE_BACKUP CACHE_DIR "/catalog.prev"
 #define CACHE_MAGIC "NXLCAT02"
 
 typedef struct {
@@ -169,21 +169,27 @@ static xmlNodePtr find_tag(xmlNodePtr node, const char *name) {
     return NULL;
 }
 
-static bool site_url(const xmlChar *href, char out[CATALOG_URL]) {
+static bool site_url(const xmlChar *href, char out[CATALOG_URL], CatalogSource source) {
     if (!href) return false;
-    xmlChar *url = xmlBuildURI(href, BAD_CAST SITE "/");
-    bool valid = url && !strncmp((char *)url, SITE "/", sizeof(SITE)) &&
+    const char *base = source == CATALOG_ROMSHQ ? ROMSHQ "/" : SITE "/";
+    xmlChar *url = xmlBuildURI(href, BAD_CAST base);
+    bool valid = url && !strncmp((char *)url, base, strlen(base)) &&
         strlen((char *)url) < CATALOG_URL;
     if (valid) strcpy(out, (char *)url);
     xmlFree(url);
     return valid;
 }
 
-static bool game_page(const xmlChar *href, char out[CATALOG_URL]) {
-    if (!site_url(href, out) || strncmp(out, LIST_URL, sizeof(LIST_URL) - 1)) return false;
-    char *slug = out + sizeof(LIST_URL) - 1;
+static bool game_page(const xmlChar *href, char out[CATALOG_URL], CatalogSource source) {
+    const char *prefix = source == CATALOG_ROMSHQ ? ROMSHQ_GAME : LIST_URL;
+    if (!site_url(href, out, source) || strncmp(out, prefix, strlen(prefix))) return false;
+    char *slug = out + strlen(prefix);
     size_t n = strspn(slug, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%-_");
     if (!n || (slug[n] && strcmp(slug + n, "/"))) return false;
+    if (source == CATALOG_ROMSHQ) {
+        slug[n] = 0;
+        return true;
+    }
     if (!slug[n]) {
         if ((size_t)(slug - out) + n + 1 >= CATALOG_URL) return false;
         strcpy(slug + n, "/");
@@ -191,7 +197,7 @@ static bool game_page(const xmlChar *href, char out[CATALOG_URL]) {
     return true;
 }
 
-static void read_cover(xmlNodePtr img, char out[CATALOG_URL]) {
+static void read_cover(xmlNodePtr img, char out[CATALOG_URL], CatalogSource source) {
     if (!img) return;
     const char *keys[] = {"data-src", "data-lazy-src", "data-srcset", "srcset", "src"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
@@ -200,19 +206,19 @@ static void read_cover(xmlNodePtr img, char out[CATALOG_URL]) {
             size_t first = strcspn((char *)value, " \t,\r\n");
             value[first] = 0;
         }
-        bool ok = value && *value && site_url(value, out);
+        bool ok = value && *value && site_url(value, out, source);
         xmlFree(value);
         if (ok) return;
     }
 }
 
-static void read_game(xmlNodePtr anchor, Game *game) {
+static void read_game(xmlNodePtr anchor, Game *game, CatalogSource source) {
     xmlNodePtr heading = find_tag(anchor->children, "h3");
     if (!heading) heading = find_tag(anchor->children, "h2");
     if (!heading) heading = find_tag(anchor->children, "h4");
     if (heading) node_text(heading, game->title);
     xmlNodePtr img = find_tag(anchor->children, "img");
-    read_cover(img, game->cover);
+    read_cover(img, game->cover, source);
     if (!game->title[0] && img) {
         xmlChar *alt = xmlGetProp(img, BAD_CAST "alt");
         copy_text(game->title, sizeof(game->title), alt);
@@ -220,7 +226,7 @@ static void read_game(xmlNodePtr anchor, Game *game) {
     }
     if (!game->title[0]) node_text(anchor, game->title);
     if (!game->title[0]) {
-        const char *slug = game->page + sizeof(LIST_URL) - 1;
+        const char *slug = game->page + strlen(source == CATALOG_ROMSHQ ? ROMSHQ_GAME : LIST_URL);
         size_t n = strcspn(slug, "/");
         if (n >= sizeof(game->title)) n = sizeof(game->title) - 1;
         for (size_t i = 0; i < n; ++i) game->title[i] = slug[i] == '-' ? ' ' : slug[i];
@@ -232,19 +238,62 @@ static bool contains(const Game *games, size_t count, const char *url) {
     return false;
 }
 
-static void read_catalog(xmlNodePtr node, Game *games, size_t *count) {
+static void romshq_platform(xmlNodePtr node, bool *switch_game, bool *other) {
+    for (; node; node = node->next) {
+        if (node->type != XML_ELEMENT_NODE) continue;
+        if (is_element(node, "span") || is_element(node, "small") || is_element(node, "strong") ||
+            is_element(node, "div")) {
+            char label[CATALOG_TEXT];
+            node_text(node, label);
+            if (!strcasecmp(label, "Switch") || !strcasecmp(label, "Nintendo Switch")) *switch_game = true;
+            if (!strcasecmp(label, "Switch 2") || !strcasecmp(label, "Nintendo Switch 2") ||
+                !strcasecmp(label, "Switch2") || !strcasecmp(label, "Nintendo Switch2") ||
+                !strcasecmp(label, "PS5") || !strcasecmp(label, "PlayStation 5")) *other = true;
+        }
+        romshq_platform(node->children, switch_game, other);
+    }
+}
+
+static bool romshq_other_game(xmlNodePtr node, const char *page) {
+    for (; node; node = node->next) {
+        if (is_element(node, "a")) {
+            xmlChar *href = xmlGetProp(node, BAD_CAST "href");
+            char target[CATALOG_URL];
+            bool other = game_page(href, target, CATALOG_ROMSHQ) && strcmp(page, target);
+            xmlFree(href);
+            if (other) return true;
+        }
+        if (romshq_other_game(node->children, page)) return true;
+    }
+    return false;
+}
+
+static xmlNodePtr romshq_card(xmlNodePtr link, const char *page) {
+    for (unsigned depth = 0; link && depth < 4; ++depth, link = link->parent) {
+        if (romshq_other_game(link->children, page)) return NULL;
+        bool switch_game = false, other = false;
+        romshq_platform(link->children, &switch_game, &other);
+        if (other) return NULL;
+        if (switch_game && (find_tag(link->children, "h4") ||
+                            find_tag(link->children, "h3") || find_tag(link->children, "h2"))) return link;
+    }
+    return NULL;
+}
+
+static void read_catalog(xmlNodePtr node, Game *games, size_t *count, CatalogSource source) {
     for (; node && *count < CATALOG_PAGE_GAMES; node = node->next) {
         if (is_element(node, "a")) {
             xmlChar *href = xmlGetProp(node, BAD_CAST "href");
             Game game = {0};
-            bool ok = game_page(href, game.page);
+            bool ok = game_page(href, game.page, source);
+            xmlNodePtr card = ok && source == CATALOG_ROMSHQ ? romshq_card(node, game.page) : node;
             xmlFree(href);
-            if (ok && !contains(games, *count, game.page)) {
-                read_game(node, &game);
+            if (ok && card && !contains(games, *count, game.page)) {
+                read_game(card, &game, source);
                 if (game.title[0]) games[(*count)++] = game;
             }
         }
-        read_catalog(node->children, games, count);
+        read_catalog(node->children, games, count, source);
     }
 }
 
@@ -260,13 +309,18 @@ static unsigned declared_pages(xmlDocPtr doc) {
 
 static bool load_page(CURL *curl, CatalogIndexJob *job, unsigned page,
                       Game *games, size_t *count, long *status) {
-    char url[CATALOG_URL] = LIST_URL;
-    if (page > 1) snprintf(url, sizeof(url), LIST_URL "page/%u/", page);
+    char url[CATALOG_URL];
+    if (job->source == CATALOG_ROMSHQ)
+        snprintf(url, sizeof(url), ROMSHQ_LIST "&page=%u", page);
+    else if (page > 1)
+        snprintf(url, sizeof(url), LIST_URL "page/%u/", page);
+    else
+        strcpy(url, LIST_URL);
     htmlDocPtr doc = fetch_page(curl, &job->cancel, url, status);
     if (!doc) return false;
     *count = 0;
-    read_catalog(xmlDocGetRootElement(doc), games, count);
-    unsigned pages = declared_pages(doc);
+    read_catalog(xmlDocGetRootElement(doc), games, count, job->source);
+    unsigned pages = job->source == CATALOG_NSROMS ? declared_pages(doc) : 0;
     if (pages) atomic_store(&job->pages, pages);
     xmlFreeDoc(doc);
     return true;
@@ -296,6 +350,119 @@ static void read_files(xmlNodePtr node, GameDetails *details) {
     }
 }
 
+static xmlNodePtr romshq_section(xmlNodePtr node, const char *heading, const char *id) {
+    for (; node; node = node->next) {
+        if (node->type != XML_ELEMENT_NODE) continue;
+        xmlChar *value = xmlGetProp(node, BAD_CAST "id");
+        bool identified = value && !xmlStrcasecmp(value, BAD_CAST id) && !is_element(node, "a");
+        xmlFree(value);
+        if (identified) return node;
+        if (is_element(node, "h2") || is_element(node, "h3")) {
+            char title[CATALOG_TEXT];
+            node_text(node, title);
+            if (!strcasecmp(title, heading)) return node->parent;
+        }
+        xmlNodePtr found = romshq_section(node->children, heading, id);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static bool romshq_id(const char *value, char id[DLARCHIVE_ID_CAPACITY]) {
+    if (!value) return false;
+    size_t digits = strspn(value, "0123456789");
+    if (!digits || digits > 20 || value[digits]) return false;
+    strcpy(id, value);
+    return true;
+}
+
+static bool romshq_button_id(xmlNodePtr node, char id[DLARCHIVE_ID_CAPACITY]) {
+    if (!xmlHasProp(node, BAD_CAST "data-romshq-download")) return false;
+    xmlChar *value = xmlGetProp(node, BAD_CAST "data-video-id");
+    bool ok = romshq_id((char *)value, id);
+    xmlFree(value);
+    return ok;
+}
+
+static void romshq_file_title(xmlNodePtr node, char title[CATALOG_TEXT]) {
+    for (unsigned depth = 0; node && depth < 4; ++depth, node = node->parent) {
+        char label[CATALOG_TEXT];
+        node_text(node, label);
+        if (strcasestr(label, "Base Game") || strcasestr(label, "Download Here")) {
+            strcpy(title, "Базова гра");
+            return;
+        }
+        if (strcasestr(label, "Update")) {
+            strcpy(title, "Оновлення");
+            return;
+        }
+        if (strcasestr(label, "DLC")) {
+            strcpy(title, "DLC");
+            return;
+        }
+        if (strcasestr(label, "Mirror")) {
+            snprintf(title, CATALOG_TEXT, "%s", label);
+            return;
+        }
+    }
+    strcpy(title, "Файл ROMsHQ");
+}
+
+static void read_romshq_files(xmlNodePtr node, GameDetails *details) {
+    for (; node && details->count < CATALOG_FILE_COUNT; node = node->next) {
+        if (is_element(node, "a") || is_element(node, "button")) {
+            GameFile file = {0};
+            xmlChar *href = xmlGetProp(node, BAD_CAST "href");
+            bool valid = romshq_button_id(node, file.id);
+            if (valid) file.source = FILE_ROMSHQ_SIGNED;
+            else if (href && strlen((char *)href) < sizeof(file.url)) {
+                const char *link = (const char *)href;
+                if (!strncmp(link, "https://datanodes.to/", sizeof("https://datanodes.to/") - 1)) {
+                    file.source = FILE_DATANODES;
+                    valid = true;
+                } else if (!strncmp(link, "https://1fichier.com/", sizeof("https://1fichier.com/") - 1)) {
+                    file.source = FILE_1FICHIER;
+                    valid = true;
+                }
+                if (valid) strcpy(file.url, link);
+            }
+            xmlFree(href);
+            for (size_t i = 0; valid && i < details->count; ++i) {
+                const GameFile *previous = &details->files[i];
+                if (previous->source == file.source && !strcmp(previous->id, file.id) &&
+                    !strcmp(previous->url, file.url)) valid = false;
+            }
+            if (valid) {
+                romshq_file_title(node, file.title);
+                details->files[details->count++] = file;
+            }
+        }
+        read_romshq_files(node->children, details);
+    }
+}
+
+static void read_romshq_screenshots(xmlNodePtr node, GameDetails *details) {
+    for (; node && details->screenshot_count < CATALOG_SCREENSHOTS; node = node->next) {
+        if (is_element(node, "a") || is_element(node, "img")) {
+            xmlChar *value = xmlGetProp(node, BAD_CAST (is_element(node, "a") ? "href" : "data-src"));
+            if (!value && is_element(node, "img")) value = xmlGetProp(node, BAD_CAST "src");
+            char url[CATALOG_URL];
+            bool valid = site_url(value, url, CATALOG_ROMSHQ);
+            xmlFree(value);
+            if (valid) {
+                const char *extension = strrchr(url, '.');
+                valid = extension && (!strcasecmp(extension, ".jpg") ||
+                    !strcasecmp(extension, ".jpeg") || !strcasecmp(extension, ".png") ||
+                    !strcasecmp(extension, ".webp"));
+            }
+            for (size_t i = 0; valid && i < details->screenshot_count; ++i)
+                if (!strcmp(details->screenshots[i], url)) valid = false;
+            if (valid) strcpy(details->screenshots[details->screenshot_count++], url);
+        }
+        read_romshq_screenshots(node->children, details);
+    }
+}
+
 static void load_details(CatalogJob *job) {
     GameDetails *details = &job->details;
     strcpy(details->title, job->game.title);
@@ -306,7 +473,14 @@ static void load_details(CatalogJob *job) {
     if (curl) curl_easy_cleanup(curl);
     if (doc) {
         xmlNodePtr root = xmlDocGetRootElement(doc);
-        read_files(root, details);
+        if (job->source == CATALOG_ROMSHQ) {
+            xmlNodePtr files = romshq_section(root, "Download Links", "download");
+            if (files) read_romshq_files(files->children, details);
+            xmlNodePtr gallery = romshq_section(root, "Screenshots", "screenshots");
+            if (gallery) read_romshq_screenshots(gallery->children, details);
+        } else {
+            read_files(root, details);
+        }
         xmlNodePtr heading = find_tag(root, "h1");
         if (heading) node_text(heading, details->title);
         xmlNodePtr head = find_tag(root, "head");
@@ -314,7 +488,7 @@ static void load_details(CatalogJob *job) {
             if (!is_element(node, "meta")) continue;
             xmlChar *property = xmlGetProp(node, BAD_CAST "property");
             xmlChar *value = xmlGetProp(node, BAD_CAST "content");
-            if (!xmlStrcmp(property, BAD_CAST "og:image")) site_url(value, cover);
+            if (!xmlStrcmp(property, BAD_CAST "og:image")) site_url(value, cover, job->source);
             xmlFree(property);
             xmlFree(value);
         }
@@ -331,17 +505,17 @@ void catalog_request(CatalogJob *job) {
     load_details(job);
 }
 
-static bool valid_game(const Game *game) {
+static bool valid_game(const Game *game, CatalogSource source) {
     if (!game->title[0] || !memchr(game->title, 0, sizeof(game->title)) ||
         !memchr(game->page, 0, sizeof(game->page)) ||
         !memchr(game->cover, 0, sizeof(game->cover))) return false;
     char normalized[CATALOG_URL];
-    return game_page(BAD_CAST game->page, normalized) && !strcmp(normalized, game->page) &&
-        (!game->cover[0] || (site_url(BAD_CAST game->cover, normalized) &&
+    return game_page(BAD_CAST game->page, normalized, source) && !strcmp(normalized, game->page) &&
+        (!game->cover[0] || (site_url(BAD_CAST game->cover, normalized, source) &&
                             !strcmp(normalized, game->cover)));
 }
 
-static bool read_cache_path(const char *path, CatalogIndex *index) {
+static bool read_cache_path(const char *path, CatalogIndex *index, CatalogSource source) {
     FILE *file = fopen(path, "rb");
     if (!file) return false;
     char magic[8];
@@ -354,7 +528,7 @@ static bool read_cache_path(const char *path, CatalogIndex *index) {
        fread(index->games, sizeof(Game), count, file) == count &&
        fgetc(file) == EOF && !ferror(file);
     fclose(file);
-    for (size_t i = 0; ok && i < count; ++i) ok = valid_game(&index->games[i]);
+    for (size_t i = 0; ok && i < count; ++i) ok = valid_game(&index->games[i], source);
     if (ok) {
         index->count = count;
         index->saved_at = (time_t)saved_at;
@@ -362,15 +536,22 @@ static bool read_cache_path(const char *path, CatalogIndex *index) {
     return ok;
 }
 
-bool catalog_read_cache(CatalogIndex *index) {
+bool catalog_read_cache(CatalogIndex *index, CatalogSource source) {
     index->count = 0;
     index->saved_at = 0;
-    return read_cache_path(CACHE_FILE, index) || read_cache_path(CACHE_BACKUP, index);
+    if (source == CATALOG_ROMSHQ)
+        return read_cache_path(CACHE_DIR "/romshq.bin", index, source) ||
+               read_cache_path(CACHE_DIR "/romshq.prev", index, source);
+    return read_cache_path(CACHE_DIR "/catalog.bin", index, source) ||
+           read_cache_path(CACHE_DIR "/catalog.prev", index, source);
 }
 
-static bool save_cache(const CatalogIndex *index) {
+static bool save_cache(const CatalogIndex *index, CatalogSource source) {
+    const char *dest = source == CATALOG_ROMSHQ ? CACHE_DIR "/romshq.bin" : CACHE_DIR "/catalog.bin";
+    const char *temp = source == CATALOG_ROMSHQ ? CACHE_DIR "/romshq.tmp" : CACHE_DIR "/catalog.tmp";
+    const char *backup = source == CATALOG_ROMSHQ ? CACHE_DIR "/romshq.prev" : CACHE_DIR "/catalog.prev";
     if (mkdir(CACHE_DIR, 0777) && errno != EEXIST) return false;
-    FILE *file = fopen(CACHE_TEMP, "wb");
+    FILE *file = fopen(temp, "wb");
     if (!file) return false;
     const uint32_t count = (uint32_t)index->count;
     const int64_t saved_at = index->saved_at;
@@ -384,18 +565,18 @@ static bool save_cache(const CatalogIndex *index) {
     bool moved = false;
     if (ok) {
         struct stat st;
-        if (!stat(CACHE_FILE, &st)) {
-            unlink(CACHE_BACKUP);
-            moved = rename(CACHE_FILE, CACHE_BACKUP) == 0;
+        if (!stat(dest, &st)) {
+            unlink(backup);
+            moved = rename(dest, backup) == 0;
             ok = moved;
         } else {
             ok = errno == ENOENT;
         }
-        if (ok) ok = rename(CACHE_TEMP, CACHE_FILE) == 0;
-        if (ok) unlink(CACHE_BACKUP);
-        else if (moved) rename(CACHE_BACKUP, CACHE_FILE);
+        if (ok) ok = rename(temp, dest) == 0;
+        if (ok) unlink(backup);
+        else if (moved) rename(backup, dest);
     }
-    if (!ok) unlink(CACHE_TEMP);
+    if (!ok) unlink(temp);
     return ok;
 }
 
@@ -459,7 +640,7 @@ void catalog_build_index(CatalogIndexJob *job) {
     }
     if (wait_until_idle(job) && job->complete) {
         job->index.saved_at = time(NULL);
-        if (!save_cache(&job->index)) strcpy(job->error, "Каталог завантажився. Кеш на microSD недоступний.");
+        if (!save_cache(&job->index, job->source)) strcpy(job->error, "Каталог завантажився. Кеш на microSD недоступний.");
     } else if (!atomic_load(&job->cancel) && !job->error[0]) {
         strcpy(job->error, "Оновлення каталогу не завершилося");
     }

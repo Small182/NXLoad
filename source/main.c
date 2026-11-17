@@ -17,6 +17,7 @@
 
 #include "catalog.h"
 #include "game_info.h"
+#include "unpack.h"
 
 #define ROWS 9
 #define FILE_ROWS 5
@@ -58,7 +59,8 @@ typedef struct {
     CatalogIndex catalog;
     CatalogIndexJob index_job;
     Thread index_thread;
-    bool index_busy, show_partial_index;
+    bool index_busy, show_partial_index, source_change;
+    CatalogSource source;
     char index_notice[CATALOG_TEXT];
     Game active_game;
     GameTab game_tab;
@@ -71,7 +73,7 @@ typedef struct {
     bool gallery_busy, gallery_requested;
     bool confirm_install, close, catalog_busy, download_busy, download_finished;
     char query[96], notice[192], game_error[192], file_id[DLARCHIVE_ID_CAPACITY];
-    char transfer_name[CATALOG_TEXT];
+    char transfer_name[CATALOG_TEXT], transfer_url[2048];
     SavedFile saved[HISTORY_LIMIT];
     GameDetails details;
     CatalogJob pending;
@@ -147,7 +149,17 @@ static size_t move(size_t current, size_t count, u64 buttons) {
 static void catalog_worker(void *arg) { catalog_request(arg); }
 static void gallery_worker(void *arg) { load_game_gallery(arg); }
 static void index_worker(void *arg) { catalog_build_index(arg); }
-static void download_worker(void *arg) { fichier_download(arg); }
+static void download_worker(void *arg) {
+    FichierJob *job = arg;
+    if (job->local_unpack) {
+        job->result = unpack_rar(job, job->url, DOWNLOAD_DIR);
+        return;
+    }
+    fichier_download(job);
+    if (!atomic_load(&job->cancelled) && !strcmp(job->result, "Download saved") &&
+        (rar_name(job->path) || rar_signature(job->path)))
+        job->result = unpack_rar(job, job->path, DOWNLOAD_DIR);
+}
 
 static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
     Result rc = threadCreate(thread, function, arg, NULL, 128 * 1024, 0x2c, -2);
@@ -204,6 +216,7 @@ static void start_index(void) {
     atomic_init(&job->published, 0);
     atomic_init(&job->page, 0);
     atomic_init(&job->pages, 0);
+    job->source = app.source;
     app.show_partial_index = app.catalog.count == 0;
     app.index_notice[0] = 0;
     app.index_busy = start_worker(&app.index_thread, index_worker, job);
@@ -216,6 +229,7 @@ static void start_game(void) {
     memset(job, 0, sizeof(*job));
     atomic_init(&job->cancel, false);
     job->game = app.active_game;
+    job->source = app.source;
     app.notice[0] = 0;
     app.catalog_busy = start_worker(&app.catalog_thread, catalog_worker, job);
     if (!app.catalog_busy) strcpy(app.game_error, "Не вдалося запустити запит");
@@ -365,14 +379,15 @@ static void pump_gallery(void) {
     }
 }
 
-static bool package_name(const char *name) {
-    const char *ext = strrchr(name, '.');
-    return ext && (!strcasecmp(ext, ".nsp") || !strcasecmp(ext, ".xci") ||
-                   !strcasecmp(ext, ".nsz") || !strcasecmp(ext, ".xcz"));
-}
-
 static int file_compare(const void *a, const void *b) {
     return strcasecmp(((const SavedFile *)a)->file, ((const SavedFile *)b)->file);
+}
+
+static bool saved_rar(const char *name) {
+    if (rar_name(name)) return true;
+    char path[320];
+    int bytes = snprintf(path, sizeof(path), DOWNLOAD_DIR "/%s", name);
+    return bytes > 0 && (size_t)bytes < sizeof(path) && rar_signature(path);
 }
 
 static void refresh_saved(void) {
@@ -382,7 +397,8 @@ static void refresh_saved(void) {
         struct dirent *entry;
         while ((entry = readdir(dir)) && app.saved_count < HISTORY_LIMIT) {
             size_t n = strlen(entry->d_name);
-            if (n < sizeof(app.saved[0].file) && package_name(entry->d_name)) {
+            if (n < sizeof(app.saved[0].file) && (package_name(entry->d_name) || rar_name(entry->d_name) ||
+                (strstr(entry->d_name, ".bin") && saved_rar(entry->d_name)))) {
                 strcpy(app.saved[app.saved_count++].file, entry->d_name);
             }
         }
@@ -390,6 +406,27 @@ static void refresh_saved(void) {
     }
     qsort(app.saved, app.saved_count, sizeof(app.saved[0]), file_compare);
     if (app.saved_index >= app.saved_count) app.saved_index = 0;
+}
+
+static void open_catalog(CatalogSource source) {
+    app.source = source;
+    app.query[0] = 0;
+    app.index_notice[0] = 0;
+    bool cached = catalog_read_cache(&app.catalog, source);
+    rebuild_view(NULL);
+    time_t now = time(NULL);
+    if (!cached || now < app.catalog.saved_at || now - app.catalog.saved_at >= CATALOG_CACHE_TTL)
+        start_index();
+}
+
+static void toggle_catalog(void) {
+    if (app.index_busy) {
+        app.source_change = true;
+        atomic_store(&app.index_job.cancel, true);
+        strcpy(app.index_notice, "Перемикання каталогу…");
+        return;
+    }
+    open_catalog(app.source == CATALOG_NSROMS ? CATALOG_ROMSHQ : CATALOG_NSROMS);
 }
 
 static void pump_index(void) {
@@ -412,6 +449,11 @@ static void pump_index(void) {
     threadWaitForExit(&app.index_thread);
     threadClose(&app.index_thread);
     app.index_busy = false;
+    if (app.source_change) {
+        app.source_change = false;
+        toggle_catalog();
+        return;
+    }
     if (job->complete) {
         char keep[CATALOG_URL] = {0};
         if (app.game_count) strcpy(keep, game_at(app.game_index)->page);
@@ -431,6 +473,13 @@ static void finish_jobs(void) {
         CatalogJob *job = &app.pending;
         if (!atomic_load(&job->cancel)) {
             app.details = job->details;
+            if (app.details.screenshot_count && job->source == CATALOG_ROMSHQ) {
+                app.gallery.count = app.details.screenshot_count;
+                memcpy(app.gallery.screenshots, app.details.screenshots,
+                       app.gallery.count * sizeof(app.gallery.screenshots[0]));
+                app.gallery.from_romshq = true;
+                app.gallery_requested = true;
+            }
             strcpy(app.game_error, job->error);
             update_cover();
             if (!app.metadata.title[0] &&
@@ -457,56 +506,97 @@ static void finish_jobs(void) {
     }
 }
 
-static void start_download(const GameFile *file) {
+static FichierJob *new_transfer(const char *name) {
     if (app.download_busy) {
-        strcpy(app.notice, "Поточне завантаження ще триває");
-        return;
+        strcpy(app.notice, "Поточна операція ще триває");
+        return NULL;
     }
     FichierJob *job = &app.download;
     memset(job, 0, sizeof(*job));
     atomic_init(&job->cancelled, false);
+    atomic_init(&job->unpacking, false);
     atomic_init(&job->received, 0);
     atomic_init(&job->total, 0);
     atomic_init(&job->streams, 0);
     atomic_init(&job->waiting, 0);
-    strcpy(app.file_id, file->id);
-    strcpy(app.transfer_name, file->title);
-    job->dlarchive = true;
-    job->dlarchive_id = app.file_id;
+    snprintf(app.transfer_name, sizeof(app.transfer_name), "%s", name);
+    app.transfer_url[0] = 0;
+    app.file_id[0] = 0;
+    return job;
+}
+
+static void launch_transfer(void) {
+    FichierJob *job = &app.download;
     app.speed_time = SDL_GetTicks64();
     app.previous_bytes = 0;
     app.speed = 0;
     app.download_finished = false;
     app.download_busy = start_worker(&app.download_thread, download_worker, job);
     if (!app.download_busy) {
-        strcpy(app.notice, "Не вдалося запустити завантаження");
+        strcpy(app.notice, "Не вдалося запустити операцію");
         return;
     }
     app.notice[0] = 0;
-    app.previous = GAME;
+    if (app.screen != DOWNLOADS) app.previous = app.screen;
     app.screen = DOWNLOADS;
 }
 
-static bool keyboard(void) {
+static void start_download(const GameFile *file) {
+    FichierJob *job = new_transfer(file->title);
+    if (!job) return;
+    strcpy(app.file_id, file->id);
+    job->dlarchive = file->source == FILE_DLARCHIVE;
+    job->dlarchive_id = app.file_id;
+    job->romshq = file->source == FILE_ROMSHQ_SIGNED;
+    job->romshq_id = job->romshq ? app.file_id : NULL;
+    job->datanodes = file->source == FILE_DATANODES;
+    strcpy(app.transfer_url, job->romshq ? app.active_game.page : file->url);
+    job->url = app.transfer_url;
+    launch_transfer();
+}
+
+static bool keyboard(char *out, size_t capacity, const char *title, const char *guide, const char *button) {
     SwkbdConfig config;
-    char query[sizeof(app.query)] = {0};
     if (R_FAILED(swkbdCreate(&config, 0))) return false;
     swkbdConfigMakePresetDefault(&config);
-    swkbdConfigSetHeaderText(&config, "Пошук ігор");
-    swkbdConfigSetGuideText(&config, "Введи назву гри");
-    swkbdConfigSetOkButtonText(&config, "Пошук");
-    swkbdConfigSetInitialText(&config, app.query);
-    swkbdConfigSetStringLenMax(&config, sizeof(query) - 1);
-    Result rc = swkbdShow(&config, query, sizeof(query));
+    swkbdConfigSetHeaderText(&config, title);
+    swkbdConfigSetGuideText(&config, guide);
+    swkbdConfigSetOkButtonText(&config, button);
+    swkbdConfigSetInitialText(&config, out);
+    swkbdConfigSetStringLenMax(&config, capacity - 1);
+    char value[2048];
+    Result rc = swkbdShow(&config, value, capacity);
     swkbdClose(&config);
     if (R_FAILED(rc)) return false;
-    char *start = query + strspn(query, " \t\r\n");
-    size_t n = strlen(start);
-    while (n && strchr(" \t\r\n", start[n - 1])) --n;
-    if (!n) return false;
-    memcpy(app.query, start, n);
-    app.query[n] = 0;
+    const char *start = value + strspn(value, " \t\r\n");
+    size_t length = strlen(start);
+    while (length && strchr(" \t\r\n", start[length - 1])) --length;
+    if (!length) return false;
+    memcpy(out, start, length);
+    out[length] = 0;
     return true;
+}
+
+static void download_link(void) {
+    char url[2048] = {0};
+    if (!keyboard(url, sizeof(url), "Завантаження за посиланням", "Встав URL ROMsHQ /d/ або DataNodes", "Запустити"))
+        return;
+    FichierJob *job = new_transfer("Файл за посиланням");
+    if (!job) return;
+    strcpy(app.transfer_url, url);
+    job->url = app.transfer_url;
+    job->romshq = !strncmp(url, "https://romshq.com/d/", sizeof("https://romshq.com/d/") - 1);
+    job->datanodes = !job->romshq;
+    launch_transfer();
+}
+
+static void start_unpack(const char *file) {
+    FichierJob *job = new_transfer(file);
+    if (!job) return;
+    job->local_unpack = true;
+    snprintf(app.transfer_url, sizeof(app.transfer_url), DOWNLOAD_DIR "/%s", file);
+    job->url = app.transfer_url;
+    launch_transfer();
 }
 
 static void open_installer(void) {
@@ -548,8 +638,12 @@ static void input(u64 buttons) {
         if (buttons & HidNpadButton_B) app.screen = app.previous;
         if ((buttons & HidNpadButton_X) && app.download_busy)
             atomic_store(&app.download.cancelled, true);
-        if ((buttons & HidNpadButton_A) && app.saved_count && !app.download_busy)
-            app.confirm_install = true;
+        if ((buttons & HidNpadButton_ZR) && !app.download_busy) download_link();
+        if ((buttons & HidNpadButton_A) && app.saved_count && !app.download_busy) {
+            const char *selected_file = app.saved[app.saved_index].file;
+            if (saved_rar(selected_file)) start_unpack(selected_file);
+            else app.confirm_install = true;
+        }
         return;
     }
     if (app.screen == GAME) {
@@ -583,7 +677,10 @@ static void input(u64 buttons) {
         return;
     }
     app.game_index = move(app.game_index, app.game_count, buttons);
-    if ((buttons & HidNpadButton_X) && keyboard()) {
+    if (buttons & HidNpadButton_ZL) {
+        toggle_catalog();
+    } else if ((buttons & HidNpadButton_X) &&
+               keyboard(app.query, sizeof(app.query), "Пошук ігор", "Введи назву гри", "Пошук")) {
         rebuild_view(NULL);
     } else if ((buttons & HidNpadButton_B) && app.query[0]) {
         app.query[0] = 0;
@@ -630,7 +727,8 @@ static void draw_library(void) {
     rect(40, 106, 500, 530, panel);
     rect(556, 106, 684, 530, panel);
     char header[160];
-    snprintf(header, sizeof(header), app.query[0] ? "Пошук · %s" : "Каталог NSRoms", app.query);
+    snprintf(header, sizeof(header), app.query[0] ? "Пошук · %s" : "Каталог %s",
+             app.query[0] ? app.query : app.source == CATALOG_ROMSHQ ? "ROMsHQ" : "NSRoms");
     text(app.normal, header, 60, 125, 450, white);
     snprintf(header, sizeof(header), app.query[0] ? "Знайдено: %zu" : "Ігор: %zu", app.game_count);
     text(app.small, header, 60, 603, 420, gray);
@@ -699,7 +797,7 @@ static void draw_game_overview(void) {
         text(app.normal, !app.metadata.title[0] && app.catalog_busy ? "Пошук у TitleDB…" :
              "Опису в TitleDB немає", 430, 269, 769, gray);
     }
-    text(app.small, app.catalog_busy ? "Перевірка файлів NSRoms…" :
+    text(app.small, app.catalog_busy ? "Перевірка файлів…" :
          "A  Перейти до файлів", 430, 577, 769, blue);
 }
 
@@ -720,22 +818,22 @@ static void draw_game_screenshots(void) {
               "Завантаження скриншота…", 452, 281, 724, gray);
     char count[80];
     snprintf(count, sizeof(count), "← / →   %zu / %zu  ·  %s", app.screenshot_index + 1,
-             app.gallery.count, app.gallery.from_titledb ? "TitleDB" : "Nintendo Life");
+             app.gallery.count, app.gallery.from_romshq ? "ROMsHQ" : app.gallery.from_titledb ? "TitleDB" : "Nintendo Life");
     text(app.small, count, 430, 584, 769, blue);
 }
 
 static void draw_game_files(void) {
     if (app.catalog_busy) {
-        text(app.normal, "Перевірка файлів NSRoms…", 430, 275, 770, gray);
+        text(app.normal, "Перевірка файлів…", 430, 275, 770, gray);
     } else if (app.game_error[0] || !app.details.count) {
-        text(app.normal, app.game_error[0] ? app.game_error : "Для цієї гри немає файлів DLArchive",
+        text(app.normal, app.game_error[0] ? app.game_error : "Для цієї гри немає доступних файлів",
              430, 275, 770, gray);
     } else {
         size_t first = first_visible(app.file_index, FILE_ROWS);
         for (size_t i = first; i < app.details.count && i < first + FILE_ROWS; ++i)
             row(i, app.file_index, 429, 267 + (int)(i - first) * 48, 782, app.details.files[i].title);
     }
-    if (app.details.count) text(app.small, "NSRoms · DLArchive", 430, 552, 769, gray);
+    if (app.details.count) text(app.small, app.source == CATALOG_ROMSHQ ? "ROMsHQ" : "NSRoms · DLArchive", 430, 552, 769, gray);
     text(app.small, app.notice, 430, 595, 772, gray);
 }
 
@@ -775,13 +873,15 @@ static void draw_downloads(void) {
         }
         rect(66, 225, 1148, 8, selected);
         rect(66, 225, (int)(1148 * percent / 100.0), 8, blue);
-        if (app.download_busy && total) {
+        if (app.download_busy && atomic_load(&app.download.unpacking)) {
+            snprintf(line, sizeof(line), "Розпакування RAR · %.1f / %.1f МіБ", have / 1048576.0, total / 1048576.0);
+        } else if (app.download_busy && total) {
             snprintf(line, sizeof(line), "%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с",
                      percent, have / 1048576.0, total / 1048576.0, app.speed / 1048576.0);
         } else if (app.download_busy && have) {
             snprintf(line, sizeof(line), "%.1f МіБ  ·  %.1f МіБ/с", have / 1048576.0, app.speed / 1048576.0);
         } else if (app.download_busy) {
-            strcpy(line, "Запит адреси файлу в DLArchive…");
+            strcpy(line, "Запит адреси файлу…");
         } else if (!strcmp(app.download.result, "Download saved")) {
             snprintf(line, sizeof(line), "Збережено · %.1f МіБ · середня %.1f МіБ/с",
                      have / 1048576.0, app.download.avg_speed / 1048576.0);
@@ -804,18 +904,19 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.11", 206, 44, 120, gray);
+    text(app.small, "1.0.12", 206, 44, 120, gray);
     if (app.download_busy)
-        text(app.small, "Завантаження триває", 950, 40, 290, blue);
+        text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування триває" : "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
     else if (app.screen == GAME) draw_game();
     else draw_downloads();
     const char *footer = app.screen == LIBRARY ?
-        "A  Відкрити    X  Пошук    L / R  Гортати    ZR  Оновити    Y  Завантаження    +  Вихід" :
+        "A  Відкрити    X  Пошук    L / R  Гортати    ZL  Джерело    ZR  Оновити    Y  Завантаження    +  Вихід" :
         app.screen == GAME ? (app.game_tab == GAME_FILES ?
         "A  Завантажити    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
         "A  До файлів    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід") :
-        "A  Відкрити DBI     X  Скасувати завантаження     B  Назад     +  Вихід";
+        app.download_busy ? "X  Скасувати    B  Назад    +  Вихід" :
+        "A  Відкрити DBI / розпакувати RAR    ZR  Посилання    B  Назад    +  Вихід";
     text(app.small, footer, 40, 665, 1200, gray);
     if (app.confirm_install) {
         rect(190, 200, 900, 305, selected);
@@ -865,11 +966,7 @@ int main(void) {
     padInitializeDefault(&pad);
     if (ok) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
-        bool cached = catalog_read_cache(&app.catalog);
-        if (cached) rebuild_view(NULL);
-        time_t now = time(NULL);
-        if (!cached || now < app.catalog.saved_at || now - app.catalog.saved_at >= CATALOG_CACHE_TTL)
-            start_index();
+        open_catalog(CATALOG_NSROMS);
         uint64_t next_frame = 0, next_scroll = 0;
         u64 held = 0;
         while (appletMainLoop() && !app.close) {

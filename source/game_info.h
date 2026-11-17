@@ -3,7 +3,7 @@
 
 #include "catalog.h"
 
-#define GALLERY_LIMIT 32
+#define GALLERY_LIMIT CATALOG_SCREENSHOTS
 #define GALLERY_HASHES (GALLERY_LIMIT * 64 + 1)
 
 typedef struct {
@@ -19,6 +19,7 @@ typedef struct {
     size_t count;
     char issue[CATALOG_TEXT];
     bool from_titledb;
+    bool from_romshq;
 } GameGallery;
 
 typedef struct {

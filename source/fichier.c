@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "fichier.h"
 #include "range.h"
+#include "unpack.h"
 
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
@@ -26,9 +27,10 @@
 #define FILE_RECEIVE_BUFFER (256 * 1024)
 #define DLARCHIVE_ORIGIN "https://drive.dlarchive.my.id"
 #define DLARCHIVE_FILE_HOST "direct-stor.berkasdrive.com"
+#define ROMSHQ_ORIGIN "https://romshq.com"
 
 
-typedef enum { HOST_FICHIER, HOST_MEGAUP, HOST_DLARCHIVE } DownloadHost;
+typedef enum { HOST_FICHIER, HOST_MEGAUP, HOST_DLARCHIVE, HOST_ROMSHQ, HOST_DATANODES } DownloadHost;
 #ifdef __SWITCH__
 #define OUTPUT_DIR DOWNLOAD_DIR
 #else
@@ -72,6 +74,8 @@ static bool resolve_host_url(const char *base, const char *target,
         !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
         (source == HOST_MEGAUP ? !strcasecmp(host, MEGAUP_FILE_HOST) :
          source == HOST_DLARCHIVE ? !strcasecmp(host, DLARCHIVE_FILE_HOST) :
+         source == HOST_ROMSHQ ? !strcasecmp(host, "romshq.com") :
+         source == HOST_DATANODES ? in_domain(host, "datanodes.to") :
          in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
         !curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) && !strcmp(port, "443") &&
         !curl_url_get(parsed, CURLUPART_URL, &url, 0) && strlen(url) < URL_CAPACITY;
@@ -145,15 +149,22 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
         t->binary = strcasestr(line, "application/octet-stream") ||
             strcasestr(line, "application/x-rar") || strcasestr(line, "application/vnd.rar") ||
             strcasestr(line, "application/zip") || strcasestr(line, "application/x-7z") ||
-            (t->job->dlarchive && (strcasestr(line, "application/x-nsp") ||
+            ((t->job->dlarchive || t->job->romshq || t->job->datanodes) &&
+                                  (strcasestr(line, "application/x-nsp") ||
                                     strcasestr(line, "application/force-download")));
     }
     return n;
 }
 
 static bool open_partial(Transfer *t, bool buffered) {
-    const char *fallback = t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
+    const char *fallback = t->job->romshq ? "romshq-download.bin" :
+        t->job->datanodes ? "datanodes-download.bin" :
+        t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
     char generic[DLARCHIVE_ID_CAPACITY + 8];
+    if (t->job->romshq && t->job->romshq_id) {
+        snprintf(generic, sizeof(generic), "romshq-%s.bin", t->job->romshq_id);
+        fallback = generic;
+    }
     if (t->job->dlarchive) {
         snprintf(generic, sizeof(generic), "%s.bin", t->job->dlarchive_id);
         fallback = t->fallback_name[0] ? t->fallback_name : generic;
@@ -591,6 +602,126 @@ static bool resolve_dlarchive(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
     return true;
 }
 
+static bool read_romshq_reply(const char *p, char target[URL_CAPACITY]) {
+    char url[URL_CAPACITY] = {0}, mode[24] = {0};
+    bool success = false;
+    skip_json_space(&p);
+    if (*p++ != '{') return false;
+    while (true) {
+        char key[64], value[URL_CAPACITY];
+        skip_json_space(&p);
+        if (!read_json_string(&p, key, sizeof(key))) return false;
+        skip_json_space(&p);
+        if (*p++ != ':') return false;
+        skip_json_space(&p);
+        if (*p == '"') {
+            if (!read_json_string(&p, value, sizeof(value))) return false;
+            if (!strcmp(key, "download_url")) strcpy(url, value);
+            if (!strcmp(key, "mode") && strlen(value) < sizeof(mode)) strcpy(mode, value);
+        } else {
+            size_t n = strcspn(p, ",} \t\r\n");
+            if (!n) return false;
+            if (!strcmp(key, "success")) success = n == 4 && !memcmp(p, "true", 4);
+            p += n;
+        }
+        skip_json_space(&p);
+        if (*p == '}') break;
+        if (*p++ != ',') return false;
+    }
+    ++p;
+    skip_json_space(&p);
+    if (*p || !success) return false;
+    if (!strcmp(mode, "direct"))
+        return !strncmp(url, ROMSHQ_ORIGIN "/d/", sizeof(ROMSHQ_ORIGIN "/d/") - 1) &&
+               resolve_host_url(NULL, url, target, HOST_ROMSHQ);
+    return resolve_host_url(NULL, url, target, HOST_DATANODES);
+}
+
+static bool romshq_headers(struct curl_slist **headers, const char *line) {
+    struct curl_slist *next = curl_slist_append(*headers, line);
+    if (!next) return false;
+    *headers = next;
+    return true;
+}
+
+static void csrf_token(xmlNodePtr node, char out[256]) {
+    for (; node && !out[0]; node = node->next) {
+        if (node_is(node, "meta")) {
+            xmlChar *name = xmlGetProp(node, BAD_CAST "name");
+            if (name && !xmlStrcasecmp(name, BAD_CAST "csrf-token")) {
+                xmlChar *value = xmlGetProp(node, BAD_CAST "content");
+                if (value && *value && xmlStrlen(value) < 256 &&
+                    !strpbrk((char *)value, "\r\n")) strcpy(out, (char *)value);
+                xmlFree(value);
+            }
+            xmlFree(name);
+        }
+        csrf_token(node->children, out);
+    }
+}
+
+static bool resolve_romshq(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
+    FichierJob *job = t->job;
+    const char *id = job->romshq_id;
+    char page[URL_CAPACITY], api[160];
+    if (!id || !*id || strlen(id) > 20 || id[strspn(id, "0123456789")] ||
+        !resolve_host_url(NULL, job->url, page, HOST_ROMSHQ) ||
+        strncmp(page, ROMSHQ_ORIGIN "/game/", sizeof(ROMSHQ_ORIGIN "/game/") - 1)) {
+        job->result = "Некоректна картка або ID ROMsHQ";
+        return false;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, page);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    CURLcode code = curl_easy_perform(curl);
+    if (code != CURLE_OK || t->status != 200 || t->challenge) {
+        job->api_http = t->status;
+        job->result = t->challenge || t->status == 403 ?
+            "ROMsHQ вимагає перевірку в браузері" : "Картка ROMsHQ недоступна";
+        return false;
+    }
+
+    char token[256] = {0}, csrf[300];
+    htmlDocPtr doc = htmlReadMemory(t->html, (int)t->length, page, "UTF-8",
+        HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
+    if (doc) {
+        csrf_token(xmlDocGetRootElement(doc), token);
+        xmlFreeDoc(doc);
+    }
+    snprintf(csrf, sizeof(csrf), "X-CSRF-TOKEN: %s", token);
+    struct curl_slist *headers = NULL;
+    if (!romshq_headers(&headers, "Origin: " ROMSHQ_ORIGIN) ||
+        !romshq_headers(&headers, "Accept: application/json") ||
+        !romshq_headers(&headers, "X-Requested-With: XMLHttpRequest") ||
+        (token[0] && !romshq_headers(&headers, csrf))) {
+        curl_slist_free_all(headers);
+        return false;
+    }
+    snprintf(api, sizeof(api), ROMSHQ_ORIGIN "/api/download/sign/%s", id);
+    curl_easy_setopt(curl, CURLOPT_URL, api);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_REFERER, page);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+    code = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->api_http);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, NULL);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+    curl_slist_free_all(headers);
+    if (code != CURLE_OK || job->api_http != 200 || t->challenge) {
+        job->result = "ROMsHQ не видав підписане посилання";
+        return false;
+    }
+    if (!read_romshq_reply(t->html, out)) {
+        job->result = "ROMsHQ повернув непідтримуване посилання";
+        return false;
+    }
+    return true;
+}
+
 static const char *page_error(const Transfer *t) {
     if (t->challenge || strcasestr(t->html, "just a moment") ||
         strcasestr(t->html, "cf-turnstile") || strcasestr(t->html, "h-captcha") ||
@@ -651,6 +782,20 @@ void fichier_download(FichierJob *job) {
         strcpy(referrer, DLARCHIVE_ORIGIN "/");
         t.name[0] = 0;
         if (parallel_download(&t, url, referrer)) goto done;
+    } else if (job->romshq) {
+        if (job->romshq_id) {
+            if (!resolve_romshq(curl, &t, url)) goto done;
+            snprintf(referrer, sizeof(referrer), "%s", job->url);
+        } else if (!resolve_host_url(NULL, job->url, url, HOST_ROMSHQ) ||
+                   strncmp(url, ROMSHQ_ORIGIN "/d/", sizeof(ROMSHQ_ORIGIN "/d/") - 1)) {
+            job->result = "Потрібне підписане посилання ROMsHQ /d/";
+            goto done;
+        }
+    } else if (job->datanodes) {
+        if (!resolve_host_url(NULL, job->url, url, HOST_DATANODES)) {
+            job->result = "Некоректне посилання DataNodes";
+            goto done;
+        }
     } else if (job->megaup) {
         if (!resolve_host_url(NULL, job->url, url, HOST_MEGAUP)) {
             job->result = "Unexpected MegaUp file address";
@@ -738,6 +883,21 @@ void fichier_download(FichierJob *job) {
             job->result = t.status == 401 || t.status == 403 || t.challenge ?
                 "MegaUp file host rejected the native GET" :
                 "MegaUp file host did not return an archive";
+            goto done;
+        }
+        if (job->romshq || job->datanodes) {
+            char *location = NULL;
+            curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &location);
+            if (location && ((job->romshq && resolve_host_url(url, location, next, HOST_ROMSHQ)) ||
+                             resolve_host_url(url, location, next, HOST_DATANODES))) {
+                strcpy(referrer, url);
+                strcpy(url, next);
+                job->result = "Забагато перенаправлень до файлу";
+                continue;
+            }
+            job->result = t.challenge || t.status == 403 ?
+                "Хостинг вимагає перевірку в браузері" :
+                "Хостинг не повернув файл. Потрібне кінцеве посилання";
             goto done;
         }
         const char *error = page_error(&t);

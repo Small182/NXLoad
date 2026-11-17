@@ -64,7 +64,7 @@ typedef struct {
     bool index_busy, show_partial_index;
     unsigned refresh_waiting;
     CatalogSource file_source;
-    bool file_source_chosen;
+    bool file_source_chosen, romshq_candidate;
     char index_notice[2][CATALOG_TEXT];
     Game active_game, game_sources[2];
     GameTab game_tab;
@@ -633,6 +633,32 @@ static void open_installer(void) {
     strcpy(app.notice, "DBI не знайдено. Потрібен DBI.nro в папці switch/DBI/.");
 }
 
+static bool guess_romshq_page(Game *game, const char *title) {
+    char slug[CATALOG_TEXT];
+    size_t used = 0;
+    bool dash = false;
+    for (const unsigned char *p = (const unsigned char *)title; *p; ++p) {
+        unsigned char c = *p;
+        // Trademark and registered marks do not belong to a game URL slug.
+        if (c == 0xe2 && p[1] == 0x84 && p[2] == 0xa2) { p += 2; continue; }
+        if (c == 0xc2 && p[1] == 0xae) { ++p; continue; }
+        if (c >= 128) return false; // Do not invent slugs for non-ASCII titles.
+        if (isalnum(c)) {
+            if (used + 2 >= sizeof(slug)) return false;
+            if (dash && used) slug[used++] = '-';
+            slug[used++] = (char)tolower(c);
+            dash = false;
+        } else if (c != 39 && c != 96) {
+            dash = true;
+        }
+    }
+    if (used < 3) return false;
+    slug[used] = 0;
+    snprintf(game->page, sizeof(game->page), "https://romshq.com/game/%s", slug);
+    snprintf(game->title, sizeof(game->title), "%s", title);
+    return true;
+}
+
 static void enter_game_files(void) {
     if (app.catalog_busy) atomic_store(&app.pending.cancel, true);
     app.game_tab = GAME_FILES;
@@ -771,6 +797,10 @@ static void input(u64 buttons) {
             memset(&app.metadata, 0, sizeof(app.metadata));
             memset(&app.gallery, 0, sizeof(app.gallery));
             read_game_metadata(&app.metadata, app.active_game.title, "");
+            app.romshq_candidate = false;
+            if (!app.game_sources[CATALOG_ROMSHQ].page[0] && app.metadata.title[0])
+                app.romshq_candidate =
+                    guess_romshq_page(&app.game_sources[CATALOG_ROMSHQ], app.metadata.title);
             app.gallery_requested = false;
             SDL_DestroyTexture(app.cover);
             app.cover = NULL;
@@ -915,9 +945,13 @@ static void draw_game_files(void) {
             if (focus) rect(x, 322, 380, 4, blue);
             text(app.large, source_name((CatalogSource)source), x + 20, 342, 340,
                  focus ? white : gray);
-            const char *state = available ? "Відкрити список файлів" :
+            const char *state = available ?
+                source == CATALOG_ROMSHQ && app.romshq_candidate ?
+                "Спробувати знайти за назвою" : "Відкрити список файлів" :
                 app.index_busy && app.index_job.source == (CatalogSource)source ?
-                "Каталог завантажується…" : "Гру не знайдено в каталозі";
+                "Каталог завантажується…" :
+                app.catalogs[source].count ? "Гру не знайдено в каталозі" :
+                "Каталог джерела недоступний";
             text(app.small, state, x + 20, 413, 345, available ? blue : gray);
         }
         if (app.game_error[0])
@@ -1009,7 +1043,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.14", 206, 44, 120, gray);
+    text(app.small, "1.0.15", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування триває" : "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();

@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,9 +15,26 @@
 
 #define MIB (UINT64_C(1024) * 1024)
 #define MIN_PARALLEL_SIZE (32 * MIB)
-#define RANGE_WRITE_BUFFER (512 * 1024)
+#define RANGE_WRITE_BUFFER (1024 * 1024)
 #define RANGE_RECEIVE_BUFFER (256 * 1024)
-#define MAX_CONNECTIONS 6
+#define MAX_CONNECTIONS 8
+#define WRITE_QUEUE_SIZE 8
+
+typedef struct {
+    unsigned char *data;
+    uint64_t offset;
+    size_t length;
+} WriteBlock;
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t ready, space;
+    int fd;
+    unsigned head, count;
+    bool active, closing, discard, failed;
+    WriteBlock blocks[WRITE_QUEUE_SIZE];
+} RangeWriter;
 
 typedef struct {
     long status;
@@ -29,7 +47,7 @@ typedef struct {
 typedef struct {
     CURL *curl;
     bool active, write_failed;
-    int fd;
+    RangeWriter *writer;
     FichierJob *job;
     const RangeInfo *info;
     RangeResponse response;
@@ -104,7 +122,7 @@ static void configure(CURL *curl, const RangeSource *source, FichierJob *job, Ra
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(curl, CURLOPT_CAINFO, source->ca_path);
     curl_easy_setopt(curl, CURLOPT_REFERER, source->referer);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.4");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.5");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
     curl_easy_setopt(curl, CURLOPT_HTTP_CONTENT_DECODING, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -153,25 +171,112 @@ bool range_probe(const RangeSource *source, FichierJob *job, RangeInfo *info) {
     return true;
 }
 
+static unsigned char *write_buffer(void) {
+    void *data = NULL;
+    return posix_memalign(&data, 4096, RANGE_WRITE_BUFFER) == 0 ? data : NULL;
+}
+
+static bool write_block(int fd, const WriteBlock *block) {
+    off_t offset = (off_t)block->offset;
+    if ((uint64_t)offset != block->offset || lseek(fd, offset, SEEK_SET) != offset) return false;
+    size_t done = 0;
+    while (done < block->length) {
+        ssize_t n = write(fd, block->data + done, block->length - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
+static void *write_worker(void *arg) {
+    RangeWriter *writer = arg;
+    pthread_mutex_lock(&writer->lock);
+    while (!writer->discard) {
+        if (!writer->count) {
+            if (writer->closing) break;
+            pthread_cond_wait(&writer->ready, &writer->lock);
+            continue;
+        }
+        WriteBlock block = writer->blocks[writer->head];
+        pthread_mutex_unlock(&writer->lock);
+        bool ok = write_block(writer->fd, &block);
+        pthread_mutex_lock(&writer->lock);
+        if (!ok) {
+            writer->failed = true;
+            pthread_cond_broadcast(&writer->space);
+            break;
+        }
+        writer->head = (writer->head + 1) % WRITE_QUEUE_SIZE;
+        --writer->count;
+        pthread_cond_signal(&writer->space);
+    }
+    pthread_mutex_unlock(&writer->lock);
+    return NULL;
+}
+
+static void free_write_queue(RangeWriter *writer) {
+    for (unsigned i = 0; i < WRITE_QUEUE_SIZE; ++i) {
+        free(writer->blocks[i].data);
+        writer->blocks[i].data = NULL;
+    }
+}
+
+static void start_writer(RangeWriter *writer) {
+    for (unsigned i = 0; i < WRITE_QUEUE_SIZE; ++i) {
+        writer->blocks[i].data = write_buffer();
+        if (!writer->blocks[i].data) {
+            free_write_queue(writer);
+            return;
+        }
+    }
+    writer->active = pthread_create(&writer->thread, NULL, write_worker, writer) == 0;
+    if (!writer->active) free_write_queue(writer);
+}
+
+static bool finish_writer(RangeWriter *writer, bool commit) {
+    if (writer->active) {
+        pthread_mutex_lock(&writer->lock);
+        writer->closing = true;
+        writer->discard = !commit;
+        pthread_cond_signal(&writer->ready);
+        pthread_mutex_unlock(&writer->lock);
+        pthread_join(writer->thread, NULL);
+    }
+    free_write_queue(writer);
+    pthread_cond_destroy(&writer->space);
+    pthread_cond_destroy(&writer->ready);
+    pthread_mutex_destroy(&writer->lock);
+    return !writer->failed;
+}
+
 static bool flush_part(RangePart *part) {
     if (!part->buffered) return true;
-    off_t offset = (off_t)(part->first + part->written);
-    if ((uint64_t)offset != part->first + part->written ||
-        lseek(part->fd, offset, SEEK_SET) != offset) {
-        part->write_failed = true;
-        return false;
-    }
-    size_t done = 0;
-    while (done < part->buffered) {
-        ssize_t n = write(part->fd, part->buffer + done, part->buffered - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
+    RangeWriter *writer = part->writer;
+    WriteBlock block = {part->buffer, part->first + part->written, part->buffered};
+    if (!writer->active) {
+        if (!write_block(writer->fd, &block)) {
             part->write_failed = true;
             return false;
         }
-        done += (size_t)n;
+    } else {
+        pthread_mutex_lock(&writer->lock);
+        while (writer->count == WRITE_QUEUE_SIZE && !writer->failed &&
+               !atomic_load(&part->job->cancelled))
+            pthread_cond_wait(&writer->space, &writer->lock);
+        if (writer->failed || atomic_load(&part->job->cancelled)) {
+            part->write_failed = writer->failed;
+            pthread_mutex_unlock(&writer->lock);
+            return false;
+        }
+        unsigned tail = (writer->head + writer->count) % WRITE_QUEUE_SIZE;
+        part->buffer = writer->blocks[tail].data;
+        writer->blocks[tail] = block;
+        ++writer->count;
+        pthread_cond_signal(&writer->ready);
+        pthread_mutex_unlock(&writer->lock);
     }
-    part->written += done;
+    part->written += block.length;
     part->buffered = 0;
     return true;
 }
@@ -231,25 +336,30 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     block_size -= block_size % RANGE_WRITE_BUFFER;
 
     RangePart parts[MAX_CONNECTIONS] = {0};
+    RangeWriter writer = {
+        .lock = PTHREAD_MUTEX_INITIALIZER,
+        .ready = PTHREAD_COND_INITIALIZER, .space = PTHREAD_COND_INITIALIZER, .fd = fd
+    };
     CURLM *multi = curl_multi_init();
     char if_range[sizeof(info->etag) + 12];
     snprintf(if_range, sizeof(if_range), "If-Range: %s", info->etag);
     struct curl_slist *headers = curl_slist_append(NULL, if_range);
     RangeResult result = RANGE_RETRY_SINGLE;
+    uint64_t started = milliseconds();
     uint64_t next = 0;
     unsigned active = 0;
     if (!multi || !headers) goto done;
     curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, (long)lanes);
     curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)lanes);
-    uint64_t started = milliseconds();
+    start_writer(&writer);
     atomic_store(&job->total, info->length);
     atomic_store(&job->streams, lanes);
     for (unsigned i = 0; i < lanes && next < info->length; ++i) {
         RangePart *part = &parts[i];
         part->job = job;
         part->info = info;
-        part->fd = fd;
-        part->buffer = malloc(RANGE_WRITE_BUFFER);
+        part->writer = &writer;
+        part->buffer = write_buffer();
         part->curl = curl_easy_init();
         if (!part->buffer || !part->curl) goto done;
         configure(part->curl, source, job, &part->response);
@@ -299,11 +409,8 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
         }
         if (active && !rescheduled && curl_multi_poll(multi, NULL, 0, 150, NULL) != CURLM_OK) goto done;
     }
-    if (!active && !atomic_load(&job->cancelled) && atomic_load(&job->received) == info->length) {
-        uint64_t elapsed = milliseconds() - started;
-        if (elapsed) job->avg_speed = (uint64_t)(info->length * 1000.0 / elapsed);
+    if (!active && !atomic_load(&job->cancelled) && atomic_load(&job->received) == info->length)
         result = RANGE_OK;
-    }
 done:
     for (unsigned i = 0; i < lanes; ++i) {
         RangePart *part = &parts[i];
@@ -313,5 +420,10 @@ done:
     }
     curl_slist_free_all(headers);
     if (multi) curl_multi_cleanup(multi);
+    if (!finish_writer(&writer, result == RANGE_OK)) result = RANGE_SD_ERROR;
+    if (result == RANGE_OK) {
+        uint64_t ended = milliseconds();
+        if (ended > started) job->avg_speed = (uint64_t)(info->length * 1000.0 / (ended - started));
+    }
     return result;
 }

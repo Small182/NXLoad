@@ -1,33 +1,43 @@
-name: Build NXLoad
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
+name: Inspect TitleDB and Nintendo Life
+on: [pull_request]
 permissions:
   contents: read
-
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Build curl and Mbed TLS for Switch
-        run: bash tools/build-network.sh
-      - run: make -j2
-      - name: Check DLArchive TLS chain
-        continue-on-error: true
+      - name: Retrieve the source catalog and example galleries
+        shell: bash
         run: |
-          status=0
-          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
-            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
-            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
-            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
-          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
-          exit "$status"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NXLoad
-          path: NXLoad.nro
-          if-no-files-found: error
+          curl -fLsS --retry 1 'https://raw.githubusercontent.com/blawar/titledb/master/US.en.json' -o /tmp/titles.json &
+          curl -fLsS --retry 1 'https://www.nintendolife.com/games/nintendo-switch/1-2-switch' -o /tmp/1-2.html &
+          curl -fLsS --retry 1 'https://www.nintendolife.com/games/switch-eshop/mysims_cozy_bundle' -o /tmp/mysims.html &
+          curl -fLsS --retry 1 'https://www.nintendolife.com/search?term=MySims+Cozy+Bundle' -o /tmp/search.html &
+          wait
+          python3 - <<'PY'
+          import json, pathlib, re
+          from html.parser import HTMLParser
+          p=pathlib.Path('/tmp/titles.json')
+          d=json.loads(p.read_text())
+          print('TITLEDB', p.stat().st_size, type(d).__name__, len(d))
+          for key, record in d.items():
+              title=record.get('name', '')
+              norm=re.sub(r'[^a-z0-9]', '', title.lower()) if title else ''
+              if norm in ('12switch','mysimscozybundle','everybody12switch','12switch2'):
+                  print('RECORD', key, {k:(f'{len(v)} chars' if k in ('description','intro') and isinstance(v,str) else v) for k,v in record.items() if k not in ('screenshots',)})
+          class P(HTMLParser):
+              def handle_starttag(self, tag, attrs):
+                  a=dict(attrs)
+                  if tag == 'form' and ('search' in str(a) or 'search' in a.get('action','')): print('FORM', a)
+                  if tag == 'input' and (a.get('type')=='search' or a.get('name') in ('q','term','query')): print('INPUT', a)
+                  if tag == 'a' and a.get('href','').startswith('/games/') and 'search.html' in path.name:
+                      print('GAME_LINK', a.get('href'))
+                  if tag in ('section','div','ul','li','a','img','figure') and (
+                       any(term in str(a).lower() for term in ('screenshot', 'gallery', '#screenshots'))):
+                      print('GALLERY_MARKUP', tag, str(a)[:620])
+          for name in ('1-2.html','mysims.html','search.html'):
+              path=pathlib.Path('/tmp/'+name)
+              if path.exists():
+                  print('HTMLFILE', path.name, path.stat().st_size)
+                  P().feed(path.read_text())
+          PY

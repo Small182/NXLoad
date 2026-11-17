@@ -1,33 +1,41 @@
-name: Build NXLoad
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
+name: Trace NXLoad game lookup
+on: [pull_request]
 permissions:
   contents: read
-
 jobs:
-  build:
+  trace:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build curl and Mbed TLS for Switch
-        run: bash tools/build-network.sh
-      - run: make -j2
-      - name: Check DLArchive TLS chain
-        continue-on-error: true
+      - name: Compare real inputs and Switch HTTP constraints
+        shell: bash
         run: |
-          status=0
-          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
-            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
-            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
-            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
-          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
-          exit "$status"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NXLoad
-          path: NXLoad.nro
-          if-no-files-found: error
+          set -u
+          opts=(--silent --show-error --connect-timeout 8 --max-time 16 --http1.1 --tlsv1.2 --tls-max 1.2 -4 --compressed -A 'NXLoad/1.0.3' --cacert romfs/cacert.pem)
+          for host in nsroms.net searching.nintendo-europe.com www.nintendo.com; do
+            getent ahostsv4 "$host" | head -1 || true
+          done
+          curl "${opts[@]}" -w 'NSRoms page: %{http_code} %{size_download}\n' -L -o /tmp/nx-nsroms.html 'https://nsroms.net/roms/mysims-cozy-bundle-switch/' &
+          curl "${opts[@]}" -w 'NSRoms search: %{http_code} %{size_download}\n' -L -o /tmp/nx-catalog.html 'https://nsroms.net/?s=MySims' &
+          curl "${opts[@]}" -w 'Nintendo search: %{http_code} %{size_download}\n' -L -o /tmp/nx-game.xml 'https://searching.nintendo-europe.com/en/select?wt=xml&rows=24&fq=type%3AGAME%20AND%20playable_on_txt%3AHAC&q=mysims%20cozy%20bundle' &
+          curl "${opts[@]}" -w 'Nintendo product: %{http_code} %{size_download}\n' -L -o /tmp/nx-game.html 'https://www.nintendo.com/en-gb/Games/Nintendo-Switch-games/MySims-Cozy-Bundle-2640109.html' &
+          wait
+          python3 - <<'PY'
+          import html, pathlib, re
+          for name in ['nsroms.html', 'catalog.html', 'game.xml', 'game.html']:
+              path = pathlib.Path('/tmp/nx-' + name)
+              if not path.exists():
+                  continue
+              data = path.read_text(errors='replace')
+              print(name, len(data))
+              if name in ['nsroms.html', 'catalog.html']:
+                  tags = re.findall(r'<(?:title|h[1-4])\b[^>]*>(.*?)</(?:title|h[1-4])>', data, re.I | re.S)
+                  for title in tags:
+                      decoded = html.unescape(re.sub('<[^>]+>', '', title)).strip()
+                      if 'mysims' in decoded.lower():
+                          print(repr(decoded))
+              elif name == 'game.xml':
+                  print('Solr result count:', re.findall(r'numFound="(\d+)"', data), 'Exact title and description available:', 'Cozy Bundle' in data)
+              elif name == 'game.html':
+                  print('Nintendo gallery rows:', len(re.findall(r'<img[^>]+data-xs="[^"]+/06_screenshots/[^"]+', data, re.I)))
+          PY

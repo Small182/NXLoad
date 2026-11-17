@@ -28,7 +28,7 @@ typedef struct {
 
 typedef struct {
     char title[CATALOG_TEXT];
-    char info[CATALOG_TEXT];
+    char info[1536];
     GameFile files[CATALOG_FILE_COUNT];
     size_t count;
     unsigned char *cover;
@@ -64,5 +64,6 @@ void catalog_request(CatalogJob *job);
 void catalog_build_index(CatalogIndexJob *job);
 bool catalog_read_cache(CatalogIndex *index);
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes);
+unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes);
 
 #endif

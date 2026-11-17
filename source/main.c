@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "catalog.h"
+#include "eshop.h"
 
 #define ROWS 9
 #define FILE_ROWS 5
@@ -23,6 +24,7 @@
 #define COVER_SLOTS 24
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
+typedef enum { GAME_OVERVIEW, GAME_SCREENSHOTS, GAME_FILES } GameTab;
 
 typedef struct {
     char file[256];
@@ -39,12 +41,14 @@ typedef struct {
     atomic_bool cancel;
     unsigned char *bytes;
     size_t count;
+    bool screenshot;
 } CoverJob;
 
 typedef struct {
     SDL_Window *window;
     SDL_Renderer *renderer;
     SDL_Texture *cover;
+    SDL_Texture *description;
     TTF_Font *small;
     TTF_Font *normal;
     TTF_Font *large;
@@ -57,6 +61,13 @@ typedef struct {
     bool index_busy, show_partial_index;
     char index_notice[CATALOG_TEXT];
     Game active_game;
+    GameTab game_tab;
+    size_t screenshot_index;
+    int description_scroll;
+    EshopGame shop;
+    EshopJob shop_job;
+    Thread shop_thread;
+    bool shop_busy, shop_requested;
     bool confirm_install, close, catalog_busy, download_busy, download_finished;
     char query[96], notice[192], game_error[192], file_id[DLARCHIVE_ID_CAPACITY];
     char transfer_name[CATALOG_TEXT];
@@ -133,6 +144,7 @@ static size_t move(size_t current, size_t count, u64 buttons) {
 }
 
 static void catalog_worker(void *arg) { catalog_request(arg); }
+static void shop_worker(void *arg) { eshop_lookup(arg); }
 static void index_worker(void *arg) { catalog_build_index(arg); }
 static void download_worker(void *arg) { fichier_download(arg); }
 
@@ -208,14 +220,14 @@ static void start_game(void) {
     if (!app.catalog_busy) strcpy(app.game_error, "Не вдалося запустити запит");
 }
 
-static SDL_Texture *decode_cover(const unsigned char *bytes, size_t count) {
+static SDL_Texture *decode_cover(const unsigned char *bytes, size_t count, bool screenshot) {
     if (!bytes || !count) return NULL;
     SDL_RWops *src = SDL_RWFromConstMem(bytes, (int)count);
     SDL_Surface *image = src ? IMG_Load_RW(src, 1) : NULL;
     if (!image) return NULL;
 
     SDL_Surface *scaled = NULL;
-    double factor = SDL_min(480.0 / image->w, 420.0 / image->h);
+    double factor = SDL_min((screenshot ? 800.0 : 480.0) / image->w, 420.0 / image->h);
     if (factor < 1.0) {
         int w = SDL_max(1, (int)(factor * image->w));
         int h = SDL_max(1, (int)(factor * image->h));
@@ -264,22 +276,36 @@ static void pump_covers(void) {
         }
         SDL_DestroyTexture(entry->texture);
         strcpy(entry->url, job->url);
-        entry->texture = decode_cover(job->bytes, job->count);
+        entry->texture = decode_cover(job->bytes, job->count, job->screenshot);
         entry->last_used = SDL_GetTicks64();
         free(job->bytes);
         job->bytes = NULL;
     }
-    if (app.cover_busy || app.download_busy || app.screen != LIBRARY || !app.game_count) return;
+    if (app.cover_busy || app.download_busy) return;
 
-    const char *url = game_at(app.game_index)->cover;
-    if (!url[0] || find_cover(url)) {
-        url = NULL;
-        size_t first = first_visible(app.game_index, ROWS);
-        for (size_t i = first; i < app.game_count && i < first + ROWS; ++i) {
-            const char *candidate = game_at(i)->cover;
-            if (candidate[0] && !find_cover(candidate)) {
-                url = candidate;
-                break;
+    const char *url = NULL;
+    bool screenshot = false;
+    if (app.screen == GAME) {
+        if (app.game_tab == GAME_SCREENSHOTS && app.shop.screenshot_count) {
+            const char *image = app.shop.screenshots[app.screenshot_index];
+            if (!find_cover(image)) {
+                screenshot = true;
+                url = image;
+            }
+        }
+        if (!url && app.shop.cover[0] && !find_cover(app.shop.cover)) url = app.shop.cover;
+    } else if (app.screen == LIBRARY && app.game_count) {
+        const char *selected_cover = game_at(app.game_index)->cover;
+        if (selected_cover[0] && !find_cover(selected_cover)) {
+            url = selected_cover;
+        } else {
+            size_t first = first_visible(app.game_index, ROWS);
+            for (size_t i = first; i < app.game_count && i < first + ROWS; ++i) {
+                const char *candidate = game_at(i)->cover;
+                if (candidate[0] && !find_cover(candidate)) {
+                    url = candidate;
+                    break;
+                }
             }
         }
     }
@@ -287,16 +313,49 @@ static void pump_covers(void) {
         strcpy(job->url, url);
         atomic_init(&job->cancel, false);
         job->count = 0;
+        job->screenshot = screenshot;
         app.cover_busy = start_worker(&app.cover_thread, cover_worker, job);
     }
 }
 
 static void update_cover(void) {
     SDL_DestroyTexture(app.cover);
-    app.cover = decode_cover(app.details.cover, app.details.cover_bytes);
+    app.cover = decode_cover(app.details.cover, app.details.cover_bytes, false);
     free(app.details.cover);
     app.details.cover = NULL;
     app.details.cover_bytes = 0;
+}
+
+static void update_description(void) {
+    SDL_DestroyTexture(app.description);
+    app.description = NULL;
+    app.description_scroll = 0;
+    const char *summary = app.shop.description[0] ? app.shop.description : app.details.info;
+    if (!*summary) return;
+    SDL_Surface *paragraph = TTF_RenderUTF8_Blended_Wrapped(app.normal, summary, gray, 750);
+    if (!paragraph) return;
+    app.description = SDL_CreateTextureFromSurface(app.renderer, paragraph);
+    SDL_FreeSurface(paragraph);
+}
+
+static void pump_shop(void) {
+    EshopJob *job = &app.shop_job;
+    if (app.shop_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.shop_thread), 0))) {
+        threadWaitForExit(&app.shop_thread);
+        threadClose(&app.shop_thread);
+        app.shop_busy = false;
+        if (!atomic_load(&job->cancel) && !strcmp(job->game.page, app.active_game.page)) {
+            app.shop = job->match;
+            update_description();
+        }
+    }
+    if (app.screen == GAME && !app.shop_busy && !app.shop_requested && !app.download_busy) {
+        memset(job, 0, sizeof(*job));
+        atomic_init(&job->cancel, false);
+        job->game = app.active_game;
+        app.shop_requested = true;
+        app.shop_busy = start_worker(&app.shop_thread, shop_worker, job);
+    }
 }
 
 static bool package_name(const char *name) {
@@ -364,6 +423,7 @@ static void finish_jobs(void) {
             app.details = job->details;
             strcpy(app.game_error, job->error);
             update_cover();
+            if (!app.shop.description[0]) update_description();
         } else {
             free(job->details.cover);
         }
@@ -480,18 +540,34 @@ static void input(u64 buttons) {
             app.confirm_install = true;
         return;
     }
-    if (app.screen == GAME && app.catalog_busy) {
-        if (buttons & HidNpadButton_B) {
-            atomic_store(&app.pending.cancel, true);
-            app.screen = LIBRARY;
-        }
-        return;
-    }
     if (app.screen == GAME) {
-        app.file_index = move(app.file_index, app.details.count, buttons);
-        if (buttons & HidNpadButton_B) { app.notice[0] = 0; app.screen = LIBRARY; }
-        if ((buttons & HidNpadButton_A) && app.details.count)
-            start_download(&app.details.files[app.file_index]);
+        if (buttons & HidNpadButton_B) {
+            if (app.catalog_busy) atomic_store(&app.pending.cancel, true);
+            if (app.shop_busy) atomic_store(&app.shop_job.cancel, true);
+            app.notice[0] = 0;
+            app.screen = LIBRARY;
+            return;
+        }
+        if ((buttons & HidNpadButton_L) && app.game_tab > GAME_OVERVIEW) --app.game_tab;
+        if ((buttons & HidNpadButton_R) && app.game_tab < GAME_FILES) ++app.game_tab;
+        if (app.game_tab == GAME_FILES) {
+            app.file_index = move(app.file_index, app.details.count, buttons);
+            if ((buttons & HidNpadButton_A) && !app.catalog_busy && app.details.count)
+                start_download(&app.details.files[app.file_index]);
+        } else if (app.game_tab == GAME_SCREENSHOTS) {
+            if (app.screenshot_index && (buttons & (HidNpadButton_Left | HidNpadButton_StickLLeft)))
+                --app.screenshot_index;
+            if (app.screenshot_index + 1 < app.shop.screenshot_count &&
+                (buttons & (HidNpadButton_Right | HidNpadButton_StickLRight))) ++app.screenshot_index;
+            if (buttons & HidNpadButton_A) app.game_tab = GAME_FILES;
+        } else {
+            int height = 0;
+            if (app.description) SDL_QueryTexture(app.description, NULL, NULL, NULL, &height);
+            if (buttons & up_buttons) app.description_scroll = SDL_max(0, app.description_scroll - 25);
+            if (buttons & down_buttons)
+                app.description_scroll = SDL_min(SDL_max(0, height - 244), app.description_scroll + 25);
+            if (buttons & HidNpadButton_A) app.game_tab = GAME_FILES;
+        }
         return;
     }
     app.game_index = move(app.game_index, app.game_count, buttons);
@@ -512,10 +588,15 @@ static void input(u64 buttons) {
         } else if (!app.catalog_busy) {
             app.active_game = *game_at(app.game_index);
             memset(&app.details, 0, sizeof(app.details));
+            memset(&app.shop, 0, sizeof(app.shop));
+            app.shop_requested = false;
             SDL_DestroyTexture(app.cover);
             app.cover = NULL;
+            update_description();
             app.game_error[0] = 0;
             app.file_index = 0;
+            app.screenshot_index = 0;
+            app.game_tab = GAME_OVERVIEW;
             app.screen = GAME;
             start_game();
         }
@@ -574,21 +655,63 @@ static void draw_library(void) {
 }
 
 static void draw_cover(void) {
-    rect(56, 118, 308, 420, panel);
+    rect(56, 127, 308, 308, background);
+    CachedCover *official = find_cover(app.shop.cover);
     CachedCover *preview = find_cover(app.active_game.cover);
-    fit_cover(app.cover ? app.cover : preview ? preview->texture : NULL, 56, 118, 308, 420);
+    SDL_Texture *cover = official && official->texture ? official->texture :
+                         app.cover ? app.cover : preview ? preview->texture : NULL;
+    fit_cover(cover, 56, 127, 308, 308);
+    text(app.normal, "Nintendo Switch", 65, 459, 293, white);
+    text(app.small, app.shop.publisher, 65, 498, 293, gray);
+    if (app.shop.released[0]) {
+        char release[48];
+        snprintf(release, sizeof(release), "Вихід · %s", app.shop.released);
+        text(app.small, release, 65, 529, 293, gray);
+    }
+    if (app.shop.page[0])
+        text(app.small, "Дані Nintendo eShop", 65, 596, 293, blue);
 }
 
-static void draw_game(void) {
-    rect(40, 106, 345, 530, panel);
-    rect(401, 106, 839, 530, panel);
-    draw_cover();
-    const char *title = app.details.title[0] ? app.details.title : app.active_game.title;
-    text(app.large, title, 430, 130, 772, white);
-    text(app.small, app.details.info, 430, 187, 772, gray);
-    text(app.normal, "Файли DLArchive", 430, 224, 770, blue);
+static void draw_game_overview(void) {
+    if (app.description) {
+        int width, height;
+        if (SDL_QueryTexture(app.description, NULL, NULL, &width, &height) == 0) {
+            int visible = SDL_min(height - app.description_scroll, 244);
+            SDL_Rect src = {0, app.description_scroll, width, visible};
+            SDL_Rect dst = {430, 269, width, visible};
+            SDL_RenderCopy(app.renderer, app.description, &src, &dst);
+            if (height > 244)
+                text(app.small, "↑ / ↓  Читати опис", 430, 522, 769, gray);
+        }
+    } else {
+        text(app.normal, app.shop_busy || app.catalog_busy ? "Завантаження опису…" :
+             "Опис гри недоступний", 430, 269, 769, gray);
+    }
+    text(app.small, app.catalog_busy ? "Перевірка файлів NSRoms…" :
+         "A  Перейти до файлів", 430, 577, 769, blue);
+}
+
+static void draw_game_screenshots(void) {
+    if (!app.shop.screenshot_count) {
+        text(app.normal, app.shop_busy || !app.shop_requested ? "Пошук скриншотів…" :
+             "Скриншотів у каталозі немає", 430, 273, 769, gray);
+        return;
+    }
+    const char *url = app.shop.screenshots[app.screenshot_index];
+    CachedCover *shot = find_cover(url);
+    rect(430, 259, 774, 309, background);
+    if (shot && shot->texture) fit_cover(shot->texture, 430, 259, 774, 309);
+    else text(app.normal, shot ? "Скриншот недоступний" :
+              app.download_busy ? "Перегляд доступний після завершення завантаження" :
+              "Завантаження скриншота…", 452, 281, 724, gray);
+    char count[80];
+    snprintf(count, sizeof(count), "← / →   %zu / %zu", app.screenshot_index + 1, app.shop.screenshot_count);
+    text(app.small, count, 430, 584, 769, blue);
+}
+
+static void draw_game_files(void) {
     if (app.catalog_busy) {
-        text(app.normal, "Завантаження картки…", 430, 275, 770, gray);
+        text(app.normal, "Перевірка файлів NSRoms…", 430, 275, 770, gray);
     } else if (app.game_error[0] || !app.details.count) {
         text(app.normal, app.game_error[0] ? app.game_error : "Для цієї гри немає файлів DLArchive",
              430, 275, 770, gray);
@@ -597,7 +720,28 @@ static void draw_game(void) {
         for (size_t i = first; i < app.details.count && i < first + FILE_ROWS; ++i)
             row(i, app.file_index, 429, 267 + (int)(i - first) * 48, 782, app.details.files[i].title);
     }
+    if (app.details.count) text(app.small, "NSRoms · DLArchive", 430, 552, 769, gray);
     text(app.small, app.notice, 430, 595, 772, gray);
+}
+
+static void draw_game(void) {
+    rect(40, 106, 345, 530, panel);
+    rect(401, 106, 839, 530, panel);
+    draw_cover();
+    const char *title = app.shop.title[0] ? app.shop.title :
+                        app.details.title[0] ? app.details.title : app.active_game.title;
+    text(app.large, title, 430, 130, 772, white);
+    const char *tabs[] = {"Огляд", "Скриншоти", "Файли"};
+    for (unsigned i = 0; i < sizeof(tabs) / sizeof(tabs[0]); ++i) {
+        int x = 430 + (int)i * 252;
+        bool selected_tab = (GameTab)i == app.game_tab;
+        rect(x, 201, 242, 42, selected_tab ? selected : background);
+        if (selected_tab) rect(x, 240, 242, 3, blue);
+        text(app.normal, tabs[i], x + 13, 208, 215, selected_tab ? white : gray);
+    }
+    if (app.game_tab == GAME_OVERVIEW) draw_game_overview();
+    else if (app.game_tab == GAME_SCREENSHOTS) draw_game_screenshots();
+    else draw_game_files();
 }
 
 static void draw_downloads(void) {
@@ -645,7 +789,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.5", 206, 44, 120, gray);
+    text(app.small, "1.0.6", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -653,7 +797,9 @@ static void draw(void) {
     else draw_downloads();
     const char *footer = app.screen == LIBRARY ?
         "A  Відкрити    X  Пошук    L / R  Гортати    ZR  Оновити    Y  Завантаження    +  Вихід" :
-        app.screen == GAME ? "A  Завантажити     B  Каталог     Y  Завантаження     +  Вихід" :
+        app.screen == GAME ? (app.game_tab == GAME_FILES ?
+        "A  Завантажити    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
+        "A  До файлів    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід") :
         "A  Відкрити DBI     X  Скасувати завантаження     B  Назад     +  Вихід";
     text(app.small, footer, 40, 665, 1200, gray);
     if (app.confirm_install) {
@@ -728,6 +874,7 @@ int main(void) {
             held = vertical;
             input(buttons);
             pump_index();
+            pump_shop();
             pump_covers();
             if (buttons || now >= next_frame) {
                 draw();
@@ -747,6 +894,7 @@ int main(void) {
         consoleExit(NULL);
     }
     if (app.index_busy) atomic_store(&app.index_job.cancel, true);
+    if (app.shop_busy) atomic_store(&app.shop_job.cancel, true);
     if (app.catalog_busy) {
         atomic_store(&app.pending.cancel, true);
         threadWaitForExit(&app.catalog_thread);
@@ -768,8 +916,13 @@ int main(void) {
         threadWaitForExit(&app.index_thread);
         threadClose(&app.index_thread);
     }
+    if (app.shop_busy) {
+        threadWaitForExit(&app.shop_thread);
+        threadClose(&app.shop_thread);
+    }
     for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
     SDL_DestroyTexture(app.cover);
+    SDL_DestroyTexture(app.description);
     if (app.small) TTF_CloseFont(app.small);
     if (app.normal) TTF_CloseFont(app.normal);
     if (app.large) TTF_CloseFont(app.large);

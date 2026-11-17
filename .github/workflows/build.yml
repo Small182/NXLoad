@@ -1,35 +1,33 @@
-name: Verify Nintendo catalog query
-on: [pull_request]
+name: Build NXLoad
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
-jobs:
-  eshop-probe:
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          python3 - <<'PY'
-          import urllib.request
-          import urllib.parse
-          import xml.etree.ElementTree as et
 
-          host = 'https://searching.nintendo-europe.com/en/select?'
-          for args in (
-              {'q':'mysims cozy bundle','fq':'type:GAME'},
-              {'q':'MySims','fq':'type:GAME'},
-              {'q':'Super Mario Odyssey','fq':'type:GAME'},
-              {'q':'*','fq':'type:GAME AND fs_id:2640109'},
-          ):
-              args.update(rows=8, wt='xml')
-              try:
-                  with urllib.request.urlopen(host+urllib.parse.urlencode(args), timeout=12) as r:
-                      data = r.read()
-                  tree = et.fromstring(data)
-                  results = tree.findall('.//result/doc')
-                  print('Query:', args['q'], args['fq'], 'records:',len(results), 'root:',tree.tag)
-                  if not results:
-                      print(data[:360].decode())
-                  for doc in results[:5]:
-                      print({v.get('name'):''.join(v.itertext()).strip()[:185] for v in doc if v.get('name') in {'title','url','image_url','image_url_sq_s','excerpt','playable_on_txt','system_type','nsuid_txt','fs_id','publisher','date_from'}})
-              except Exception as e:
-                  print(type(e).__name__,str(e))
-          PY
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build curl and Mbed TLS for Switch
+        run: bash tools/build-network.sh
+      - run: make -j2
+      - name: Check DLArchive TLS chain
+        continue-on-error: true
+        run: |
+          status=0
+          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
+            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
+            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
+            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
+          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NXLoad
+          path: NXLoad.nro
+          if-no-files-found: error

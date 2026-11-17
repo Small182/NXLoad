@@ -87,15 +87,23 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
     return buf;
 }
 
-unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
+static unsigned char *fetch_resource(const char *url, atomic_bool *cancel, size_t limit, size_t *bytes) {
     *bytes = 0;
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
     long status = 0;
-    Buffer image = fetch(curl, cancel, url, COVER_BYTES, &status);
+    Buffer data = fetch(curl, cancel, url, limit, &status);
     curl_easy_cleanup(curl);
-    *bytes = image.size;
-    return image.data;
+    *bytes = data.size;
+    return data.data;
+}
+
+unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
+    return fetch_resource(url, cancel, COVER_BYTES, bytes);
+}
+
+unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes) {
+    return fetch_resource(url, cancel, PAGE_BYTES, bytes);
 }
 
 static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, long *status) {

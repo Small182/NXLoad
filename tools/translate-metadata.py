@@ -38,17 +38,16 @@ def prepare(args):
         raise ValueError("The shard count must be between 1 and 64")
     manual = read_json(args.manual)
     saved = read_json(args.cache) if args.cache.is_file() else {}
-    by_title, ready, pending = {}, {}, {}
+    titles, ready, pending = set(), {}, {}
     for _, title_id, _, item in selected_games(load_catalog(args.source)):
         english = description(item)
         if not english or manual.get(title_id, "").strip():
             continue
         digest = fingerprint(english)
-        by_title[title_id] = digest
-        cached = saved.get(title_id)
-        if (isinstance(cached, list) and len(cached) == 2 and cached[0] == digest
-                and isinstance(cached[1], str)):
-            ready[digest] = cached[1]
+        titles.add(title_id)
+        cached = saved.get(digest)
+        if isinstance(cached, str):
+            ready[digest] = cached
         else:
             pending[digest] = english
 
@@ -63,8 +62,8 @@ def prepare(args):
         lengths[index] += len(english)
     for index, queue in enumerate(queues):
         write_json(args.output / f"input-{index}.json.gz", queue)
-    write_json(args.output / "plan.json.gz", {"titles": by_title, "ready": ready})
-    print(f"{len(by_title):,} games, {len(pending):,} distinct descriptions to translate, "
+    write_json(args.output / "plan.json.gz", {"expected": sorted(ready.keys() | pending.keys()), "ready": ready})
+    print(f"{len(titles):,} title IDs, {len(pending):,} distinct descriptions to translate, "
           f"{len(ready):,} reusable descriptions.", flush=True)
     print("pending=" + str(len(pending)), flush=True)
     if os.environ.get("GITHUB_OUTPUT"):
@@ -136,15 +135,20 @@ def merge(args):
             if digest in descriptions or not isinstance(translated, str):
                 raise ValueError(f"Duplicate or invalid result for {digest}")
             descriptions[digest] = translated
-    titles = plan["titles"]
-    required = set(titles.values())
+    expected = plan.get("expected")
+    if expected is None:
+        # A saved plan from the initial job listed its inputs as separate files.
+        expected = set(plan["ready"])
+        for source in args.plan.parent.glob("input-*.json.gz"):
+            expected.update(read_json(source))
+    required = set(expected)
     if set(descriptions) != required:
         raise ValueError(f"{len(required - descriptions.keys())} missing and "
                          f"{len(descriptions.keys() - required)} unexpected descriptions")
-    output = {title_id: [digest, descriptions[digest]] for title_id, digest in titles.items()}
-    write_json(args.output, output)
-    translated = sum(bool(entry[1]) for entry in output.values())
-    print(f"{translated:,} Ukrainian descriptions, {len(output) - translated:,} English fallbacks.", flush=True)
+    write_json(args.output, descriptions)
+    translated = sum(bool(entry) for entry in descriptions.values())
+    print(f"{translated:,} distinct Ukrainian descriptions, "
+          f"{len(descriptions) - translated:,} English fallbacks.", flush=True)
 
 
 def main():

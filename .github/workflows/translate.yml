@@ -21,17 +21,24 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pending: ${{ steps.prepare.outputs.pending }}
+      recovering: ${{ steps.prepare.outputs.recovering }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - id: prepare
-        run: python3 tools/translate-metadata.py prepare translation-plan
-      - if: steps.prepare.outputs.pending != '0'
+        run: |
+          if test -f .github/workflows/recover-translations.yml; then
+            printf 'recovering=true\n' >> "$GITHUB_OUTPUT"
+          else
+            python3 tools/translate-metadata.py prepare translation-plan
+          fi
+      - if: steps.prepare.outputs.recovering != 'true' && steps.prepare.outputs.pending != '0'
         run: |
           curl -fLsS --retry 2 --max-time 180 'https://data.argosopentech.com/argospm/v1/translate-en_uk-1_9.argosmodel' -o translation-plan/en-uk.argosmodel
           echo 'a4915e274380812a1f020aaf801969d51d999127d13e5445d53cbb1f7675deda  translation-plan/en-uk.argosmodel' | sha256sum --check -
       - uses: actions/upload-artifact@v4
+        if: steps.prepare.outputs.recovering != 'true'
         with:
           name: ukrainian-description-plan
           path: translation-plan/
@@ -40,7 +47,7 @@ jobs:
           if-no-files-found: error
 
   translate:
-    if: needs.plan.outputs.pending != '0'
+    if: needs.plan.outputs.recovering != 'true' && needs.plan.outputs.pending != '0'
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -73,7 +80,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.translate.result == 'success' || needs.translate.result == 'skipped') }}
+    if: ${{ !cancelled() && needs.plan.outputs.recovering != 'true' && needs.plan.result == 'success' && (needs.translate.result == 'success' || needs.translate.result == 'skipped') }}
     needs: [plan, translate]
     runs-on: ubuntu-latest
     permissions:

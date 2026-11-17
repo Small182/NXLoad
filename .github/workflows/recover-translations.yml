@@ -1,0 +1,50 @@
+name: Package completed Ukrainian translations
+on:
+  pull_request:
+    paths: [.github/workflows/recover-translations.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'native-1fichier'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      revision: ${{ steps.publish.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ukrainian-description-plan
+          path: translation-plan
+          run-id: 44079152002
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ukrainian-descriptions-*
+          merge-multiple: true
+          path: translation-results
+          run-id: 44079152002
+          github-token: ${{ github.token }}
+      - id: publish
+        run: |
+          python3 tools/translate-metadata.py merge translation-plan/plan.json.gz translation-results tools/translations.uk.json.gz
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/translations.uk.json.gz
+          git rm .github/workflows/recover-translations.yml
+          git commit -m 'Publish the Ukrainian catalog'
+          git push origin HEAD:refs/heads/native-1fichier
+          printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: publish
+    uses: ./.github/workflows/build.yml
+    with:
+      revision: ${{ needs.publish.outputs.revision }}

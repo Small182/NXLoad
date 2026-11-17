@@ -34,9 +34,7 @@ def build(database, manual, automatic):
         english = description(item)
         ukrainian = text(manual.get(title_id))
         if not ukrainian and english:
-            cached = automatic.get(title_id)
-            if isinstance(cached, list) and len(cached) == 2 and cached[0] == fingerprint(english):
-                ukrainian = text(cached[1])
+            ukrainian = text(automatic.get(fingerprint(english)))
         translated += bool(ukrainian)
         summary = ukrainian or english
         shots = item.get("screenshots")

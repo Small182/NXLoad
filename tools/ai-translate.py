@@ -248,6 +248,12 @@ def collect(args):
             existing[key] = translated
     write_json(args.cache, existing)
     write_json(args.directory / "review.json.gz", review)
+    # A small bilingual sample supports actual editorial checking before publishing.
+    sample = [{
+        "title": manifest[key]["name"], "english": manifest[key]["english"],
+        "ukrainian": approved[key],
+    } for key in sorted(approved)[:40]]
+    write_json(args.directory / "editorial-sample.json", sample)
     write_json(args.directory / "quality-report.json", {
         "batch_id": state["batch_id"], "expected": len(manifest),
         "accepted": len(approved), "flagged": len(review),

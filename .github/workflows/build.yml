@@ -1,33 +1,33 @@
-name: Build NXLoad
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
+name: Benchmark Ukrainian descriptions
+on: [pull_request]
 permissions:
   contents: read
-
 jobs:
-  build:
+  sample:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Build curl and Mbed TLS for Switch
-        run: bash tools/build-network.sh
-      - run: make -j2
-      - name: Check DLArchive TLS chain
-        continue-on-error: true
-        run: |
-          status=0
-          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
-            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
-            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
-            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
-          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
-          exit "$status"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NXLoad
-          path: NXLoad.nro
-          if-no-files-found: error
+      - run: |
+          curl -fLsS --retry 2 https://data.argosopentech.com/argospm/v1/translate-en_uk-1_9.argosmodel -o /tmp/model.zip
+          sha256sum /tmp/model.zip
+          unzip -l /tmp/model.zip | head -30
+          python3 -m venv /tmp/mt
+          /tmp/mt/bin/pip -q install 'ctranslate2==4.7.1' 'sentencepiece==0.2.1'
+          curl -fLsS --retry 2 'https://raw.githubusercontent.com/blawar/titledb/d424690446eec6f4484209b9a1c067c7f7511398/US.en.json' -o /tmp/title.json
+          /tmp/mt/bin/python - <<'PY'
+          import ctranslate2 as ct, sentencepiece as sp, zipfile, pathlib, json, time, re, random
+          with zipfile.ZipFile('/tmp/model.zip') as z: z.extractall('/tmp/model')
+          root = next(pathlib.Path('/tmp/model').iterdir())
+          print((root/'metadata.json').read_text())
+          s = sp.SentencePieceProcessor(model_file=str(root/'sentencepiece.model'))
+          tr = ct.Translator(str(root/'model'), compute_type='int8', inter_threads=2, intra_threads=2)
+          d=json.load(open('/tmp/title.json'))
+          descriptions=[r['description'] for r in d.values() if isinstance(r,dict) and isinstance(r.get('description'),str) and len(r['description'])>100]
+          random.Random(25).shuffle(descriptions)
+          texts=[s.encode(re.sub(r'\s+',' ',d).strip(), out_type=str) for d in descriptions[:196]]
+          start=time.monotonic()
+          for x in [texts[:100],texts[100:]]:
+              r = tr.translate_batch(x, beam_size=1, max_batch_size=2048, batch_type='tokens',
+                                      max_input_length=600, max_decoding_length=650)
+              print(len(r), 'input', sum(len(i) for i in x), 'output', sum(len(i.hypotheses[0]) for i in r), 'elapsed', round(time.monotonic()-start,2))
+              print(s.decode(r[0].hypotheses[0])[:230])
+          PY

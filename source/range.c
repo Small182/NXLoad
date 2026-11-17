@@ -172,8 +172,7 @@ bool range_probe(const RangeSource *source, FichierJob *job, RangeInfo *info) {
 }
 
 static unsigned char *write_buffer(void) {
-    void *data = NULL;
-    return posix_memalign(&data, 4096, RANGE_WRITE_BUFFER) == 0 ? data : NULL;
+    return aligned_alloc(4096, RANGE_WRITE_BUFFER);
 }
 
 static bool write_block(int fd, const WriteBlock *block) {
@@ -270,6 +269,7 @@ static bool flush_part(RangePart *part) {
             return false;
         }
         unsigned tail = (writer->head + writer->count) % WRITE_QUEUE_SIZE;
+        // Swap buffers so the network thread can resume without copying this block.
         part->buffer = writer->blocks[tail].data;
         writer->blocks[tail] = block;
         ++writer->count;

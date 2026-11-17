@@ -8,7 +8,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := NXLoad
 APP_TITLE := NXLoad
 APP_AUTHOR := Small182
-APP_VERSION := 1.0.10
+APP_VERSION := 1.0.11
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)
@@ -36,7 +36,7 @@ all: $(TITLEDB) $(GALLERIES)
 	@mkdir -p build
 	@$(MAKE) --no-print-directory -C build -f $(TOPDIR)/Makefile
 
-$(TITLEDB): $(TOPDIR)/tools/build-metadata.py $(TOPDIR)/tools/descriptions.uk.json
+$(TITLEDB): $(TOPDIR)/tools/build-metadata.py $(TOPDIR)/tools/descriptions.uk.json $(TOPDIR)/tools/title_db.py $(wildcard $(TOPDIR)/tools/translations.uk.json.gz)
 	python3 $< $@
 
 $(GALLERIES): $(TOPDIR)/tools/build-galleries.py

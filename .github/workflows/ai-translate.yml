@@ -1,0 +1,131 @@
+name: Improve Ukrainian game descriptions with AI
+
+on:
+  push:
+    branches: [native-1fichier]
+    paths:
+      - tools/ai-translate.py
+      - tools/build-metadata.py
+      - .github/workflows/ai-translate.yml
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "prepare (free), pilot (30 paid), full_chunk (1500 paid), collect (free)"
+        required: true
+        type: choice
+        default: prepare
+        options: [prepare, pilot, full_chunk, collect]
+      source_run_id:
+        description: "For collect: workflow run ID that submitted the batch"
+        required: false
+        type: string
+      model:
+        description: "Translation model (default: high-quality Terra)"
+        required: false
+        type: string
+        default: gpt-5.6-terra
+
+permissions:
+  contents: read
+
+jobs:
+  translate:
+    if: github.ref_name == 'native-1fichier'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      STAGE: ${{ inputs.stage || 'prepare' }}
+      MODEL: ${{ inputs.model || 'gpt-5.6-terra' }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: native-1fichier
+
+      - name: Validate translation pipeline
+        run: |
+          python3 -m py_compile tools/ai-translate.py tools/build-metadata.py tools/title_db.py
+          echo "Context-aware AI translation tooling loaded"
+
+      - name: Prepare controlled translation batch
+        if: env.STAGE != 'collect'
+        run: |
+          case "$STAGE" in
+            prepare|pilot) LIMIT=30 ;;
+            full_chunk) LIMIT=1500 ;;
+            *) echo "Unknown stage: $STAGE" && exit 1 ;;
+          esac
+          python3 tools/ai-translate.py prepare ai-work --limit "$LIMIT" --model "$MODEL"
+          if test "$STAGE" = prepare; then
+            echo "No API calls or charges. Inspect requests.jsonl before using pilot/full_chunk."
+          fi
+
+      - name: Submit explicitly requested paid batch
+        if: env.STAGE == 'pilot' || env.STAGE == 'full_chunk'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if test -z "$OPENAI_API_KEY"; then
+            echo "::error::Add OPENAI_API_KEY as a GitHub Actions repository secret before paid translation."
+            exit 1
+          fi
+          python3 -m pip install --quiet 'openai>=2,<5'
+          python3 tools/ai-translate.py submit ai-work
+          echo "Save this run ID to use the collect stage later: $GITHUB_RUN_ID"
+
+      - name: Fetch submitted batch data
+        if: env.STAGE == 'collect'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Provide the submit workflow run ID in source_run_id."
+            exit 1
+          fi
+          mkdir -p ai-work
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name nxload-ai-translation-batch --dir ai-work
+
+      - name: Collect results, validate quality and save approved descriptions
+        if: env.STAGE == 'collect'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if test -z "$OPENAI_API_KEY"; then
+            echo "::error::OPENAI_API_KEY is required to fetch results."
+            exit 1
+          fi
+          python3 -m pip install --quiet 'openai>=2,<5'
+          python3 tools/ai-translate.py collect ai-work
+          if test -f tools/translations.ai.uk.json.gz; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add tools/translations.ai.uk.json.gz
+            if ! git diff --cached --quiet; then
+              git commit -m 'Add quality-checked contextual Ukrainian game descriptions'
+              git push origin HEAD:refs/heads/native-1fichier
+            fi
+          else
+            echo "The batch is not complete or no validated descriptions were produced."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && env.STAGE != 'collect'
+        with:
+          name: nxload-ai-translation-batch
+          path: ai-work/
+          retention-days: 30
+          compression-level: 6
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always() && env.STAGE == 'collect'
+        with:
+          name: nxload-ai-translation-review
+          path: |
+            ai-work/quality-report.json
+            ai-work/review.json.gz
+          retention-days: 30
+          if-no-files-found: warn

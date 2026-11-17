@@ -20,8 +20,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.revision || github.sha }}
-      - name: Install libarchive for Switch
-        run: dkp-pacman -Sy --needed --noconfirm switch-libarchive
+      - name: Ensure libarchive for Switch
+        run: |
+          if aarch64-none-elf-pkg-config --exists libarchive; then
+            echo "switch-libarchive is already installed"
+          else
+            for attempt in 1 2 3; do
+              if dkp-pacman -Sy --needed --noconfirm switch-libarchive; then exit 0; fi
+              echo "Package mirror unavailable; retry $attempt"
+              sleep 6
+            done
+            exit 1
+          fi
       - name: Build curl and Mbed TLS for Switch
         run: bash tools/build-network.sh
       - run: make -j2

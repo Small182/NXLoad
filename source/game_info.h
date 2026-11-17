@@ -10,8 +10,8 @@ typedef struct {
     char title[CATALOG_TEXT];
     char publisher[CATALOG_TEXT];
     char released[16];
-    char description[3072];
-    char original[3072];
+    char description[6144];
+    char original[6144];
     char fallback_hashes[GALLERY_HASHES];
 } GameMetadata;
 

@@ -64,6 +64,7 @@ typedef struct {
     bool index_busy, show_partial_index;
     unsigned refresh_waiting;
     CatalogSource file_source;
+    bool file_source_chosen;
     char index_notice[2][CATALOG_TEXT];
     Game active_game, game_sources[2];
     GameTab game_tab;
@@ -632,14 +633,29 @@ static void open_installer(void) {
     strcpy(app.notice, "DBI не знайдено. Потрібен DBI.nro в папці switch/DBI/.");
 }
 
-static bool multiple_game_sources(void) {
-    return app.game_sources[CATALOG_NSROMS].page[0] && app.game_sources[CATALOG_ROMSHQ].page[0];
+static void enter_game_files(void) {
+    if (app.catalog_busy) atomic_store(&app.pending.cancel, true);
+    app.game_tab = GAME_FILES;
+    app.file_source_chosen = false;
+    app.file_index = 0;
+    app.game_error[0] = 0;
 }
 
 static void open_file_source(CatalogSource source) {
+    if (!app.game_sources[source].page[0]) {
+        snprintf(app.game_error, sizeof(app.game_error),
+                 "%s: цю гру не знайдено в каталозі джерела", source_name(source));
+        return;
+    }
+    if (app.catalog_busy) {
+        strcpy(app.game_error, "Попередній запит ще завершується. Повтори A.");
+        return;
+    }
     app.file_source = source;
+    app.file_source_chosen = true;
     app.file_index = 0;
     app.game_error[0] = 0;
+    memset(&app.details, 0, sizeof(app.details));
     start_game();
 }
 
@@ -676,28 +692,44 @@ static void input(u64 buttons) {
     }
     if (app.screen == GAME) {
         if (buttons & HidNpadButton_B) {
+            if (app.game_tab == GAME_FILES) {
+                if (app.file_source_chosen) {
+                    if (app.catalog_busy) atomic_store(&app.pending.cancel, true);
+                    app.file_source_chosen = false;
+                    app.game_error[0] = 0;
+                } else {
+                    app.game_tab = GAME_OVERVIEW;
+                }
+                return;
+            }
             if (app.catalog_busy) atomic_store(&app.pending.cancel, true);
             if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
             app.notice[0] = 0;
             app.screen = LIBRARY;
             return;
         }
+        GameTab previous_tab = app.game_tab;
         if ((buttons & HidNpadButton_L) && app.game_tab > GAME_OVERVIEW) --app.game_tab;
         if ((buttons & HidNpadButton_R) && app.game_tab < GAME_FILES) ++app.game_tab;
+        if (app.game_tab == GAME_FILES && previous_tab != GAME_FILES) enter_game_files();
         if (app.game_tab == GAME_FILES) {
-            if ((buttons & HidNpadButton_ZL) && !app.catalog_busy && multiple_game_sources()) {
-                open_file_source(app.file_source == CATALOG_NSROMS ? CATALOG_ROMSHQ : CATALOG_NSROMS);
-                return;
+            if (!app.file_source_chosen) {
+                if (buttons & (up_buttons | HidNpadButton_Left | HidNpadButton_StickLLeft))
+                    app.file_source = CATALOG_NSROMS;
+                if (buttons & (down_buttons | HidNpadButton_Right | HidNpadButton_StickLRight))
+                    app.file_source = CATALOG_ROMSHQ;
+                if (buttons & HidNpadButton_A) open_file_source(app.file_source);
+            } else {
+                app.file_index = move(app.file_index, app.details.count, buttons);
+                if ((buttons & HidNpadButton_A) && !app.catalog_busy && app.details.count)
+                    start_download(&app.details.files[app.file_index]);
             }
-            app.file_index = move(app.file_index, app.details.count, buttons);
-            if ((buttons & HidNpadButton_A) && !app.catalog_busy && app.details.count)
-                start_download(&app.details.files[app.file_index]);
         } else if (app.game_tab == GAME_SCREENSHOTS) {
             if (app.screenshot_index && (buttons & (HidNpadButton_Left | HidNpadButton_StickLLeft)))
                 --app.screenshot_index;
             if (app.screenshot_index + 1 < app.gallery.count &&
                 (buttons & (HidNpadButton_Right | HidNpadButton_StickLRight))) ++app.screenshot_index;
-            if (buttons & HidNpadButton_A) app.game_tab = GAME_FILES;
+            if (buttons & HidNpadButton_A) enter_game_files();
         } else {
             if ((buttons & HidNpadButton_X) && app.metadata.original[0]) {
                 app.show_original = !app.show_original;
@@ -708,7 +740,7 @@ static void input(u64 buttons) {
             if (buttons & up_buttons) app.description_scroll = SDL_max(0, app.description_scroll - 25);
             if (buttons & down_buttons)
                 app.description_scroll = SDL_min(SDL_max(0, height - 244), app.description_scroll + 25);
-            if (buttons & HidNpadButton_A) app.game_tab = GAME_FILES;
+            if (buttons & HidNpadButton_A) enter_game_files();
         }
         return;
     }
@@ -748,7 +780,8 @@ static void input(u64 buttons) {
             app.screenshot_index = 0;
             app.game_tab = GAME_OVERVIEW;
             app.screen = GAME;
-            open_file_source(entry->games[CATALOG_NSROMS] ? CATALOG_NSROMS : CATALOG_ROMSHQ);
+            app.file_source = entry->games[CATALOG_NSROMS] ? CATALOG_NSROMS : CATALOG_ROMSHQ;
+            app.file_source_chosen = false;
         }
     }
 }
@@ -872,6 +905,27 @@ static void draw_game_screenshots(void) {
 }
 
 static void draw_game_files(void) {
+    if (!app.file_source_chosen) {
+        text(app.normal, "Оберіть джерело файлів", 430, 268, 770, white);
+        for (unsigned source = 0; source < 2; ++source) {
+            int x = 430 + (int)source * 395;
+            bool focus = app.file_source == (CatalogSource)source;
+            bool available = app.game_sources[source].page[0] != 0;
+            rect(x, 322, 380, 166, focus ? selected : background);
+            if (focus) rect(x, 322, 380, 4, blue);
+            text(app.large, source_name((CatalogSource)source), x + 20, 342, 340,
+                 focus ? white : gray);
+            const char *state = available ? "Відкрити список файлів" :
+                app.index_busy && app.index_job.source == (CatalogSource)source ?
+                "Каталог завантажується…" : "Гру не знайдено в каталозі";
+            text(app.small, state, x + 20, 413, 345, available ? blue : gray);
+        }
+        if (app.game_error[0])
+            text(app.small, app.game_error, 430, 522, 775, blue);
+        text(app.small, "← / →  Джерело    A  Відкрити    B  До огляду",
+             430, 584, 775, gray);
+        return;
+    }
     if (app.catalog_busy) {
         text(app.normal, "Перевірка файлів…", 430, 275, 770, gray);
     } else if (app.game_error[0] || !app.details.count) {
@@ -883,11 +937,7 @@ static void draw_game_files(void) {
             row(i, app.file_index, 429, 267 + (int)(i - first) * 48, 782, app.details.files[i].title);
     }
     char providers[96];
-    if (multiple_game_sources())
-        snprintf(providers, sizeof(providers), "%s   ·   ZL %s", source_name(app.file_source),
-                 source_name(app.file_source == CATALOG_NSROMS ? CATALOG_ROMSHQ : CATALOG_NSROMS));
-    else
-        snprintf(providers, sizeof(providers), "%s", source_name(app.file_source));
+    snprintf(providers, sizeof(providers), "%s   ·   B  Інше джерело", source_name(app.file_source));
     text(app.small, providers, 430, 552, 769, gray);
     text(app.small, app.notice, 430, 595, 772, gray);
 }
@@ -959,7 +1009,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.13", 206, 44, 120, gray);
+    text(app.small, "1.0.14", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування триває" : "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -968,7 +1018,9 @@ static void draw(void) {
     const char *footer = app.screen == LIBRARY ?
         "A  Відкрити    X  Пошук    L / R  Гортати    ZR  Оновити    Y  Завантаження    +  Вихід" :
         app.screen == GAME ? (app.game_tab == GAME_FILES ?
-        "A  Завантажити    ZL  Джерело    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
+        (app.file_source_chosen ?
+        "A  Завантажити    B  Джерела    L / R  Вкладки    Y  Завантаження    +  Вихід" :
+        "← / →  Джерело    A  Обрати    B  Огляд    L / R  Вкладки    +  Вихід") :
         app.game_tab == GAME_OVERVIEW && app.metadata.original[0] ?
         "A  До файлів    X  Мова опису    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
         "A  До файлів    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід") :

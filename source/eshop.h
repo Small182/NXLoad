@@ -12,12 +12,14 @@ typedef struct {
     char released[16];
     char cover[CATALOG_URL];
     char page[CATALOG_URL];
+    char issue[CATALOG_TEXT];
     char screenshots[ESHOP_SCREENSHOTS][CATALOG_URL];
     size_t screenshot_count;
 } EshopGame;
 
 typedef struct {
     Game game;
+    char heading[CATALOG_TEXT];
     EshopGame match;
     atomic_bool cancel;
 } EshopJob;

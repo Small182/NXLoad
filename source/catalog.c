@@ -52,10 +52,14 @@ static int should_cancel(void *ptr, curl_off_t a, curl_off_t b, curl_off_t c, cu
     return atomic_load((atomic_bool *)ptr);
 }
 
-static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t limit, long *status) {
-    *status = 0;
+static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t limit,
+                    CatalogFetchStatus *status) {
+    *status = (CatalogFetchStatus){0};
     Buffer buf = { .data = malloc(limit + 1), .capacity = limit };
-    if (!buf.data) return (Buffer){0};
+    if (!buf.data) {
+        status->curl = CURLE_OUT_OF_MEMORY;
+        return (Buffer){0};
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
 #if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
@@ -77,9 +81,9 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, should_cancel);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    CURLcode result = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
-    if (result != CURLE_OK || *status != 200 || !buf.size) {
+    status->curl = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status->http);
+    if (status->curl != CURLE_OK || status->http != 200 || !buf.size) {
         free(buf.data);
         return (Buffer){0};
     }
@@ -87,27 +91,34 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
     return buf;
 }
 
-static unsigned char *fetch_resource(const char *url, atomic_bool *cancel, size_t limit, size_t *bytes) {
+static unsigned char *fetch_resource(const char *url, atomic_bool *cancel, size_t limit,
+                                     size_t *bytes, CatalogFetchStatus *status) {
     *bytes = 0;
     CURL *curl = curl_easy_init();
-    if (!curl) return NULL;
-    long status = 0;
-    Buffer data = fetch(curl, cancel, url, limit, &status);
+    if (!curl) {
+        *status = (CatalogFetchStatus){ .curl = CURLE_FAILED_INIT };
+        return NULL;
+    }
+    Buffer data = fetch(curl, cancel, url, limit, status);
     curl_easy_cleanup(curl);
     *bytes = data.size;
     return data.data;
 }
 
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
-    return fetch_resource(url, cancel, COVER_BYTES, bytes);
+    CatalogFetchStatus status;
+    return fetch_resource(url, cancel, COVER_BYTES, bytes, &status);
 }
 
-unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes) {
-    return fetch_resource(url, cancel, PAGE_BYTES, bytes);
+unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
+                                      CatalogFetchStatus *status) {
+    return fetch_resource(url, cancel, PAGE_BYTES, bytes, status);
 }
 
 static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, long *status) {
-    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status);
+    CatalogFetchStatus request;
+    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, &request);
+    *status = request.http;
     if (!buf.data) return NULL;
     htmlDocPtr doc = htmlReadMemory((char *)buf.data, (int)buf.size, url, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);

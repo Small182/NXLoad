@@ -14,6 +14,10 @@
 #define UK_GAMES "/en-gb/Games/Nintendo-Switch-games/"
 #define SWITCH_GAMES "/Games/Nintendo-Switch-games/"
 #define MEDIA "/eu/media/images/"
+#define CATALOG_ROMS "https://nsroms.net/roms/"
+#define US_PRODUCTS OFFICIAL "/us/store/products/"
+#define US_IMAGES "https://assets.nintendo.com/image/upload/"
+#define US_GAME_ART "/store/software/switch/"
 
 static bool begins(const char *value, const char *prefix) {
     return !strncmp(value, prefix, strlen(prefix));
@@ -211,7 +215,7 @@ static void match_records(xmlDocPtr document, const char *key, const char *alter
     }
 }
 
-static xmlDocPtr search(const char *terms, atomic_bool *cancel) {
+static xmlDocPtr search(const char *terms, atomic_bool *cancel, CatalogFetchStatus *status) {
     if (!*terms) return NULL;
     char *escaped = curl_easy_escape(NULL, terms, 0);
     if (!escaped) return NULL;
@@ -219,7 +223,7 @@ static xmlDocPtr search(const char *terms, atomic_bool *cancel) {
     snprintf(url, sizeof(url), "%s%s", SEARCH, escaped);
     curl_free(escaped);
     size_t size;
-    unsigned char *data = catalog_fetch_document(url, cancel, &size);
+    unsigned char *data = catalog_fetch_document(url, cancel, &size, status);
     if (!data) return NULL;
     xmlDocPtr doc = xmlReadMemory((char *)data, (int)size, NULL, NULL,
                                  XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
@@ -256,7 +260,7 @@ static bool product_summary(xmlNodePtr node, const char *wanted, bool *after_tit
             char key[CATALOG_TEXT] = {0};
             if (name) title_key(key, (char *)name, false);
             xmlFree(name);
-            *after_title = !strcmp(key, wanted);
+            if (!strcmp(key, wanted)) *after_title = true;
         } else if (*after_title && node->type == XML_ELEMENT_NODE &&
                    !xmlStrcmp(node->name, BAD_CAST "p")) {
             xmlChar *value = xmlNodeGetContent(node);
@@ -274,31 +278,154 @@ static bool product_summary(xmlNodePtr node, const char *wanted, bool *after_tit
     return false;
 }
 
-void eshop_lookup(EshopJob *job) {
-    char words[CATALOG_TEXT], raw_key[CATALOG_TEXT], trimmed_key[CATALOG_TEXT];
-    char title[CATALOG_TEXT];
-    clean_text(title, sizeof(title), job->game.title);
-    trim_site_suffix(title);
-    title_key(raw_key, job->game.title, false);
-    title_key(words, title, true);
-    title_key(trimmed_key, title, false);
-    xmlDocPtr doc = search(words, &job->cancel);
-    if (!doc) return;
-    match_records(doc, raw_key, trimmed_key, &job->match);
-    xmlFreeDoc(doc);
-    if (!job->match.page[0] || atomic_load(&job->cancel)) return;
-
+static htmlDocPtr fetch_product(const char *url, atomic_bool *cancel, CatalogFetchStatus *status) {
     size_t size;
-    unsigned char *data = catalog_fetch_document(job->match.page, &job->cancel, &size);
-    if (!data) return;
+    unsigned char *data = catalog_fetch_document(url, cancel, &size, status);
+    if (!data) return NULL;
     htmlDocPtr page = htmlReadMemory((char *)data, (int)size, NULL, "UTF-8",
                                     HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
     free(data);
-    if (!page) return;
+    return page;
+}
+
+static void request_issue(EshopGame *game, const char *step, CatalogFetchStatus status) {
+    if (status.curl)
+        snprintf(game->issue, sizeof(game->issue), "%s · cURL %d", step, status.curl);
+    else if (status.http && status.http != 200)
+        snprintf(game->issue, sizeof(game->issue), "%s · HTTP %ld", step, status.http);
+    else
+        snprintf(game->issue, sizeof(game->issue), "%s · дані недоступні", step);
+}
+
+static void european_product(EshopJob *job, const char *words, const char *raw, const char *trimmed) {
+    EshopGame *game = &job->match;
+    CatalogFetchStatus status = {0};
+    xmlDocPtr doc = search(words, &job->cancel, &status);
+    if (!doc) {
+        request_issue(game, "Пошук Nintendo eShop", status);
+        return;
+    }
+    match_records(doc, raw, trimmed, game);
+    xmlFreeDoc(doc);
+    if (!game->page[0]) {
+        strcpy(game->issue, "Точного збігу в Nintendo eShop не знайдено");
+        return;
+    }
+    if (atomic_load(&job->cancel)) return;
+    htmlDocPtr page = fetch_product(game->page, &job->cancel, &status);
+    if (!page) {
+        request_issue(game, "Сторінка Nintendo eShop", status);
+        return;
+    }
     char wanted[CATALOG_TEXT];
-    title_key(wanted, job->match.title, false);
+    title_key(wanted, game->title, false);
     bool after_title = false;
-    product_summary(xmlDocGetRootElement(page), wanted, &after_title, &job->match);
-    screenshots(xmlDocGetRootElement(page), &job->match);
+    product_summary(xmlDocGetRootElement(page), wanted, &after_title, game);
+    screenshots(xmlDocGetRootElement(page), game);
     xmlFreeDoc(page);
+}
+
+static bool us_artwork(const char *src, char out[CATALOG_URL]) {
+    if (!src || !begins(src, US_IMAGES)) return false;
+    const char *path = strstr(src, US_GAME_ART);
+    if (!path || strspn(path, "/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(path))
+        return false;
+    int count = snprintf(out, CATALOG_URL, US_IMAGES "f_jpg,q_auto,w_800%s", path);
+    return count > 0 && count < CATALOG_URL;
+}
+
+static xmlChar *us_title(xmlNodePtr node, const char *raw, const char *trimmed) {
+    for (; node; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE && !xmlStrcmp(node->name, BAD_CAST "h1")) {
+            xmlChar *name = xmlNodeGetContent(node);
+            char key[CATALOG_TEXT];
+            title_key(key, name ? (char *)name : "", false);
+            if (key[0] && (!strcmp(key, raw) || !strcmp(key, trimmed))) return name;
+            xmlFree(name);
+        }
+        xmlChar *nested = us_title(node->children, raw, trimmed);
+        if (nested) return nested;
+    }
+    return NULL;
+}
+
+static void us_images(xmlNodePtr node, const char *title, EshopGame *game) {
+    size_t length = strlen(title);
+    for (; node && game->screenshot_count < ESHOP_SCREENSHOTS; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE && !xmlStrcmp(node->name, BAD_CAST "img")) {
+            xmlChar *alt = xmlGetProp(node, BAD_CAST "alt");
+            if (alt && begins((char *)alt, title) && alt[length] == ' ' &&
+                alt[length + 1] && !alt[length + 1 + strspn((char *)alt + length + 1, "0123456789")]) {
+                xmlChar *src = xmlGetProp(node, BAD_CAST "src");
+                char image[CATALOG_URL];
+                if (us_artwork((char *)src, image)) {
+                    size_t i = 0;
+                    while (i < game->screenshot_count && strcmp(game->screenshots[i], image)) ++i;
+                    if (i == game->screenshot_count) strcpy(game->screenshots[game->screenshot_count++], image);
+                }
+                xmlFree(src);
+            }
+            xmlFree(alt);
+        } else if (!game->cover[0] && node->type == XML_ELEMENT_NODE &&
+                   !xmlStrcmp(node->name, BAD_CAST "meta")) {
+            xmlChar *property = xmlGetProp(node, BAD_CAST "property");
+            if (!xmlStrcmp(property, BAD_CAST "og:image")) {
+                xmlChar *src = xmlGetProp(node, BAD_CAST "content");
+                us_artwork((char *)src, game->cover);
+                xmlFree(src);
+            }
+            xmlFree(property);
+        }
+        us_images(node->children, title, game);
+    }
+}
+
+static void american_product(EshopJob *job, const char *raw, const char *trimmed) {
+    if (!begins(job->game.page, CATALOG_ROMS)) return;
+    const char *slug = job->game.page + sizeof(CATALOG_ROMS) - 1;
+    size_t length = strspn(slug, "abcdefghijklmnopqrstuvwxyz0123456789-");
+    const size_t suffix = sizeof("-switch") - 1;
+    if (length <= suffix || (slug[length] && strcmp(slug + length, "/")) ||
+        memcmp(slug + length - suffix, "-switch", suffix))
+        return;
+    char url[CATALOG_URL];
+    int size = snprintf(url, sizeof(url), US_PRODUCTS "%.*s/", (int)length, slug);
+    if (size <= 0 || size >= CATALOG_URL) return;
+
+    CatalogFetchStatus status = {0};
+    htmlDocPtr page = fetch_product(url, &job->cancel, &status);
+    if (!page) {
+        if (!job->match.issue[0]) request_issue(&job->match, "Сторінка Nintendo Store", status);
+        return;
+    }
+    xmlNodePtr root = xmlDocGetRootElement(page);
+    xmlChar *name = us_title(root, raw, trimmed);
+    if (name) {
+        EshopGame *game = &job->match;
+        if (!game->page[0]) {
+            strcpy(game->page, url);
+            clean_text(game->title, sizeof(game->title), (char *)name);
+        }
+        bool after_title = false;
+        char wanted[CATALOG_TEXT];
+        title_key(wanted, (char *)name, false);
+        product_summary(root, wanted, &after_title, game);
+        if (!game->screenshot_count) us_images(root, (char *)name, game);
+        if (game->description[0] && game->screenshot_count) game->issue[0] = 0;
+    }
+    xmlFree(name);
+    xmlFreeDoc(page);
+}
+
+void eshop_lookup(EshopJob *job) {
+    char words[CATALOG_TEXT], raw_key[CATALOG_TEXT], trimmed_key[CATALOG_TEXT], title[CATALOG_TEXT];
+    const char *name = job->heading[0] ? job->heading : job->game.title;
+    clean_text(title, sizeof(title), name);
+    trim_site_suffix(title);
+    title_key(raw_key, name, false);
+    title_key(words, title, true);
+    title_key(trimmed_key, title, false);
+    european_product(job, words, raw_key, trimmed_key);
+    if ((!job->match.description[0] || !job->match.screenshot_count) && !atomic_load(&job->cancel))
+        american_product(job, raw_key, trimmed_key);
 }

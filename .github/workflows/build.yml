@@ -1,42 +1,95 @@
-name: Check alternate Nintendo storefront
-on: [pull_request]
+name: Build NXLoad
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
-  inspect:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build curl and Mbed TLS for Switch
+        run: bash tools/build-network.sh
+      - run: make -j2
+      - name: Check DLArchive TLS chain
+        continue-on-error: true
+        run: |
+          status=0
+          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
+            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
+            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
+            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
+          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NXLoad
+          path: NXLoad.nro
+          if-no-files-found: error
+
+  metadata-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - shell: bash
+      - name: Verify both official Nintendo sources using real catalog data
         run: |
-          curl -4 -fLsS --http1.1 --compressed --cacert romfs/cacert.pem 'https://www.nintendo.com/us/store/products/mysims-cozy-bundle-switch/' -o /tmp/my.html
-          python3 - <<'PY'
-          import json, pathlib, re
-          from html.parser import HTMLParser
-          s = pathlib.Path('/tmp/my.html').read_text()
-          print('HTML size', len(s))
-          for needle in ['__NEXT_DATA__','ProductGallery','screenshot','gameDescription', 'gallery', 'cozy bundle', 'mysims-cozy-bundle-switch', 'og:description']:
-              matches = list(re.finditer(needle, s, re.I))
-              print(needle, len(matches))
-              for m in matches[:3]:
-                  print(repr(s[max(0,m.start()-40):m.end()+65]))
-          class Parser(HTMLParser):
-              def handle_starttag(self, tag, attrs):
-                  a = dict(attrs)
-                  if tag == 'meta' and a.get('property', '').startswith('og:'):
-                      print(a)
-                  if tag == 'img' and any(k in str(a).lower() for k in ('mysims', 'screenshot', 'gallery')):
-                      print('img', {k:v for k,v in a.items() if k in ('src','alt','title')})
-          Parser().feed(s)
-          m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', s, re.S)
-          if m:
-              def walk(obj, path):
-                  if isinstance(obj, dict):
-                      for k,v in obj.items():
-                          if any(n in k.lower() for n in ('gallery','screenshot','description','producttitle')) and 'locales' not in path:
-                              print(path + '/' + k, type(v).__name__, str(v)[:700])
-                          walk(v, path + '/' + k)
-                  if isinstance(obj, list):
-                      for i,v in enumerate(obj[:12]): walk(v, path + '/' + str(i))
-              walk(json.loads(m.group(1)), '')
-          PY
+          if ! pkg-config --exists libxml-2.0 libcurl; then
+            sudo apt-get update
+            sudo apt-get install -y libxml2-dev libcurl4-openssl-dev
+          fi
+          mkdir 'romfs:'
+          ln -s ../romfs/cacert.pem 'romfs:/cacert.pem'
+          cat > /tmp/nxload-metadata.c <<'C'
+          #include "eshop.h"
+          #include <curl/curl.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          static int simulate_dns_failure;
+          unsigned char *__real_catalog_fetch_document(const char *, atomic_bool *, size_t *, CatalogFetchStatus *);
+          unsigned char *__wrap_catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *size,
+                                                        CatalogFetchStatus *status) {
+              printf("Host request: %s\n", url);
+              if (simulate_dns_failure && strstr(url, "searching.nintendo-europe.com/")) {
+                  *status = (CatalogFetchStatus){.curl = CURLE_COULDNT_RESOLVE_HOST};
+                  *size = 0;
+                  return NULL;
+              }
+              return __real_catalog_fetch_document(url, cancel, size, status);
+          }
+          int main(void) {
+              if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
+              CatalogJob catalog = {0};
+              strcpy(catalog.game.title, "MySims Cozy Bundle Switch");
+              strcpy(catalog.game.page, "https://nsroms.net/roms/mysims-cozy-bundle-switch/");
+              catalog_request(&catalog);
+              free(catalog.details.cover);
+              printf("Actual NSRoms heading (%ld): %s\n", catalog.http, catalog.details.title);
+              if (catalog.http != 200 || !strstr(catalog.details.title, "ROM Download")) return 1;
+              for (int mode = 0; mode <= 1; ++mode) {
+                  EshopJob job = {.game = catalog.game};
+                  strcpy(job.heading, catalog.details.title);
+                  simulate_dns_failure = mode;
+                  eshop_lookup(&job);
+                  printf("Mode %d: %s · %zu description bytes · %zu screenshots · %s\n", mode,
+                         job.match.title, strlen(job.match.description), job.match.screenshot_count, job.match.issue);
+                  if (strcmp(job.match.title, "MySims™: Cozy Bundle") ||
+                      !strstr(job.match.page, mode ? "/us/store/products/" : "/Nintendo-Switch-games/") ||
+                      job.match.screenshot_count < (mode ? 5 : 6)) return 2;
+                  if (!strstr(job.match.description, mode ? "tales of creativity" : "MySims")) return 3;
+                  size_t size;
+                  unsigned char *image = catalog_fetch_cover(job.match.screenshots[0], &job.cancel, &size);
+                  if (!image) return 4;
+                  printf("First screenshot downloaded: %zu bytes\n", size);
+                  free(image);
+              }
+              curl_global_cleanup();
+          }
+          C
+          cc -std=c11 -Wall -Wextra -Werror -I source /tmp/nxload-metadata.c source/eshop.c source/catalog.c $(pkg-config --cflags --libs libxml-2.0 libcurl) -Wl,--wrap=catalog_fetch_document -o /tmp/nxload-metadata
+          /tmp/nxload-metadata

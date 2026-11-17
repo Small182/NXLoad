@@ -281,7 +281,7 @@ static void pump_covers(void) {
         free(job->bytes);
         job->bytes = NULL;
     }
-    if (app.cover_busy || app.download_busy) return;
+    if (app.cover_busy || app.download_busy || app.shop_busy) return;
 
     const char *url = NULL;
     bool screenshot = false;
@@ -349,12 +349,16 @@ static void pump_shop(void) {
             update_description();
         }
     }
-    if (app.screen == GAME && !app.shop_busy && !app.shop_requested && !app.download_busy) {
+    if (app.screen == GAME && !app.shop_busy && !app.shop_requested &&
+        !app.download_busy && !app.catalog_busy && !app.cover_busy) {
         memset(job, 0, sizeof(*job));
         atomic_init(&job->cancel, false);
         job->game = app.active_game;
+        if (app.details.title[0])
+            strcpy(job->heading, app.details.title);
         app.shop_requested = true;
         app.shop_busy = start_worker(&app.shop_thread, shop_worker, job);
+        if (!app.shop_busy) strcpy(app.shop.issue, "Не вдалося запустити запит Nintendo eShop");
     }
 }
 
@@ -388,7 +392,8 @@ static void refresh_saved(void) {
 static void pump_index(void) {
     if (!app.index_busy) return;
     CatalogIndexJob *job = &app.index_job;
-    atomic_store(&job->paused, app.download_busy);
+    bool game_request = app.screen == GAME && (app.catalog_busy || app.shop_busy || !app.shop_requested);
+    atomic_store(&job->paused, app.download_busy || game_request);
     size_t published = atomic_load(&job->published);
     if (app.show_partial_index && published > app.catalog.count) {
         char keep[CATALOG_URL] = {0};
@@ -684,7 +689,7 @@ static void draw_game_overview(void) {
         }
     } else {
         text(app.normal, app.shop_busy || !app.shop_requested ? "Завантаження опису…" :
-             "Опис із Nintendo eShop недоступний", 430, 269, 769, gray);
+             app.shop.issue[0] ? app.shop.issue : "Опис із Nintendo eShop недоступний", 430, 269, 769, gray);
     }
     text(app.small, app.catalog_busy ? "Перевірка файлів NSRoms…" :
          "A  Перейти до файлів", 430, 577, 769, blue);
@@ -693,6 +698,7 @@ static void draw_game_overview(void) {
 static void draw_game_screenshots(void) {
     if (!app.shop.screenshot_count) {
         const char *status = app.shop_busy || !app.shop_requested ? "Пошук скриншотів…" :
+                             app.shop.issue[0] ? app.shop.issue :
                              app.shop.page[0] ? "Скриншоти Nintendo eShop недоступні" :
                              "Дані гри в Nintendo eShop недоступні";
         text(app.normal, status, 430, 273, 769, gray);
@@ -790,7 +796,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.7", 206, 44, 120, gray);
+    text(app.small, "1.0.8", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();

@@ -43,6 +43,11 @@ typedef struct {
 } CatalogJob;
 
 typedef struct {
+    long http;
+    int curl;
+} CatalogFetchStatus;
+
+typedef struct {
     size_t count;
     time_t saved_at;
     Game games[CATALOG_CAPACITY];
@@ -63,6 +68,7 @@ void catalog_request(CatalogJob *job);
 void catalog_build_index(CatalogIndexJob *job);
 bool catalog_read_cache(CatalogIndex *index);
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes);
-unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes);
+unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
+                                      CatalogFetchStatus *status);
 
 #endif

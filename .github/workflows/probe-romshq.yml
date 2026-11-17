@@ -1,0 +1,50 @@
+name: Inspect public ROMsHQ and DataNodes pages
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for source in 'catalog|https://romshq.com/browse?scene=62' 'page2|https://romshq.com/browse?scene=62&page=2' 'game|https://romshq.com/game/powerful-pro-baseball-2024-2025' 'host|https://datanodes.to/xfcs6m8yaki3'; do
+            name=${source%%|*}
+            url=${source#*|}
+            curl -sS -L --max-filesize 4194304 --max-time 20 -A NXLoad/1.0.12 -w "$name %{http_code} %{content_type} %{size_download}\n" "$url" -o "/tmp/$name.html" &
+          done
+          wait
+          python3 - <<'PY'
+          import html, pathlib, re
+          from html.parser import HTMLParser
+          class P(HTMLParser):
+              def __init__(self, name):
+                  super().__init__()
+                  self.name=name
+                  self.count=0
+              def handle_starttag(self, tag, attrs):
+                  a=dict(attrs)
+                  href=a.get('href') or ''
+                  src=a.get('src') or ''
+                  if (tag=='a' and (href.startswith('/game/') or '/browse?' in href or 'datanodes.to/' in href)) or (
+                      tag in ('form','input','meta','button','script','img') and (
+                          self.name=='host' or self.name=='game' and any(w in str(a).lower() for w in ('download','data-src','og:image')))):
+                      if self.count<23 or self.name=='host':
+                          print('NODE', tag, repr(a)[:450])
+                      self.count+=1
+          for name in ('catalog','page2','game','host'):
+              p=pathlib.Path('/tmp/'+name+'.html')
+              if not p.exists(): continue
+              print('PAGE',name)
+              s=p.read_text(errors='replace')
+              if name=='host':
+                  for m in re.finditer(r"op=download|download2|(?:/download|downloadUrl|download_link|downloadFile|fetch\(|\.ajax\()",s,re.I):
+                      print('FLOW',repr(s[max(0,m.start()-60):m.end()+100]))
+              if name in ('catalog','page2'):
+                  print('PAGE LINKS', re.findall(r'href="[^"]*page=[^"]+"',s)[:12])
+                  print('EXAMPLE', 'powerful-pro-baseball-2024-2025' in s)
+              if name=='game':
+                  start=s.find('Download Links')
+                  if start>=0:
+                      print('FILES',re.sub(r'\s+',' ',s[start:start+12000])[:4200])
+              P(name).feed(s)
+          PY

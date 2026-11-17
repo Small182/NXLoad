@@ -1,41 +1,42 @@
-name: Trace NXLoad game lookup
+name: Check alternate Nintendo storefront
 on: [pull_request]
 permissions:
   contents: read
 jobs:
-  trace:
+  inspect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compare real inputs and Switch HTTP constraints
-        shell: bash
+      - shell: bash
         run: |
-          set -u
-          opts=(--silent --show-error --connect-timeout 8 --max-time 16 --http1.1 --tlsv1.2 --tls-max 1.2 -4 --compressed -A 'NXLoad/1.0.3' --cacert romfs/cacert.pem)
-          for host in nsroms.net searching.nintendo-europe.com www.nintendo.com; do
-            getent ahostsv4 "$host" | head -1 || true
-          done
-          curl "${opts[@]}" -w 'NSRoms page: %{http_code} %{size_download}\n' -L -o /tmp/nx-nsroms.html 'https://nsroms.net/roms/mysims-cozy-bundle-switch/' &
-          curl "${opts[@]}" -w 'NSRoms search: %{http_code} %{size_download}\n' -L -o /tmp/nx-catalog.html 'https://nsroms.net/?s=MySims' &
-          curl "${opts[@]}" -w 'Nintendo search: %{http_code} %{size_download}\n' -L -o /tmp/nx-game.xml 'https://searching.nintendo-europe.com/en/select?wt=xml&rows=24&fq=type%3AGAME%20AND%20playable_on_txt%3AHAC&q=mysims%20cozy%20bundle' &
-          curl "${opts[@]}" -w 'Nintendo product: %{http_code} %{size_download}\n' -L -o /tmp/nx-game.html 'https://www.nintendo.com/en-gb/Games/Nintendo-Switch-games/MySims-Cozy-Bundle-2640109.html' &
-          wait
+          curl -4 -fLsS --http1.1 --compressed --cacert romfs/cacert.pem 'https://www.nintendo.com/us/store/products/mysims-cozy-bundle-switch/' -o /tmp/my.html
           python3 - <<'PY'
-          import html, pathlib, re
-          for name in ['nsroms.html', 'catalog.html', 'game.xml', 'game.html']:
-              path = pathlib.Path('/tmp/nx-' + name)
-              if not path.exists():
-                  continue
-              data = path.read_text(errors='replace')
-              print(name, len(data))
-              if name in ['nsroms.html', 'catalog.html']:
-                  tags = re.findall(r'<(?:title|h[1-4])\b[^>]*>(.*?)</(?:title|h[1-4])>', data, re.I | re.S)
-                  for title in tags:
-                      decoded = html.unescape(re.sub('<[^>]+>', '', title)).strip()
-                      if 'mysims' in decoded.lower():
-                          print(repr(decoded))
-              elif name == 'game.xml':
-                  print('Solr result count:', re.findall(r'numFound="(\d+)"', data), 'Exact title and description available:', 'Cozy Bundle' in data)
-              elif name == 'game.html':
-                  print('Nintendo gallery rows:', len(re.findall(r'<img[^>]+data-xs="[^"]+/06_screenshots/[^"]+', data, re.I)))
+          import json, pathlib, re
+          from html.parser import HTMLParser
+          s = pathlib.Path('/tmp/my.html').read_text()
+          print('HTML size', len(s))
+          for needle in ['__NEXT_DATA__','ProductGallery','screenshot','gameDescription', 'gallery', 'cozy bundle', 'mysims-cozy-bundle-switch', 'og:description']:
+              matches = list(re.finditer(needle, s, re.I))
+              print(needle, len(matches))
+              for m in matches[:3]:
+                  print(repr(s[max(0,m.start()-40):m.end()+65]))
+          class Parser(HTMLParser):
+              def handle_starttag(self, tag, attrs):
+                  a = dict(attrs)
+                  if tag == 'meta' and a.get('property', '').startswith('og:'):
+                      print(a)
+                  if tag == 'img' and any(k in str(a).lower() for k in ('mysims', 'screenshot', 'gallery')):
+                      print('img', {k:v for k,v in a.items() if k in ('src','alt','title')})
+          Parser().feed(s)
+          m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', s, re.S)
+          if m:
+              def walk(obj, path):
+                  if isinstance(obj, dict):
+                      for k,v in obj.items():
+                          if any(n in k.lower() for n in ('gallery','screenshot','description','producttitle')) and 'locales' not in path:
+                              print(path + '/' + k, type(v).__name__, str(v)[:700])
+                          walk(v, path + '/' + k)
+                  if isinstance(obj, list):
+                      for i,v in enumerate(obj[:12]): walk(v, path + '/' + str(i))
+              walk(json.loads(m.group(1)), '')
           PY

@@ -5,6 +5,7 @@ on:
     branches: [native-1fichier]
     paths:
       - tools/ai-translate.py
+      - tools/local-translate.py
       - tools/build-metadata.py
       - .github/workflows/ai-translate.yml
   workflow_dispatch:
@@ -46,7 +47,8 @@ jobs:
 
       - name: Validate translation pipeline
         run: |
-          python3 -m py_compile tools/ai-translate.py tools/build-metadata.py tools/title_db.py
+          python3 -m py_compile tools/ai-translate.py tools/build-metadata.py tools/title_db.py tools/local-translate.py
+          python3 tools/local-translate.py --prepare --limit 3
           echo "Context-aware AI translation tooling loaded"
 
       - name: Prepare controlled translation batch

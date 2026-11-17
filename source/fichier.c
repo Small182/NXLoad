@@ -93,6 +93,79 @@ static bool resolve_host_url(const char *base, const char *target,
     return ok;
 }
 
+// Signed ROMsHQ /d/ URLs and DataNodes download pages can redirect to
+// distinct HTTPS delivery hosts. Accept ordinary public DNS names only:
+ // do not follow redirects to IP literals, local machines or custom ports.
+static bool public_redirect_host(const char *host) {
+    if (!host) return false;
+    size_t n = strlen(host);
+    if (n < 4 || n > 253 || !strchr(host, '.')) return false;
+    if (in_domain(host, "localhost") || in_domain(host, "local") ||
+        in_domain(host, "internal") || in_domain(host, "test") ||
+        in_domain(host, "invalid")) return false;
+    bool has_letter = false, at_label_start = true;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)host[i];
+        if (c == '.') {
+            if (at_label_start || host[i - 1] == '-') return false;
+            at_label_start = true;
+        } else if (c >= 'a' && c <= 'z') {
+            has_letter = true;
+            at_label_start = false;
+        } else if (c >= 'A' && c <= 'Z') {
+            has_letter = true;
+            at_label_start = false;
+        } else if (c >= '0' && c <= '9') {
+            at_label_start = false;
+        } else if (c == '-' && !at_label_start) {
+            at_label_start = false;
+        } else {
+            return false;
+        }
+    }
+    return has_letter && !at_label_start && host[n - 1] != '-';
+}
+
+static bool resolve_download_redirect(const char *base, const char *target,
+                                      char out[URL_CAPACITY], char host_out[128]) {
+    if (!target || !*target) return false;
+    CURLU *parsed = curl_url();
+    if (!parsed) return false;
+    char *scheme = NULL, *host = NULL, *port = NULL, *address = NULL;
+    bool ok = (!base || !curl_url_set(parsed, CURLUPART_URL, base, CURLU_DISALLOW_USER)) &&
+        !curl_url_set(parsed, CURLUPART_URL, target, CURLU_DISALLOW_USER) &&
+        !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) &&
+        !strcasecmp(scheme, "https") &&
+        !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
+        public_redirect_host(host) &&
+        !curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) &&
+        !strcmp(port, "443") &&
+        !curl_url_get(parsed, CURLUPART_URL, &address, 0) &&
+        strlen(address) < URL_CAPACITY;
+    if (ok) {
+        strcpy(out, address);
+        snprintf(host_out, 128, "%s", host);
+    }
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_free(address);
+    curl_url_cleanup(parsed);
+    return ok;
+}
+
+static void redirect_referer(const char *from, char referer[URL_CAPACITY]) {
+    CURLU *parsed = curl_url();
+    if (!parsed) return;
+    char *host = NULL;
+    if (!curl_url_set(parsed, CURLUPART_URL, from, CURLU_DISALLOW_USER) &&
+        !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
+        public_redirect_host(host))
+        snprintf(referer, URL_CAPACITY, "https://%s/", host);
+    curl_free(host);
+    curl_url_cleanup(parsed);
+}
+
 static bool resolve_url(const char *base, const char *target, char out[URL_CAPACITY]) {
     return resolve_host_url(base, target, out, HOST_FICHIER);
 }
@@ -835,6 +908,7 @@ void fichier_download(FichierJob *job) {
             if (code == CURLE_OK && closed && !atomic_load(&job->cancelled)) {
                 if (!rename(t.partial, job->path)) {
                     job->result = "Download saved";
+                    job->tls_detail[0] = 0;
                     goto done;
                 }
                 t.error = "Could not finalize file on SD";
@@ -887,17 +961,32 @@ void fichier_download(FichierJob *job) {
         }
         if (job->romshq || job->datanodes) {
             char *location = NULL;
+            char destination_host[128] = {0};
             curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &location);
-            if (location && ((job->romshq && resolve_host_url(url, location, next, HOST_ROMSHQ)) ||
-                             resolve_host_url(url, location, next, HOST_DATANODES))) {
-                strcpy(referrer, url);
+            if (t.status >= 300 && t.status < 400 && location &&
+                resolve_download_redirect(url, location, next, destination_host) &&
+                strcmp(next, url)) {
+                // Do not leak an expiring signed URL in the Referer header.
+                redirect_referer(url, referrer);
                 strcpy(url, next);
                 job->result = "Забагато перенаправлень до файлу";
+                snprintf(job->tls_detail, sizeof(job->tls_detail),
+                         "Перенаправлення на %s", destination_host);
                 continue;
+            }
+            if (location) {
+                char ignored[URL_CAPACITY], target_host[128] = {0};
+                if (resolve_download_redirect(url, location, ignored, target_host))
+                    snprintf(job->tls_detail, sizeof(job->tls_detail),
+                             "Перенаправлення зупинено: %s", target_host);
+                else
+                    strcpy(job->tls_detail, "Небезпечне або непідтримуване перенаправлення");
             }
             job->result = t.challenge || t.status == 403 ?
                 "Хостинг вимагає перевірку в браузері" :
-                "Хостинг не повернув файл. Потрібне кінцеве посилання";
+                t.status >= 300 && t.status < 400 ?
+                "Хостинг перенаправив на непідтримувану адресу" :
+                "Хостинг не повернув файл";
             goto done;
         }
         const char *error = page_error(&t);

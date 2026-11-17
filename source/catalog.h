@@ -11,6 +11,7 @@
 #define CATALOG_TEXT 192
 #define CATALOG_PAGE_GAMES 64
 #define CATALOG_CAPACITY 4096
+#define MERGED_CAPACITY (2 * CATALOG_CAPACITY)
 #define CATALOG_MAX_PAGES 120
 #define CATALOG_CACHE_TTL (24 * 60 * 60)
 #define CATALOG_FILE_COUNT 24
@@ -24,6 +25,10 @@ typedef struct {
     char page[CATALOG_URL];
     char cover[CATALOG_URL];
 } Game;
+
+typedef struct {
+    const Game *games[2];
+} CatalogEntry;
 
 typedef struct {
     char title[CATALOG_TEXT];

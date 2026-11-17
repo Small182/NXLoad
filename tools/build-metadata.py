@@ -12,8 +12,38 @@ import zlib
 
 from title_db import description, fingerprint, load_catalog, selected_games, text
 
-MAGIC = b"NXLTDB02"
+MAGIC = b"NXLTDB03"
 SCREENSHOT = re.compile(r"https://img-eshop\.cdn\.nintendo\.net/i/([a-f0-9]{64})\.jpg")
+
+
+CYRILLIC = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
+LATIN = re.compile(r"[A-Za-z]")
+WORDS = re.compile(r"[^\W\d_]+", re.UNICODE)
+APOSTROPHE = re.compile(r"([А-Яа-яІіЇїЄєҐґ])\s*['’]\s+([А-Яа-яІіЇїЄєҐґ])")
+HYPHEN = re.compile(r"(\d)-\s+(?=[А-Яа-яІіЇїЄєҐґ])")
+
+
+def clean_machine_description(candidate, source):
+    candidate = text(candidate)
+    if not candidate or not CYRILLIC.search(candidate) or any(mark in candidate for mark in ("�", "▁", "<unk>")):
+        return ""
+    words = WORDS.findall(candidate)
+    # Proper names are valid Latin text. Mixed scripts inside a single word are rarely intentional.
+    originals = set(WORDS.findall(source.casefold()))
+    mixed = [word for word in words if LATIN.search(word) and CYRILLIC.search(word)
+             and word.casefold() not in originals]
+    if mixed:
+        return ""
+    if len(words) >= 12 and sum(bool(LATIN.search(word)) for word in words) * 3 > len(words):
+        return ""
+    folded = [word.casefold() for word in words]
+    for width in (1, 2, 3, 4):
+        for start in range(len(folded) - 3 * width + 1):
+            phrase = folded[start:start + width]
+            if (width > 1 or len(phrase[0]) >= 3) and phrase * 3 == folded[start:start + 3 * width]:
+                return ""
+    candidate = APOSTROPHE.sub(r"\1’\2", candidate)
+    return HYPHEN.sub(r"\1-", candidate)
 
 
 def field_bytes(value, capacity):
@@ -34,7 +64,7 @@ def build(database, manual, automatic):
         english = description(item)
         ukrainian = text(manual.get(title_id))
         if not ukrainian and english:
-            ukrainian = text(automatic.get(fingerprint(english)))
+            ukrainian = clean_machine_description(automatic.get(fingerprint(english)), english)
         translated += bool(ukrainian)
         summary = ukrainian or english
         shots = item.get("screenshots")
@@ -51,6 +81,7 @@ def build(database, manual, automatic):
             field_bytes(text(item.get("publisher")), 192),
             field_bytes(release_date(item.get("releaseDate")), 16),
             field_bytes(summary, 3072),
+            field_bytes(english if ukrainian and english != ukrainian else "", 3072),
             "".join(hashes).encode("ascii"),
         ]
         body = zlib.compress(b"\0".join(fields) + b"\0")

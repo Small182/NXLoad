@@ -115,10 +115,8 @@ unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size
     return fetch_resource(url, cancel, PAGE_BYTES, bytes, status);
 }
 
-static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, long *status) {
-    CatalogFetchStatus request;
-    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, &request);
-    *status = request.http;
+static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, CatalogFetchStatus *status) {
+    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status);
     if (!buf.data) return NULL;
     htmlDocPtr doc = htmlReadMemory((char *)buf.data, (int)buf.size, url, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);
@@ -308,11 +306,12 @@ static unsigned declared_pages(xmlDocPtr doc) {
 }
 
 static bool load_page(CURL *curl, CatalogIndexJob *job, unsigned page,
-                      Game *games, size_t *count, long *status) {
+                      Game *games, size_t *count, CatalogFetchStatus *status) {
     char url[CATALOG_URL];
-    if (job->source == CATALOG_ROMSHQ)
-        snprintf(url, sizeof(url), ROMSHQ_LIST "&page=%u", page);
-    else if (page > 1)
+    if (job->source == CATALOG_ROMSHQ) {
+        if (page == 1) strcpy(url, ROMSHQ_LIST);
+        else snprintf(url, sizeof(url), ROMSHQ_LIST "&page=%u", page);
+    } else if (page > 1)
         snprintf(url, sizeof(url), LIST_URL "page/%u/", page);
     else
         strcpy(url, LIST_URL);
@@ -469,7 +468,9 @@ static void load_details(CatalogJob *job) {
     char cover[CATALOG_URL];
     strcpy(cover, job->game.cover);
     CURL *curl = curl_easy_init();
-    htmlDocPtr doc = curl ? fetch_page(curl, &job->cancel, job->game.page, &job->http) : NULL;
+    CatalogFetchStatus status = {.curl = CURLE_FAILED_INIT};
+    htmlDocPtr doc = curl ? fetch_page(curl, &job->cancel, job->game.page, &status) : NULL;
+    job->http = status.http;
     if (curl) curl_easy_cleanup(curl);
     if (doc) {
         xmlNodePtr root = xmlDocGetRootElement(doc);
@@ -494,7 +495,10 @@ static void load_details(CatalogJob *job) {
         }
         xmlFreeDoc(doc);
     } else {
-        snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна (HTTP %ld)", job->http);
+        if (status.curl)
+            snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна · cURL %d", status.curl);
+        else
+            snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна · HTTP %ld", status.http);
     }
     if (cover[0] && !atomic_load(&job->cancel)) {
         details->cover = catalog_fetch_cover(cover, &job->cancel, &details->cover_bytes);
@@ -602,18 +606,21 @@ void catalog_build_index(CatalogIndexJob *job) {
     }
     for (unsigned page = 1; page <= CATALOG_MAX_PAGES && wait_until_idle(job); ++page) {
         atomic_store(&job->page, page);
-        long status = 0;
+        CatalogFetchStatus status;
         size_t count = 0;
         bool loaded = load_page(curl, job, page, games, &count, &status);
-        if (!loaded && (status == 0 || status >= 500) && wait_until_idle(job)) {
+        if (!loaded && (status.curl || status.http >= 500) && wait_until_idle(job)) {
             index_delay();
             loaded = load_page(curl, job, page, games, &count, &status);
         }
         if (atomic_load(&job->cancel)) break;
         unsigned pages = atomic_load(&job->pages);
         if (!loaded) {
-            if (!pages && page > 1 && status == 404) job->complete = true;
-            else snprintf(job->error, sizeof(job->error), "Каталог · сторінка %u · HTTP %ld", page, status);
+            if (!pages && page > 1 && status.http == 404) job->complete = true;
+            else if (status.curl)
+                snprintf(job->error, sizeof(job->error), "Сторінка %u · cURL %d", page, status.curl);
+            else
+                snprintf(job->error, sizeof(job->error), "Сторінка %u · HTTP %ld", page, status.http);
             break;
         }
 

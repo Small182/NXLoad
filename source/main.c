@@ -54,18 +54,22 @@ typedef struct {
     TTF_Font *normal;
     TTF_Font *large;
     Screen screen, previous;
-    size_t rows[CATALOG_CAPACITY];
+    size_t rows[MERGED_CAPACITY];
     size_t game_count, game_index, file_index, saved_count, saved_index;
-    CatalogIndex catalog;
+    CatalogIndex catalogs[2];
+    CatalogEntry entries[MERGED_CAPACITY];
+    size_t entry_count;
     CatalogIndexJob index_job;
     Thread index_thread;
-    bool index_busy, show_partial_index, source_change;
-    CatalogSource source;
-    char index_notice[CATALOG_TEXT];
-    Game active_game;
+    bool index_busy, show_partial_index;
+    unsigned refresh_waiting;
+    CatalogSource file_source;
+    char index_notice[2][CATALOG_TEXT];
+    Game active_game, game_sources[2];
     GameTab game_tab;
     size_t screenshot_index;
     int description_scroll;
+    bool show_original;
     GameMetadata metadata;
     GameGallery gallery;
     GalleryJob gallery_job;
@@ -169,8 +173,13 @@ static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
     return R_SUCCEEDED(rc);
 }
 
+static const char *source_name(CatalogSource source) {
+    return source == CATALOG_ROMSHQ ? "ROMsHQ" : "NSRoms";
+}
+
 static const Game *game_at(size_t row) {
-    return &app.catalog.games[app.rows[row]];
+    const CatalogEntry *entry = &app.entries[app.rows[row]];
+    return entry->games[CATALOG_NSROMS] ? entry->games[CATALOG_NSROMS] : entry->games[CATALOG_ROMSHQ];
 }
 
 static bool match_query(const Game *game) {
@@ -194,10 +203,11 @@ static void rebuild_view(const char *keep) {
     app.game_count = 0;
     app.game_index = 0;
     bool found = false;
-    for (size_t i = 0; i < app.catalog.count; ++i) {
-        const Game *game = &app.catalog.games[i];
-        if (!match_query(game)) continue;
-        if (keep && !strcmp(game->page, keep)) {
+    for (size_t i = 0; i < app.entry_count; ++i) {
+        const Game *nsroms = app.entries[i].games[CATALOG_NSROMS];
+        const Game *romshq = app.entries[i].games[CATALOG_ROMSHQ];
+        if ((!nsroms || !match_query(nsroms)) && (!romshq || !match_query(romshq))) continue;
+        if (keep && ((nsroms && !strcmp(nsroms->page, keep)) || (romshq && !strcmp(romshq->page, keep)))) {
             app.game_index = app.game_count;
             found = true;
         }
@@ -207,8 +217,10 @@ static void rebuild_view(const char *keep) {
         app.game_index = SDL_min(old_index, app.game_count - 1);
 }
 
-static void start_index(void) {
-    if (app.index_busy) return;
+static void start_next_index(void) {
+    if (app.index_busy || !app.refresh_waiting) return;
+    CatalogSource source = (app.refresh_waiting & (1u << CATALOG_NSROMS)) ? CATALOG_NSROMS : CATALOG_ROMSHQ;
+    app.refresh_waiting &= ~(1u << source);
     CatalogIndexJob *job = &app.index_job;
     memset(job, 0, sizeof(*job));
     atomic_init(&job->cancel, false);
@@ -216,11 +228,17 @@ static void start_index(void) {
     atomic_init(&job->published, 0);
     atomic_init(&job->page, 0);
     atomic_init(&job->pages, 0);
-    job->source = app.source;
-    app.show_partial_index = app.catalog.count == 0;
-    app.index_notice[0] = 0;
+    job->source = source;
+    app.show_partial_index = app.catalogs[source].count == 0;
+    app.index_notice[source][0] = 0;
     app.index_busy = start_worker(&app.index_thread, index_worker, job);
-    if (!app.index_busy) strcpy(app.index_notice, "Не вдалося запустити оновлення каталогу");
+    if (!app.index_busy) strcpy(app.index_notice[source], "Не вдалося запустити оновлення");
+}
+
+static void refresh_catalogs(void) {
+    app.refresh_waiting |= (1u << CATALOG_NSROMS) | (1u << CATALOG_ROMSHQ);
+    if (app.index_busy) app.refresh_waiting &= ~(1u << app.index_job.source);
+    start_next_index();
 }
 
 static void start_game(void) {
@@ -228,8 +246,8 @@ static void start_game(void) {
     CatalogJob *job = &app.pending;
     memset(job, 0, sizeof(*job));
     atomic_init(&job->cancel, false);
-    job->game = app.active_game;
-    job->source = app.source;
+    job->game = app.game_sources[app.file_source];
+    job->source = app.file_source;
     app.notice[0] = 0;
     app.catalog_busy = start_worker(&app.catalog_thread, catalog_worker, job);
     if (!app.catalog_busy) strcpy(app.game_error, "Не вдалося запустити запит");
@@ -345,7 +363,7 @@ static void update_description(void) {
     SDL_DestroyTexture(app.description);
     app.description = NULL;
     app.description_scroll = 0;
-    const char *summary = app.metadata.description;
+    const char *summary = app.show_original ? app.metadata.original : app.metadata.description;
     if (!*summary) return;
     SDL_Surface *paragraph = TTF_RenderUTF8_Blended_Wrapped(app.normal, summary, gray, 750);
     if (!paragraph) return;
@@ -408,61 +426,57 @@ static void refresh_saved(void) {
     if (app.saved_index >= app.saved_count) app.saved_index = 0;
 }
 
-static void open_catalog(CatalogSource source) {
-    app.source = source;
-    app.query[0] = 0;
-    app.index_notice[0] = 0;
-    bool cached = catalog_read_cache(&app.catalog, source);
-    rebuild_view(NULL);
-    time_t now = time(NULL);
-    if (!cached || now < app.catalog.saved_at || now - app.catalog.saved_at >= CATALOG_CACHE_TTL)
-        start_index();
+static void remake_catalog(void) {
+    char keep[CATALOG_URL] = {0};
+    if (app.game_count) strcpy(keep, game_at(app.game_index)->page);
+    app.entry_count = merge_catalogs(app.catalogs, app.entries);
+    rebuild_view(keep[0] ? keep : NULL);
 }
 
-static void toggle_catalog(void) {
-    if (app.index_busy) {
-        app.source_change = true;
-        atomic_store(&app.index_job.cancel, true);
-        strcpy(app.index_notice, "Перемикання каталогу…");
-        return;
+static void open_catalogs(void) {
+    time_t now = time(NULL);
+    for (unsigned source = 0; source < 2; ++source) {
+        CatalogIndex *index = &app.catalogs[source];
+        bool cached = catalog_read_cache(index, (CatalogSource)source);
+        if (!cached || now < index->saved_at || now - index->saved_at >= CATALOG_CACHE_TTL)
+            app.refresh_waiting |= 1u << source;
     }
-    open_catalog(app.source == CATALOG_NSROMS ? CATALOG_ROMSHQ : CATALOG_NSROMS);
+    remake_catalog();
+    start_next_index();
 }
 
 static void pump_index(void) {
-    if (!app.index_busy) return;
+    if (!app.index_busy) {
+        start_next_index();
+        return;
+    }
     CatalogIndexJob *job = &app.index_job;
+    CatalogIndex *index = &app.catalogs[job->source];
     bool game_request = app.screen == GAME &&
         (app.catalog_busy || app.gallery_busy ||
          (app.game_tab == GAME_SCREENSHOTS && !app.gallery_requested));
     atomic_store(&job->paused, app.download_busy || game_request);
     size_t published = atomic_load(&job->published);
-    if (app.show_partial_index && published > app.catalog.count) {
-        char keep[CATALOG_URL] = {0};
-        if (app.game_count) strcpy(keep, game_at(app.game_index)->page);
-        size_t from = app.catalog.count;
-        memcpy(app.catalog.games + from, job->index.games + from, (published - from) * sizeof(Game));
-        app.catalog.count = published;
-        rebuild_view(keep);
+    if (app.show_partial_index && published > index->count) {
+        size_t from = index->count;
+        memcpy(index->games + from, job->index.games + from, (published - from) * sizeof(Game));
+        index->count = published;
+        remake_catalog();
     }
     if (R_FAILED(waitSingle(waiterForThread(&app.index_thread), 0))) return;
     threadWaitForExit(&app.index_thread);
     threadClose(&app.index_thread);
     app.index_busy = false;
-    if (app.source_change) {
-        app.source_change = false;
-        toggle_catalog();
-        return;
-    }
     if (job->complete) {
         char keep[CATALOG_URL] = {0};
         if (app.game_count) strcpy(keep, game_at(app.game_index)->page);
-        memcpy(app.catalog.games, job->index.games, job->index.count * sizeof(Game));
-        app.catalog.count = job->index.count;
-        app.catalog.saved_at = job->index.saved_at;
-        rebuild_view(keep);
+        memcpy(index->games, job->index.games, job->index.count * sizeof(Game));
+        index->count = job->index.count;
+        index->saved_at = job->index.saved_at;
+        app.entry_count = merge_catalogs(app.catalogs, app.entries);
+        rebuild_view(keep[0] ? keep : NULL);
     }
-    strcpy(app.index_notice, job->error);
+    strcpy(app.index_notice[job->source], job->error);
 }
 
 static void finish_jobs(void) {
@@ -474,6 +488,9 @@ static void finish_jobs(void) {
         if (!atomic_load(&job->cancel)) {
             app.details = job->details;
             if (app.details.screenshot_count && job->source == CATALOG_ROMSHQ) {
+                if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
+                memset(&app.gallery, 0, sizeof(app.gallery));
+                app.screenshot_index = 0;
                 app.gallery.count = app.details.screenshot_count;
                 memcpy(app.gallery.screenshots, app.details.screenshots,
                        app.gallery.count * sizeof(app.gallery.screenshots[0]));
@@ -550,7 +567,7 @@ static void start_download(const GameFile *file) {
     job->romshq = file->source == FILE_ROMSHQ_SIGNED;
     job->romshq_id = job->romshq ? app.file_id : NULL;
     job->datanodes = file->source == FILE_DATANODES;
-    strcpy(app.transfer_url, job->romshq ? app.active_game.page : file->url);
+    strcpy(app.transfer_url, job->romshq ? app.game_sources[app.file_source].page : file->url);
     job->url = app.transfer_url;
     launch_transfer();
 }
@@ -615,6 +632,17 @@ static void open_installer(void) {
     strcpy(app.notice, "DBI не знайдено. Потрібен DBI.nro в папці switch/DBI/.");
 }
 
+static bool multiple_game_sources(void) {
+    return app.game_sources[CATALOG_NSROMS].page[0] && app.game_sources[CATALOG_ROMSHQ].page[0];
+}
+
+static void open_file_source(CatalogSource source) {
+    app.file_source = source;
+    app.file_index = 0;
+    app.game_error[0] = 0;
+    start_game();
+}
+
 static void input(u64 buttons) {
     if (!buttons) return;
     if (app.confirm_install) {
@@ -657,6 +685,10 @@ static void input(u64 buttons) {
         if ((buttons & HidNpadButton_L) && app.game_tab > GAME_OVERVIEW) --app.game_tab;
         if ((buttons & HidNpadButton_R) && app.game_tab < GAME_FILES) ++app.game_tab;
         if (app.game_tab == GAME_FILES) {
+            if ((buttons & HidNpadButton_ZL) && !app.catalog_busy && multiple_game_sources()) {
+                open_file_source(app.file_source == CATALOG_NSROMS ? CATALOG_ROMSHQ : CATALOG_NSROMS);
+                return;
+            }
             app.file_index = move(app.file_index, app.details.count, buttons);
             if ((buttons & HidNpadButton_A) && !app.catalog_busy && app.details.count)
                 start_download(&app.details.files[app.file_index]);
@@ -667,6 +699,10 @@ static void input(u64 buttons) {
                 (buttons & (HidNpadButton_Right | HidNpadButton_StickLRight))) ++app.screenshot_index;
             if (buttons & HidNpadButton_A) app.game_tab = GAME_FILES;
         } else {
+            if ((buttons & HidNpadButton_X) && app.metadata.original[0]) {
+                app.show_original = !app.show_original;
+                update_description();
+            }
             int height = 0;
             if (app.description) SDL_QueryTexture(app.description, NULL, NULL, NULL, &height);
             if (buttons & up_buttons) app.description_scroll = SDL_max(0, app.description_scroll - 25);
@@ -677,25 +713,28 @@ static void input(u64 buttons) {
         return;
     }
     app.game_index = move(app.game_index, app.game_count, buttons);
-    if (buttons & HidNpadButton_ZL) {
-        toggle_catalog();
-    } else if ((buttons & HidNpadButton_X) &&
+    if ((buttons & HidNpadButton_X) &&
                keyboard(app.query, sizeof(app.query), "Пошук ігор", "Введи назву гри", "Пошук")) {
         rebuild_view(NULL);
     } else if ((buttons & HidNpadButton_B) && app.query[0]) {
         app.query[0] = 0;
         rebuild_view(NULL);
     } else if (buttons & HidNpadButton_ZR) {
-        start_index();
+        refresh_catalogs();
     } else if ((buttons & HidNpadButton_L) && app.game_count) {
         app.game_index -= SDL_min(app.game_index, (size_t)40);
     } else if ((buttons & HidNpadButton_R) && app.game_count) {
         app.game_index = SDL_min(app.game_index + 40, app.game_count - 1);
     } else if (buttons & HidNpadButton_A) {
         if (!app.game_count) {
-            if (!app.catalog.count) start_index();
+            if (!app.entry_count && !app.index_busy) refresh_catalogs();
         } else if (!app.catalog_busy) {
+            const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
             app.active_game = *game_at(app.game_index);
+            memset(app.game_sources, 0, sizeof(app.game_sources));
+            for (unsigned source = 0; source < 2; ++source)
+                if (entry->games[source]) app.game_sources[source] = *entry->games[source];
+            app.show_original = false;
             memset(&app.details, 0, sizeof(app.details));
             memset(&app.metadata, 0, sizeof(app.metadata));
             memset(&app.gallery, 0, sizeof(app.gallery));
@@ -709,7 +748,7 @@ static void input(u64 buttons) {
             app.screenshot_index = 0;
             app.game_tab = GAME_OVERVIEW;
             app.screen = GAME;
-            start_game();
+            open_file_source(entry->games[CATALOG_NSROMS] ? CATALOG_NSROMS : CATALOG_ROMSHQ);
         }
     }
 }
@@ -727,8 +766,8 @@ static void draw_library(void) {
     rect(40, 106, 500, 530, panel);
     rect(556, 106, 684, 530, panel);
     char header[160];
-    snprintf(header, sizeof(header), app.query[0] ? "Пошук · %s" : "Каталог %s",
-             app.query[0] ? app.query : app.source == CATALOG_ROMSHQ ? "ROMsHQ" : "NSRoms");
+    if (app.query[0]) snprintf(header, sizeof(header), "Пошук · %s", app.query);
+    else strcpy(header, "Каталог ігор");
     text(app.normal, header, 60, 125, 450, white);
     snprintf(header, sizeof(header), app.query[0] ? "Знайдено: %zu" : "Ігор: %zu", app.game_count);
     text(app.small, header, 60, 603, 420, gray);
@@ -748,22 +787,30 @@ static void draw_library(void) {
         text(app.large, game_at(app.game_index)->title, 588, 150, 610, white);
         CachedCover *cover = find_cover(game_at(app.game_index)->cover);
         if (cover) fit_cover(cover->texture, 588, 214, 620, 314);
-        text(app.normal, "A  Відкрити картку гри", 588, 541, 604, blue);
+        const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
+        const char *sources = entry->games[CATALOG_NSROMS] ?
+            (entry->games[CATALOG_ROMSHQ] ? "NSRoms · ROMsHQ" : "NSRoms") : "ROMsHQ";
+        text(app.small, sources, 588, 541, 604, blue);
     } else if (!app.index_busy) {
         text(app.normal, app.query[0] ? "Ігор за цим запитом не знайдено" : "Каталог порожній",
              588, 152, 610, gray);
     }
-    if (app.index_busy) {
-        unsigned page = atomic_load(&app.index_job.page), pages = atomic_load(&app.index_job.pages);
-        if (app.download_busy) strcpy(header, "Оновлення каталогу призупинено на час завантаження");
-        else if (page && pages) snprintf(header, sizeof(header), "Оновлення каталогу · %u / %u", page, pages);
-        else if (page) snprintf(header, sizeof(header), "Оновлення каталогу · сторінка %u", page);
-        else strcpy(header, "Оновлення каталогу…");
-        text(app.small, header, 588, app.game_count ? 577 : 152, 610, blue);
-    } else {
-        text(app.small, app.index_notice, 588, 577, 610, gray);
+    for (unsigned source = 0; source < 2; ++source) {
+        const char *name = source_name((CatalogSource)source);
+        int y = 568 + 19 * (int)source;
+        if (app.index_busy && app.index_job.source == (CatalogSource)source) {
+            unsigned page = atomic_load(&app.index_job.page), pages = atomic_load(&app.index_job.pages);
+            if (app.download_busy) snprintf(header, sizeof(header), "%s · оновлення призупинено", name);
+            else if (page && pages) snprintf(header, sizeof(header), "%s · %u / %u", name, page, pages);
+            else if (page) snprintf(header, sizeof(header), "%s · сторінка %u", name, page);
+            else snprintf(header, sizeof(header), "%s · оновлення…", name);
+            text(app.small, header, 588, y, 610, blue);
+        } else if (app.index_notice[source][0]) {
+            snprintf(header, sizeof(header), "%s · %.120s", name, app.index_notice[source]);
+            text(app.small, header, 588, y, 610, gray);
+        }
     }
-    text(app.small, app.notice, 588, 595, 610, gray);
+    text(app.small, app.notice, 588, 609, 610, gray);
 }
 
 static void draw_cover(void) {
@@ -797,8 +844,10 @@ static void draw_game_overview(void) {
         text(app.normal, !app.metadata.title[0] && app.catalog_busy ? "Пошук у TitleDB…" :
              "Опису в TitleDB немає", 430, 269, 769, gray);
     }
-    text(app.small, app.catalog_busy ? "Перевірка файлів…" :
-         "A  Перейти до файлів", 430, 577, 769, blue);
+    if (app.metadata.original[0]) {
+        text(app.small, app.show_original ? "Англійський оригінал" : "Український опис", 430, 548, 769, gray);
+        text(app.small, app.show_original ? "X  Українською" : "X  Показати оригінал", 430, 577, 769, blue);
+    }
 }
 
 static void draw_game_screenshots(void) {
@@ -833,7 +882,13 @@ static void draw_game_files(void) {
         for (size_t i = first; i < app.details.count && i < first + FILE_ROWS; ++i)
             row(i, app.file_index, 429, 267 + (int)(i - first) * 48, 782, app.details.files[i].title);
     }
-    if (app.details.count) text(app.small, app.source == CATALOG_ROMSHQ ? "ROMsHQ" : "NSRoms · DLArchive", 430, 552, 769, gray);
+    char providers[96];
+    if (multiple_game_sources())
+        snprintf(providers, sizeof(providers), "%s   ·   ZL %s", source_name(app.file_source),
+                 source_name(app.file_source == CATALOG_NSROMS ? CATALOG_ROMSHQ : CATALOG_NSROMS));
+    else
+        snprintf(providers, sizeof(providers), "%s", source_name(app.file_source));
+    text(app.small, providers, 430, 552, 769, gray);
     text(app.small, app.notice, 430, 595, 772, gray);
 }
 
@@ -904,16 +959,18 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.12", 206, 44, 120, gray);
+    text(app.small, "1.0.13", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування триває" : "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
     else if (app.screen == GAME) draw_game();
     else draw_downloads();
     const char *footer = app.screen == LIBRARY ?
-        "A  Відкрити    X  Пошук    L / R  Гортати    ZL  Джерело    ZR  Оновити    Y  Завантаження    +  Вихід" :
+        "A  Відкрити    X  Пошук    L / R  Гортати    ZR  Оновити    Y  Завантаження    +  Вихід" :
         app.screen == GAME ? (app.game_tab == GAME_FILES ?
-        "A  Завантажити    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
+        "A  Завантажити    ZL  Джерело    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
+        app.game_tab == GAME_OVERVIEW && app.metadata.original[0] ?
+        "A  До файлів    X  Мова опису    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід" :
         "A  До файлів    L / R  Вкладки    B  Каталог    Y  Завантаження    +  Вихід") :
         app.download_busy ? "X  Скасувати    B  Назад    +  Вихід" :
         "A  Відкрити DBI / розпакувати RAR    ZR  Посилання    B  Назад    +  Вихід";
@@ -966,7 +1023,7 @@ int main(void) {
     padInitializeDefault(&pad);
     if (ok) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
-        open_catalog(CATALOG_NSROMS);
+        open_catalogs();
         uint64_t next_frame = 0, next_scroll = 0;
         u64 held = 0;
         while (appletMainLoop() && !app.close) {

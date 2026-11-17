@@ -95,6 +95,81 @@ static void clean_heading(char *name) {
     } while (removed);
 }
 
+typedef struct {
+    char key[CATALOG_TEXT];
+    size_t index;
+    CatalogSource source;
+} MergeKey;
+
+static int compare_merge_key(const void *a, const void *b) {
+    return strcmp(((const MergeKey *)a)->key, ((const MergeKey *)b)->key);
+}
+
+static void merge_matches(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY],
+                          MergeKey *keys, bool *matched, bool platform_suffix) {
+    size_t count = 0;
+    // Include established matches when checking ambiguity, so remaining records cannot
+    // get paired against the wrong edition after the first pass.
+    for (unsigned source = 0; source < 2; ++source) {
+        for (size_t i = 0; i < indexes[source].count; ++i) {
+            char title[CATALOG_TEXT];
+            strcpy(title, indexes[source].games[i].title);
+            clean_heading(title);
+            if (platform_suffix && source == CATALOG_NSROMS) {
+                char stripped[CATALOG_TEXT];
+                strcpy(stripped, title);
+                if (remove_suffix(stripped, "nintendo switch") || remove_suffix(stripped, "switch")) {
+                    if (strpbrk(stripped, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                        strcpy(title, stripped);
+                }
+            }
+            MergeKey *key = &keys[count];
+            title_key(key->key, title);
+            if (!key->key[0]) continue;
+            key->index = i;
+            key->source = (CatalogSource)source;
+            ++count;
+        }
+    }
+    qsort(keys, count, sizeof(*keys), compare_merge_key);
+    for (size_t start = 0; start < count;) {
+        size_t end = start + 1;
+        while (end < count && !strcmp(keys[start].key, keys[end].key)) ++end;
+        if (end - start == 2 && keys[start].source != keys[start + 1].source) {
+            const MergeKey *left = &keys[start], *right = &keys[start + 1];
+            if (left->source == CATALOG_ROMSHQ) {
+                const MergeKey *tmp = left;
+                left = right;
+                right = tmp;
+            }
+            if (!entries[left->index].games[CATALOG_ROMSHQ] && !matched[right->index]) {
+                entries[left->index].games[CATALOG_ROMSHQ] = &indexes[CATALOG_ROMSHQ].games[right->index];
+                matched[right->index] = true;
+            }
+        }
+        start = end;
+    }
+}
+
+size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY]) {
+    size_t count = indexes[CATALOG_NSROMS].count;
+    size_t other = indexes[CATALOG_ROMSHQ].count;
+    for (size_t i = 0; i < count; ++i)
+        entries[i] = (CatalogEntry){.games = {&indexes[CATALOG_NSROMS].games[i], NULL}};
+    bool *matched = other ? calloc(other, sizeof(*matched)) : NULL;
+    MergeKey *keys = count && matched ? malloc((count + other) * sizeof(*keys)) : NULL;
+    if (keys) {
+        merge_matches(indexes, entries, keys, matched, false);
+        merge_matches(indexes, entries, keys, matched, true);
+    }
+    for (size_t i = 0; i < other; ++i)
+        if (!matched || !matched[i])
+            entries[count++] = (CatalogEntry){.games = {NULL, &indexes[CATALOG_ROMSHQ].games[i]}};
+    free(keys);
+    free(matched);
+    return count;
+}
+
 static bool read_u32(FILE *file, uint32_t *value) {
     unsigned char b[4];
     if (fread(b, 1, sizeof(b), file) != sizeof(b)) return false;
@@ -124,10 +199,10 @@ static bool read_metadata_record(FILE *file, GameMetadata *metadata) {
     char *inputs = decoded;
     GameMetadata result = {0};
     char *fields[] = {result.title, result.publisher, result.released,
-                      result.description, result.fallback_hashes};
+                      result.description, result.original, result.fallback_hashes};
     const size_t capacities[] = {sizeof(result.title), sizeof(result.publisher),
                                  sizeof(result.released), sizeof(result.description),
-                                 sizeof(result.fallback_hashes)};
+                                 sizeof(result.original), sizeof(result.fallback_hashes)};
     for (size_t i = 0; i < sizeof(fields) / sizeof(*fields); ++i) {
         char *end = memchr(inputs, 0, available);
         if (!end || (size_t)(end - inputs) >= capacities[i]) return false;
@@ -180,7 +255,7 @@ bool read_game_metadata(GameMetadata *metadata, const char *title, const char *h
     char magic[8];
     uint32_t count = 0;
     bool found = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
-                 !memcmp(magic, "NXLTDB02", sizeof(magic)) && read_u32(file, &count) &&
+                 !memcmp(magic, "NXLTDB03", sizeof(magic)) && read_u32(file, &count) &&
                  count <= 100000 && metadata_candidates(file, count, title, heading, metadata);
     fclose(file);
     return found;

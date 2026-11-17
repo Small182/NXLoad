@@ -11,6 +11,7 @@ typedef struct {
     char publisher[CATALOG_TEXT];
     char released[16];
     char description[3072];
+    char original[3072];
     char fallback_hashes[GALLERY_HASHES];
 } GameMetadata;
 
@@ -32,6 +33,7 @@ typedef struct {
     atomic_bool cancel;
 } GalleryJob;
 
+size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY]);
 bool read_game_metadata(GameMetadata *metadata, const char *title, const char *heading);
 void load_game_gallery(GalleryJob *job);
 unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes);

@@ -153,14 +153,18 @@ jobs:
           compression-level: 6
           if-no-files-found: warn
 
+      - name: Package review data in one folder
+        if: env.STAGE == 'collect'
+        run: |
+          mkdir -p editorial-package
+          for file in ai-work/quality-report.json ai-work/review.json.gz ai-work/editorial-sample.json tools/translations.ai.uk.json.gz; do
+            if test -f "$file"; then cp "$file" editorial-package/; fi
+          done
+
       - uses: actions/upload-artifact@v4
         if: env.STAGE == 'collect'
         with:
           name: nxload-ai-translation-review
-          path: |
-            ai-work/quality-report.json
-            ai-work/review.json.gz
-            ai-work/editorial-sample.json
-            tools/translations.ai.uk.json.gz
+          path: editorial-package/
           retention-days: 30
           if-no-files-found: warn

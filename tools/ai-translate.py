@@ -264,7 +264,7 @@ def main():
     p = choices.add_parser("prepare")
     p.add_argument("directory", type=Path)
     p.add_argument("--source", type=Path)
-    p.add_argument("--model", default="gpt-5.4-mini")
+    p.add_argument("--model", default="gpt-5.6-terra")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--manual", type=Path, default=MANUAL)
     p.add_argument("--cache", type=Path, default=OUTPUT)

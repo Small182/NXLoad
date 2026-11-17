@@ -31,3 +31,42 @@ jobs:
           name: NXLoad
           path: NXLoad.nro
           if-no-files-found: error
+  eshop-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect Nintendo catalog and product screenshot markup
+        run: |
+          python3 - <<'PY'
+          import collections
+          import re
+          import urllib.request
+          import urllib.parse
+          import xml.etree.ElementTree as et
+          from html.parser import HTMLParser
+          args = {'q':'title:MySims', 'fq':'type:GAME AND playable_on_txt:"Nintendo Switch"', 'wt':'xml', 'rows':12}
+          for host in ('searching.nintendo-europe.com','search.nintendo-europe.com'):
+              try:
+                  with urllib.request.urlopen('https://'+host+'/en/select?'+urllib.parse.urlencode(args), timeout=12) as r:
+                      tree = et.fromstring(r.read())
+                  for doc in tree.findall(".//result/doc")[:4]:
+                      print(host, {v.get('name'):''.join(v.itertext()).strip()[:170] for v in doc if v.get('name') in {'title','url','image_url','image_url_sq_s','excerpt','playable_on_txt','nsuid_txt'}})
+              except Exception as e:
+                  print(host, str(e))
+          class Parser(HTMLParser):
+              def handle_starttag(self, kind, attrs):
+                  attrs = dict(attrs)
+                  if kind not in ('a','img','source','div','button','li'):
+                      return
+                  show = {k:v for k,v in attrs.items() if v and ('/media/images/' in v or ('gallery' in v.lower() and k=='class') or 'screenshot' in v.lower())}
+                  if show and len(lines)<90:
+                      lines.append((kind,show))
+          lines = []
+          address = 'https://www.nintendo.com/en-gb/Games/Nintendo-Switch-games/MySims-Cozy-Bundle-2640109.html'
+          try:
+              with urllib.request.urlopen(address,timeout=12) as r:
+                  Parser().feed(r.read().decode('utf-8'))
+              for line in lines:
+                  print(line)
+          except Exception as e:
+              print('Nintendo product', str(e))
+          PY

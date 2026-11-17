@@ -1,72 +1,35 @@
-name: Build NXLoad
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
+name: Verify Nintendo catalog query
+on: [pull_request]
 permissions:
   contents: read
-
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build curl and Mbed TLS for Switch
-        run: bash tools/build-network.sh
-      - run: make -j2
-      - name: Check DLArchive TLS chain
-        continue-on-error: true
-        run: |
-          status=0
-          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
-            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
-            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
-            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
-          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
-          exit "$status"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NXLoad
-          path: NXLoad.nro
-          if-no-files-found: error
   eshop-probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Inspect Nintendo catalog and product screenshot markup
-        run: |
+      - run: |
           python3 - <<'PY'
-          import collections
-          import re
           import urllib.request
           import urllib.parse
           import xml.etree.ElementTree as et
-          from html.parser import HTMLParser
-          args = {'q':'title:MySims', 'fq':'type:GAME AND playable_on_txt:"Nintendo Switch"', 'wt':'xml', 'rows':12}
-          for host in ('searching.nintendo-europe.com','search.nintendo-europe.com'):
+
+          host = 'https://searching.nintendo-europe.com/en/select?'
+          for args in (
+              {'q':'mysims cozy bundle','fq':'type:GAME'},
+              {'q':'MySims','fq':'type:GAME'},
+              {'q':'Super Mario Odyssey','fq':'type:GAME'},
+              {'q':'*','fq':'type:GAME AND fs_id:2640109'},
+          ):
+              args.update(rows=8, wt='xml')
               try:
-                  with urllib.request.urlopen('https://'+host+'/en/select?'+urllib.parse.urlencode(args), timeout=12) as r:
-                      tree = et.fromstring(r.read())
-                  for doc in tree.findall(".//result/doc")[:4]:
-                      print(host, {v.get('name'):''.join(v.itertext()).strip()[:170] for v in doc if v.get('name') in {'title','url','image_url','image_url_sq_s','excerpt','playable_on_txt','nsuid_txt'}})
+                  with urllib.request.urlopen(host+urllib.parse.urlencode(args), timeout=12) as r:
+                      data = r.read()
+                  tree = et.fromstring(data)
+                  results = tree.findall('.//result/doc')
+                  print('Query:', args['q'], args['fq'], 'records:',len(results), 'root:',tree.tag)
+                  if not results:
+                      print(data[:360].decode())
+                  for doc in results[:5]:
+                      print({v.get('name'):''.join(v.itertext()).strip()[:185] for v in doc if v.get('name') in {'title','url','image_url','image_url_sq_s','excerpt','playable_on_txt','system_type','nsuid_txt','fs_id','publisher','date_from'}})
               except Exception as e:
-                  print(host, str(e))
-          class Parser(HTMLParser):
-              def handle_starttag(self, kind, attrs):
-                  attrs = dict(attrs)
-                  if kind not in ('a','img','source','div','button','li'):
-                      return
-                  show = {k:v for k,v in attrs.items() if v and ('/media/images/' in v or ('gallery' in v.lower() and k=='class') or 'screenshot' in v.lower())}
-                  if show and len(lines)<90:
-                      lines.append((kind,show))
-          lines = []
-          address = 'https://www.nintendo.com/en-gb/Games/Nintendo-Switch-games/MySims-Cozy-Bundle-2640109.html'
-          try:
-              with urllib.request.urlopen(address,timeout=12) as r:
-                  Parser().feed(r.read().decode('utf-8'))
-              for line in lines:
-                  print(line)
-          except Exception as e:
-              print('Nintendo product', str(e))
+                  print(type(e).__name__,str(e))
           PY

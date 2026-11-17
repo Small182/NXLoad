@@ -1,19 +1,98 @@
-name: Check Ukrainian metadata and screenshots
-on: [pull_request]
+name: Build NXLoad
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
-  inspect:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build curl and Mbed TLS for Switch
+        run: bash tools/build-network.sh
+      - run: make -j2
+      - name: Check DLArchive TLS chain
+        continue-on-error: true
+        run: |
+          status=0
+          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
+            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
+            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
+            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
+          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NXLoad
+          path: NXLoad.nro
+          if-no-files-found: error
+
+  metadata-smoke:
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          for file in UA.uk.json UA.en.json UA.ru.json US.uk.json; do curl -LsS -o /dev/null -w "$file: %{http_code}\n" "https://raw.githubusercontent.com/blawar/titledb/d424690446eec6f4484209b9a1c067c7f7511398/$file"; done
-          curl -fLsS 'https://raw.githubusercontent.com/blawar/titledb/d424690446eec6f4484209b9a1c067c7f7511398/US.en.json' -o /tmp/title.json
-          python3 - <<'PY'
-          import json
-          d = json.load(open('/tmp/title.json'))
-          for key in ('70010000000141', '70010000084815', '70010000068159'):
-              r = d[key]
-              print(r['name'], repr(r.get('screenshots'))[:1200])
-          print('Games with screenshots:', sum(bool(r.get('screenshots')) if isinstance(r,dict) else False for r in d.values()))
-          PY
+      - uses: actions/checkout@v4
+      - name: Verify offline Ukrainian descriptions and galleries with HTTP 403
+        run: |
+          if ! pkg-config --exists libxml-2.0 libcurl zlib; then
+            sudo apt-get update
+            sudo apt-get install -y libxml2-dev libcurl4-openssl-dev zlib1g-dev
+          fi
+          python3 tools/build-metadata.py /tmp/nxload/titledb.bin
+          python3 tools/build-galleries.py /tmp/nxload/gallery/.ready
+          cat > /tmp/nxload-metadata.c <<'C'
+          #include "game_info.h"
+          #include <assert.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          static int requests;
+          unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
+                                               CatalogFetchStatus *status) {
+              (void)cancel;
+              assert(strstr(url, "nintendolife.com/games/"));
+              ++requests;
+              *bytes = 0;
+              *status = (CatalogFetchStatus){.http = 403};
+              return NULL;
+          }
+          unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
+              (void)url; (void)cancel; (void)bytes;
+              abort();
+          }
+          int main(void) {
+              const char *titles[] = {"1-2 Switch NSP ROM Download", "MySims Cozy Bundle Switch",
+                                      "Everybody 1-2-Switch!"};
+              const char *ua[] = {"збірка мініігор для двох", "Дві затишні пригоди"};
+              for (int i = 0; i < 3; ++i) {
+                  GameMetadata metadata = {0};
+                  assert(read_game_metadata(&metadata, titles[i], ""));
+                  GalleryJob job = {0};
+                  strcpy(job.title, metadata.title);
+                  strcpy(job.fallback_hashes, metadata.fallback_hashes);
+                  load_game_gallery(&job);
+                  if (i == 2) {
+                      assert(requests == 1 && job.result.from_titledb && job.result.count > 0);
+                      assert(strstr(job.result.screenshots[0], "https://img-eshop.cdn.nintendo.net/i/") ==
+                             job.result.screenshots[0]);
+                      printf("HTTP 403 fallback: %s, %zu public CDN URLs\n", metadata.title, job.result.count);
+                      continue;
+                  }
+                  assert(!requests && !job.result.from_titledb && strstr(metadata.description, ua[i]));
+                  assert(job.result.count == (i == 0 ? 9 : 15));
+                  for (size_t j = 0; j < job.result.count; ++j) {
+                      size_t size;
+                      unsigned char *image = load_gallery_image(job.result.screenshots[j], &job.cancel, &size);
+                      assert(image && size > 4 && image[0] == 0xff && image[1] == 0xd8);
+                      free(image);
+                  }
+                  printf("Offline: %s, Ukrainian description, %zu JPEG files\n", metadata.title, job.result.count);
+              }
+          }
+          C
+          cc -std=c11 -Wall -Wextra -Werror -DTITLEDB_PATH='"/tmp/nxload/titledb.bin"' -DBUILTIN_GALLERY_PATH='"/tmp/nxload/gallery/"' -I source /tmp/nxload-metadata.c source/game_info.c $(pkg-config --cflags --libs libxml-2.0 zlib) -o /tmp/nxload-metadata
+          /tmp/nxload-metadata

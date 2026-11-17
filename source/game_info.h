@@ -4,18 +4,21 @@
 #include "catalog.h"
 
 #define GALLERY_LIMIT 32
+#define GALLERY_HASHES (GALLERY_LIMIT * 64 + 1)
 
 typedef struct {
     char title[CATALOG_TEXT];
     char publisher[CATALOG_TEXT];
     char released[16];
     char description[1536];
+    char fallback_hashes[GALLERY_HASHES];
 } GameMetadata;
 
 typedef struct {
     char screenshots[GALLERY_LIMIT][CATALOG_URL];
     size_t count;
     char issue[CATALOG_TEXT];
+    bool from_titledb;
 } GameGallery;
 
 typedef struct {
@@ -23,11 +26,13 @@ typedef struct {
     char title[CATALOG_TEXT];
     char heading[CATALOG_TEXT];
     char catalog_title[CATALOG_TEXT];
+    char fallback_hashes[GALLERY_HASHES];
     GameGallery result;
     atomic_bool cancel;
 } GalleryJob;
 
 bool read_game_metadata(GameMetadata *metadata, const char *title, const char *heading);
 void load_game_gallery(GalleryJob *job);
+unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes);
 
 #endif

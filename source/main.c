@@ -246,7 +246,8 @@ static SDL_Texture *decode_cover(const unsigned char *bytes, size_t count, bool 
 
 static void cover_worker(void *arg) {
     CoverJob *job = arg;
-    job->bytes = catalog_fetch_cover(job->url, &job->cancel, &job->count);
+    job->bytes = job->screenshot ? load_gallery_image(job->url, &job->cancel, &job->count) :
+                 catalog_fetch_cover(job->url, &job->cancel, &job->count);
 }
 
 static CachedCover *find_cover(const char *url) {
@@ -356,6 +357,7 @@ static void pump_gallery(void) {
         strcpy(job->title, app.metadata.title);
         strcpy(job->heading, app.details.title);
         strcpy(job->catalog_title, app.active_game.title);
+        strcpy(job->fallback_hashes, app.metadata.fallback_hashes);
         app.gallery_requested = true;
         app.gallery_busy = start_worker(&app.gallery_thread, gallery_worker, job);
         if (!app.gallery_busy)
@@ -717,7 +719,8 @@ static void draw_game_screenshots(void) {
               app.download_busy ? "Перегляд доступний після завершення завантаження" :
               "Завантаження скриншота…", 452, 281, 724, gray);
     char count[80];
-    snprintf(count, sizeof(count), "← / →   %zu / %zu  ·  Nintendo Life", app.screenshot_index + 1, app.gallery.count);
+    snprintf(count, sizeof(count), "← / →   %zu / %zu  ·  %s", app.screenshot_index + 1,
+             app.gallery.count, app.gallery.from_titledb ? "TitleDB" : "Nintendo Life");
     text(app.small, count, 430, 584, 769, blue);
 }
 
@@ -801,7 +804,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.9", 206, 44, 120, gray);
+    text(app.small, "1.0.10", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();

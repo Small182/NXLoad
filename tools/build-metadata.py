@@ -15,7 +15,8 @@ TITLEDB_URL = (
     "https://raw.githubusercontent.com/blawar/titledb/"
     "d424690446eec6f4484209b9a1c067c7f7511398/US.en.json"
 )
-MAGIC = b"NXLTDB01"
+MAGIC = b"NXLTDB02"
+SCREENSHOT = re.compile(r"https://img-eshop\.cdn\.nintendo\.net/i/([a-f0-9]{64})\.jpg")
 MAX_SOURCE = 128 * 1024 * 1024
 IGNORED = "™®©\u00a0–—’‘…"
 
@@ -46,7 +47,7 @@ def release_date(value):
         return ""
 
 
-def build(database):
+def build(database, translations):
     entries = {}
     for item in database.values():
         if not isinstance(item, dict) or item.get("isDemo") is not False:
@@ -58,12 +59,23 @@ def build(database):
         key = title_key(name).encode("utf-8")
         if not 0 < len(key) < 192:
             continue
-        description = text(item.get("description")) or text(item.get("intro"))
+        description = (text(translations.get(title_id.upper())) or
+                       text(item.get("description")) or text(item.get("intro")))
+        shots = item.get("screenshots")
+        hashes = []
+        if isinstance(shots, list):
+            for url in shots:
+                match = SCREENSHOT.fullmatch(url) if isinstance(url, str) else None
+                if match:
+                    hashes.append(match[1])
+                if len(hashes) == 32:
+                    break
         fields = [
             field_bytes(name, 192),
             field_bytes(text(item.get("publisher")), 192),
             field_bytes(release_date(item.get("releaseDate")), 16),
             field_bytes(description, 1536),
+            "".join(hashes).encode("ascii"),
         ]
         if not fields[0]:
             continue
@@ -97,7 +109,8 @@ def main():
             data = response.read(MAX_SOURCE + 1)
     if len(data) > MAX_SOURCE:
         raise ValueError("TitleDB snapshot exceeds the input limit")
-    index, count = build(json.loads(data))
+    translations = json.loads(Path(__file__).with_name("descriptions.uk.json").read_text(encoding="utf-8"))
+    index, count = build(json.loads(data), translations)
     if not count:
         raise ValueError("TitleDB snapshot contains no matching records")
     args.output.parent.mkdir(parents=True, exist_ok=True)

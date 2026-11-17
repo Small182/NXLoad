@@ -13,11 +13,16 @@
 #ifndef TITLEDB_PATH
 #define TITLEDB_PATH "romfs:/titledb.bin"
 #endif
+#ifndef BUILTIN_GALLERY_PATH
+#define BUILTIN_GALLERY_PATH "romfs:/gallery/"
+#endif
+#define BUILTIN_IMAGE_LIMIT (2 * 1024 * 1024)
 
 #define NL "https://www.nintendolife.com"
 #define NL_SWITCH "/games/nintendo-switch/"
 #define NL_ESHOP "/games/switch-eshop/"
 #define NL_IMAGE "https://images.nintendolife.com/screenshots/"
+#define TITLEDB_IMAGE "https://img-eshop.cdn.nintendo.net/i/"
 #define SOURCE_PAGE "https://nsroms.net/roms/"
 
 static bool begins(const char *value, const char *prefix) {
@@ -118,9 +123,11 @@ static bool read_metadata_record(FILE *file, GameMetadata *metadata) {
     if (uncompress((unsigned char *)decoded, &available, compressed, length) != Z_OK) return false;
     char *inputs = decoded;
     GameMetadata result = {0};
-    char *fields[] = {result.title, result.publisher, result.released, result.description};
+    char *fields[] = {result.title, result.publisher, result.released,
+                      result.description, result.fallback_hashes};
     const size_t capacities[] = {sizeof(result.title), sizeof(result.publisher),
-                                 sizeof(result.released), sizeof(result.description)};
+                                 sizeof(result.released), sizeof(result.description),
+                                 sizeof(result.fallback_hashes)};
     for (size_t i = 0; i < sizeof(fields) / sizeof(*fields); ++i) {
         char *end = memchr(inputs, 0, available);
         if (!end || (size_t)(end - inputs) >= capacities[i]) return false;
@@ -173,7 +180,7 @@ bool read_game_metadata(GameMetadata *metadata, const char *title, const char *h
     char magic[8];
     uint32_t count = 0;
     bool found = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
-                 !memcmp(magic, "NXLTDB01", sizeof(magic)) && read_u32(file, &count) &&
+                 !memcmp(magic, "NXLTDB02", sizeof(magic)) && read_u32(file, &count) &&
                  count <= 100000 && metadata_candidates(file, count, title, heading, metadata);
     fclose(file);
     return found;
@@ -254,12 +261,65 @@ static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, con
     return job->result.count != 0;
 }
 
+static bool bundled_gallery(const char *key, GameGallery *gallery) {
+    if (!key[0] || strspn(key, "abcdefghijklmnopqrstuvwxyz0123456789") != strlen(key))
+        return false;
+    char manifest[CATALOG_URL], line[24];
+    snprintf(manifest, sizeof(manifest), BUILTIN_GALLERY_PATH "%s/images.txt", key);
+    FILE *file = fopen(manifest, "r");
+    if (!file) return false;
+    while (gallery->count < GALLERY_LIMIT && fgets(line, sizeof(line), file)) {
+        size_t digits = strspn(line, "0123456789");
+        if (!digits || strcmp(line + digits, "\n")) break;
+        snprintf(gallery->screenshots[gallery->count++], CATALOG_URL,
+                 BUILTIN_GALLERY_PATH "%s/%.*s.jpg", key, (int)digits, line);
+    }
+    fclose(file);
+    return gallery->count != 0;
+}
+
+static void titledb_gallery(GalleryJob *job) {
+    GameGallery *gallery = &job->result;
+    const char *hashes = job->fallback_hashes;
+    size_t digits = strspn(hashes, "0123456789abcdef");
+    if (digits % 64 || hashes[digits]) return;
+    for (size_t offset = 0; offset < digits && gallery->count < GALLERY_LIMIT; offset += 64)
+        snprintf(gallery->screenshots[gallery->count++], CATALOG_URL,
+                 TITLEDB_IMAGE "%.64s.jpg", hashes + offset);
+    if (gallery->count) {
+        gallery->from_titledb = true;
+        gallery->issue[0] = 0;
+    }
+}
+
+unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes) {
+    if (!begins(url, BUILTIN_GALLERY_PATH)) return catalog_fetch_cover(url, cancel, bytes);
+    *bytes = 0;
+    if (atomic_load(cancel)) return NULL;
+    FILE *file = fopen(url, "rb");
+    if (!file) return NULL;
+    unsigned char *data = NULL;
+    if (!fseek(file, 0, SEEK_END)) {
+        long size = ftell(file);
+        if (size > 0 && size <= BUILTIN_IMAGE_LIMIT && !fseek(file, 0, SEEK_SET)) {
+            data = malloc((size_t)size);
+            if (data && fread(data, 1, (size_t)size, file) == (size_t)size)
+                *bytes = (size_t)size;
+        }
+    }
+    fclose(file);
+    if (*bytes) return data;
+    free(data);
+    return NULL;
+}
+
 void load_game_gallery(GalleryJob *job) {
     char name[CATALOG_TEXT], key[CATALOG_TEXT], alternate[CATALOG_TEXT] = {0};
     snprintf(name, sizeof(name), "%s", job->title[0] ? job->title :
              job->heading[0] ? job->heading : job->catalog_title);
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
+    if (bundled_gallery(key, &job->result)) return;
     char slugs[2][CATALOG_TEXT] = {{0}};
     make_slug(slugs[0], name);
     if (!job->title[0]) {
@@ -277,7 +337,7 @@ void load_game_gallery(GalleryJob *job) {
 
     CatalogFetchStatus status = {0};
     const char *platforms[] = {NL_SWITCH, NL_ESHOP};
-    for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
+    for (size_t i = 0; i < 2 && !job->result.issue[0] && !atomic_load(&job->cancel); ++i) {
         if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
         for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
             char url[CATALOG_URL];
@@ -286,15 +346,17 @@ void load_game_gallery(GalleryJob *job) {
             if (status.curl) {
                 snprintf(job->result.issue, sizeof(job->result.issue),
                          "Nintendo Life · cURL %d", status.curl);
-                return;
+                break;
             }
             if (status.http && status.http != 200 && status.http != 404) {
                 snprintf(job->result.issue, sizeof(job->result.issue),
                          "Nintendo Life · HTTP %ld", status.http);
-                return;
+                break;
             }
         }
     }
-    snprintf(job->result.issue, sizeof(job->result.issue), "%s",
-             "Скриншоти гри в Nintendo Life не знайдено");
+    if (atomic_load(&job->cancel)) return;
+    titledb_gallery(job);
+    if (!job->result.count && !job->result.issue[0])
+        strcpy(job->result.issue, "Скриншоти гри в Nintendo Life не знайдено");
 }

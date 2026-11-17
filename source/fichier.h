@@ -15,6 +15,7 @@ typedef struct {
     atomic_bool cancelled;
     atomic_uint_fast64_t received;
     atomic_uint_fast64_t total;
+    atomic_uint streams;
     atomic_uint waiting;
     const char *result;
     long http;

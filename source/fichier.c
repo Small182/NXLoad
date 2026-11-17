@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "fichier.h"
+#include "range.h"
 
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
@@ -150,7 +151,7 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
     return n;
 }
 
-static bool open_partial(Transfer *t) {
+static bool open_partial(Transfer *t, bool buffered) {
     const char *fallback = t->job->megaup ? "megaup-download.bin" : "1fichier-download.bin";
     char generic[DLARCHIVE_ID_CAPACITY + 8];
     if (t->job->dlarchive) {
@@ -197,12 +198,58 @@ static bool open_partial(Transfer *t) {
         t->error = "Cannot open output stream";
         return false;
     }
-    t->write_buffer = malloc(FILE_WRITE_BUFFER);
+    t->write_buffer = buffered ? malloc(FILE_WRITE_BUFFER) : NULL;
     if (t->write_buffer && setvbuf(t->file, t->write_buffer, _IOFBF, FILE_WRITE_BUFFER)) {
         free(t->write_buffer);
         t->write_buffer = NULL;
     }
     return true;
+}
+
+static bool parallel_download(Transfer *t, const char *url, const char *referer) {
+    FichierJob *job = t->job;
+    const RangeSource source = { url, referer, "romfs:/cacert.pem" };
+    RangeInfo info;
+    if (!range_probe(&source, job, &info)) {
+        if (info.status != 429) return false;
+        job->http = info.status;
+        job->result = "DLArchive обмежив кількість запитів";
+        return true;
+    }
+    t->expected = info.length;
+    read_filename(t, info.disposition);
+    if (!open_partial(t, false)) {
+        job->result = t->error;
+        return true;
+    }
+    RangeResult result = range_download(&source, &info, job, fileno(t->file));
+    bool closed = fclose(t->file) == 0;
+    t->file = NULL;
+    if (result == RANGE_OK && closed && !atomic_load(&job->cancelled)) {
+        if (!rename(t->partial, job->path)) {
+            job->result = "Download saved";
+            return true;
+        }
+        job->result = "Could not finalize file on SD";
+        unlink(t->partial);
+        return true;
+    }
+    unlink(t->partial);
+    if (atomic_load(&job->cancelled)) return true;
+    if (result == RANGE_SD_ERROR || !closed) {
+        job->result = "SD write failed (space or file size limit)";
+        return true;
+    }
+    if (result == RANGE_RATE_LIMIT) {
+        job->result = "DLArchive обмежив кількість запитів";
+        return true;
+    }
+    atomic_store(&job->received, 0);
+    atomic_store(&job->total, 0);
+    atomic_store(&job->streams, 0);
+    job->avg_speed = 0;
+    job->http = 0;
+    return false;
 }
 
 static size_t on_body(char *data, size_t size, size_t count, void *arg) {
@@ -211,7 +258,7 @@ static size_t on_body(char *data, size_t size, size_t count, void *arg) {
     if (atomic_load(&t->job->cancelled)) return 0;
     if (t->allow_file && t->status == 200 && !t->challenge && !t->text &&
         (t->attachment || t->binary)) {
-        if (!t->file && !open_partial(t)) return 0;
+        if (!t->file && !open_partial(t, true)) return 0;
         size_t written = fwrite(data, 1, n, t->file);
         atomic_fetch_add(&t->job->received, written);
         if (written != n) t->error = "SD write failed (space or file size limit)";
@@ -588,7 +635,7 @@ void fichier_download(FichierJob *job) {
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 40L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.3");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.4");
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
@@ -602,6 +649,8 @@ void fichier_download(FichierJob *job) {
     if (job->dlarchive) {
         if (!resolve_dlarchive(curl, &t, url)) goto done;
         strcpy(referrer, DLARCHIVE_ORIGIN "/");
+        t.name[0] = 0;
+        if (parallel_download(&t, url, referrer)) goto done;
     } else if (job->megaup) {
         if (!resolve_host_url(NULL, job->url, url, HOST_MEGAUP)) {
             job->result = "Unexpected MegaUp file address";

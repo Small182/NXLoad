@@ -378,7 +378,8 @@ static void finish_jobs(void) {
     }
     if (app.download_busy && SDL_GetTicks64() - app.speed_time >= 500) {
         uint64_t now = SDL_GetTicks64(), bytes = atomic_load(&app.download.received);
-        app.speed = (bytes - app.previous_bytes) * 1000.0 / (now - app.speed_time);
+        app.speed = bytes >= app.previous_bytes ?
+            (bytes - app.previous_bytes) * 1000.0 / (now - app.speed_time) : 0;
         app.previous_bytes = bytes;
         app.speed_time = now;
     }
@@ -394,6 +395,7 @@ static void start_download(const GameFile *file) {
     atomic_init(&job->cancelled, false);
     atomic_init(&job->received, 0);
     atomic_init(&job->total, 0);
+    atomic_init(&job->streams, 0);
     atomic_init(&job->waiting, 0);
     strcpy(app.file_id, file->id);
     strcpy(app.transfer_name, file->title);
@@ -603,9 +605,15 @@ static void draw_downloads(void) {
     text(app.large, "Завантаження", 66, 128, 1100, white);
     if (app.download_busy || app.download_finished) {
         uint64_t have = atomic_load(&app.download.received), total = atomic_load(&app.download.total);
+        unsigned streams = atomic_load(&app.download.streams);
         double percent = total ? SDL_min(100.0, 100.0 * have / total) : 0;
         char line[192];
         text(app.normal, app.transfer_name, 66, 182, 1100, white);
+        if (streams > 1) {
+            char connections[48];
+            snprintf(connections, sizeof(connections), "HTTP Range · %u з’єднань", streams);
+            text(app.small, connections, 920, 183, 290, blue);
+        }
         rect(66, 225, 1148, 8, selected);
         rect(66, 225, (int)(1148 * percent / 100.0), 8, blue);
         if (app.download_busy && total) {
@@ -637,7 +645,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.3", 206, 44, 120, gray);
+    text(app.small, "1.0.4", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -673,6 +681,7 @@ int main(void) {
     SocketInitConfig socket_config = *socketGetDefaultInitConfig();
     socket_config.tcp_rx_buf_size = 512 * 1024;
     socket_config.tcp_rx_buf_max_size = 2 * 1024 * 1024;
+    socket_config.sb_efficiency = 8;
     Result sockets = socketInitialize(&socket_config);
     if (R_FAILED(sockets)) sockets = socketInitializeDefault();
     bool curl_ready = romfs_ready && R_SUCCEEDED(entropy) && R_SUCCEEDED(sockets) && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;

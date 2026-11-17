@@ -1,5 +1,7 @@
 # NXLoad
 
+Файли від 32 МіБ NXLoad завантажує у 4 або 6 з’єднань, якщо сервер DLArchive підтримує HTTP Range і надає сильний ETag. Передача йде напряму на Switch. Якщо сервер ігнорує запити по частинах, NXLoad використовує один потік.
+
 Нативний каталог Nintendo Switch та завантажувач DLArchive для microSD.
 
 Скопіюй `NXLoad.nro` у `switch/` і запусти через Homebrew Menu.

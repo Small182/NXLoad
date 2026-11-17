@@ -304,8 +304,6 @@ static void load_details(CatalogJob *job) {
             xmlChar *property = xmlGetProp(node, BAD_CAST "property");
             xmlChar *value = xmlGetProp(node, BAD_CAST "content");
             if (!xmlStrcmp(property, BAD_CAST "og:image")) site_url(value, cover);
-            if (!xmlStrcmp(property, BAD_CAST "og:description"))
-                copy_text(details->info, sizeof(details->info), value);
             xmlFree(property);
             xmlFree(value);
         }

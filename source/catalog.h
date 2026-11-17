@@ -28,7 +28,6 @@ typedef struct {
 
 typedef struct {
     char title[CATALOG_TEXT];
-    char info[1536];
     GameFile files[CATALOG_FILE_COUNT];
     size_t count;
     unsigned char *cover;

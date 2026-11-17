@@ -31,3 +31,44 @@ jobs:
           name: NXLoad
           path: NXLoad.nro
           if-no-files-found: error
+
+  metadata-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify MySims against Nintendo eShop
+        run: |
+          if ! pkg-config --exists libxml-2.0 libcurl; then
+            sudo apt-get update
+            sudo apt-get install -y libxml2-dev libcurl4-openssl-dev
+          fi
+          mkdir 'romfs:'
+          ln -s ../romfs/cacert.pem 'romfs:/cacert.pem'
+          cat > /tmp/nxload-metadata.c <<'C'
+          #include "eshop.h"
+          #include <curl/curl.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          int main(void) {
+              if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
+              EshopJob job = {0};
+              strcpy(job.game.title, "MySims Cozy Bundle Switch ROM Download");
+              eshop_lookup(&job);
+              printf("Title: %s\nPublisher: %s\nPage: %s\nDescription bytes: %zu\nGallery: %zu\n",
+                     job.match.title, job.match.publisher, job.match.page,
+                     strlen(job.match.description), job.match.screenshot_count);
+              if (!strstr(job.match.title, "Cozy Bundle") || strcmp(job.match.publisher, "Electronic Arts") ||
+                  !strstr(job.match.description, "MySims") || !job.match.cover[0] ||
+                  job.match.screenshot_count < 6) return 1;
+              size_t size;
+              unsigned char *image = catalog_fetch_cover(job.match.screenshots[0], &job.cancel, &size);
+              if (!image) return 1;
+              printf("First screenshot: %zu bytes\n", size);
+              free(image);
+              curl_global_cleanup();
+              return 0;
+          }
+          C
+          cc -I source /tmp/nxload-metadata.c source/eshop.c source/catalog.c $(pkg-config --cflags --libs libxml-2.0 libcurl) -o /tmp/nxload-metadata
+          /tmp/nxload-metadata

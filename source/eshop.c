@@ -90,19 +90,25 @@ static void title_key(char out[CATALOG_TEXT], const char *value, bool search_wor
 
 static void trim_site_suffix(char *title) {
     const char *suffixes[] = {
-        " nintendo switch", " switch", " nsp", " xci", " nsz", " xcz"
+        "rom download free", "rom free download", "rom download", "rom",
+        "switch download free", "switch free download", "switch download",
+        "nintendo switch", "switch", "nsp", "xci", "nsz", "xcz"
     };
-    bool changed;
-    do {
-        changed = false;
+    for (;;) {
+        size_t end = strlen(title);
+        while (end && strchr(" )]", title[end - 1])) --end;
+        size_t cut = end;
         for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
-            if (ends(title, suffixes[i])) {
-                title[strlen(title) - strlen(suffixes[i])] = 0;
-                changed = true;
-                break;
-            }
+            size_t size = strlen(suffixes[i]);
+            if (end <= size || !strchr(" -|:/([", title[end - size - 1]) ||
+                strncasecmp(title + end - size, suffixes[i], size)) continue;
+            cut = end - size;
+            while (cut && strchr(" -|:/([", title[cut - 1])) --cut;
+            break;
         }
-    } while (changed);
+        if (cut == end || !cut) return;
+        title[cut] = 0;
+    }
 }
 
 static bool product_url(const char *value, char out[CATALOG_URL]) {
@@ -222,7 +228,7 @@ static xmlDocPtr search(const char *terms, atomic_bool *cancel) {
 }
 
 static void screenshots(xmlNodePtr node, EshopGame *game) {
-    const char *attributes[] = {"data-xl", "data-lg", "data-md", "data-xs", "data-src", "src", "href"};
+    const char *attributes[] = {"data-md", "data-xs", "data-lg", "data-xl", "data-src", "src", "href"};
     for (; node && game->screenshot_count < ESHOP_SCREENSHOTS; node = node->next) {
         if (node->type == XML_ELEMENT_NODE &&
             (!xmlStrcmp(node->name, BAD_CAST "img") || !xmlStrcmp(node->name, BAD_CAST "a"))) {

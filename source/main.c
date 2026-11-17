@@ -330,7 +330,7 @@ static void update_description(void) {
     SDL_DestroyTexture(app.description);
     app.description = NULL;
     app.description_scroll = 0;
-    const char *summary = app.shop.description[0] ? app.shop.description : app.details.info;
+    const char *summary = app.shop.description;
     if (!*summary) return;
     SDL_Surface *paragraph = TTF_RenderUTF8_Blended_Wrapped(app.normal, summary, gray, 750);
     if (!paragraph) return;
@@ -423,7 +423,6 @@ static void finish_jobs(void) {
             app.details = job->details;
             strcpy(app.game_error, job->error);
             update_cover();
-            if (!app.shop.description[0]) update_description();
         } else {
             free(job->details.cover);
         }
@@ -684,8 +683,8 @@ static void draw_game_overview(void) {
                 text(app.small, "↑ / ↓  Читати опис", 430, 522, 769, gray);
         }
     } else {
-        text(app.normal, app.shop_busy || app.catalog_busy ? "Завантаження опису…" :
-             "Опис гри недоступний", 430, 269, 769, gray);
+        text(app.normal, app.shop_busy || !app.shop_requested ? "Завантаження опису…" :
+             "Опис із Nintendo eShop недоступний", 430, 269, 769, gray);
     }
     text(app.small, app.catalog_busy ? "Перевірка файлів NSRoms…" :
          "A  Перейти до файлів", 430, 577, 769, blue);
@@ -693,8 +692,10 @@ static void draw_game_overview(void) {
 
 static void draw_game_screenshots(void) {
     if (!app.shop.screenshot_count) {
-        text(app.normal, app.shop_busy || !app.shop_requested ? "Пошук скриншотів…" :
-             "Скриншотів у каталозі немає", 430, 273, 769, gray);
+        const char *status = app.shop_busy || !app.shop_requested ? "Пошук скриншотів…" :
+                             app.shop.page[0] ? "Скриншоти Nintendo eShop недоступні" :
+                             "Дані гри в Nintendo eShop недоступні";
+        text(app.normal, status, 430, 273, 769, gray);
         return;
     }
     const char *url = app.shop.screenshots[app.screenshot_index];
@@ -789,7 +790,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.6", 206, 44, 120, gray);
+    text(app.small, "1.0.7", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();

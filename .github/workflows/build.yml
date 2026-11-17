@@ -31,3 +31,44 @@ jobs:
           name: NXLoad
           path: NXLoad.nro
           if-no-files-found: error
+  live-range-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request one byte from the DLArchive sample
+        run: |
+          python3 - <<'PY'
+          import json
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          class NoRedirects(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirects)
+          origin = "https://drive.dlarchive.my.id"
+          api = "https://uptobox.dlarchive.my.id/files_api.php?action=file-url&id=t94awh34fed17a"
+          try:
+              headers = {"Origin": origin, "Referer": origin + "/dl/?id=t94awh34fed17a", "User-Agent": "NXLoad/1.0.3"}
+              with opener.open(urllib.request.Request(api, headers=headers), timeout=12) as response:
+                  print(f"API HTTP {response.status}")
+                  result = json.loads(response.read(65536))
+              url = result.get("url", "")
+              address = urllib.parse.urlsplit(url)
+              if address.scheme != "https" or address.netloc != "direct-stor.berkasdrive.com":
+                  print("API returned no URL on the expected HTTPS file host")
+                  raise SystemExit(0)
+              headers = {"Range": "bytes=0-0", "Accept-Encoding": "identity", "Referer": origin + "/", "User-Agent": "NXLoad/1.0.3"}
+              with opener.open(urllib.request.Request(url, headers=headers), timeout=12) as response:
+                  tag = response.headers.get("ETag", "")
+                  print(f"File HTTP {response.status}")
+                  print("Content-Range:", response.headers.get("Content-Range", "absent"))
+                  print("Strong ETag:", len(tag) > 2 and tag[0] == tag[-1] == '"')
+                  if response.status == 206:
+                      print("One-byte body:", len(response.read(2)) == 1)
+          except urllib.error.HTTPError as error:
+              print(f"HTTP {error.code} from {urllib.parse.urlsplit(error.url).hostname}")
+          except (urllib.error.URLError, ValueError, TimeoutError) as error:
+              print(f"Probe unavailable: {type(error).__name__}")
+          PY

@@ -14,6 +14,7 @@ from title_db import description, fingerprint, load_catalog, selected_games, tex
 
 MAGIC = b"NXLTDB03"
 AI_REVISION = "nx-context-v1"
+LOCAL_REVISION = "nx-local-qwen3-v1"
 SCREENSHOT = re.compile(r"https://img-eshop\.cdn\.nintendo\.net/i/([a-f0-9]{64})\.jpg")
 
 
@@ -58,13 +59,17 @@ def release_date(value):
         return ""
 
 
-def build(database, manual, automatic, ai_translations=None):
+def build(database, manual, automatic, ai_translations=None, local_translations=None):
     ai_translations = ai_translations or {}
+    local_translations = local_translations or {}
     records = []
     translated = 0
     for key, title_id, name, item in selected_games(database):
         english = description(item)
         ukrainian = text(manual.get(title_id))
+        if not ukrainian and english:
+            local_key = title_id + ":" + fingerprint(english) + ":" + LOCAL_REVISION
+            ukrainian = clean_machine_description(local_translations.get(local_key), english)
         if not ukrainian and english:
             ai_key = title_id + ":" + fingerprint(english) + ":" + AI_REVISION
             ukrainian = clean_machine_description(ai_translations.get(ai_key), english)
@@ -111,7 +116,10 @@ def main():
     automatic = json.loads(gzip.decompress(saved.read_bytes())) if saved.is_file() else {}
     ai_saved = tools / "translations.ai.uk.json.gz"
     ai_translations = json.loads(gzip.decompress(ai_saved.read_bytes())) if ai_saved.is_file() else {}
-    index, count, translated = build(load_catalog(args.source), manual, automatic, ai_translations)
+    local_saved = tools / "translations.local.uk.json.gz"
+    local_translations = json.loads(gzip.decompress(local_saved.read_bytes())) if local_saved.is_file() else {}
+    index, count, translated = build(load_catalog(args.source), manual, automatic,
+                                     ai_translations, local_translations)
     if not count:
         raise ValueError("TitleDB snapshot contains no matching records")
     args.output.parent.mkdir(parents=True, exist_ok=True)

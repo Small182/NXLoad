@@ -1,33 +1,19 @@
-name: Build NXLoad
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
+name: Check Ukrainian metadata and screenshots
+on: [pull_request]
 permissions:
   contents: read
-
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Build curl and Mbed TLS for Switch
-        run: bash tools/build-network.sh
-      - run: make -j2
-      - name: Check DLArchive TLS chain
-        continue-on-error: true
-        run: |
-          status=0
-          timeout 12s openssl s_client -connect direct-stor.berkasdrive.com:443 \
-            -servername direct-stor.berkasdrive.com -tls1_2 -verify_hostname direct-stor.berkasdrive.com \
-            -verify_return_error -CAfile romfs/cacert.pem -no-CApath -no-CAstore \
-            < /dev/null > /tmp/nxload-tls-chain.txt 2>&1 || status=$?
-          sed -n '/^depth=/p; /verify error/p; /Verify return code:/p' /tmp/nxload-tls-chain.txt
-          exit "$status"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NXLoad
-          path: NXLoad.nro
-          if-no-files-found: error
+      - run: |
+          for file in UA.uk.json UA.en.json UA.ru.json US.uk.json; do curl -LsS -o /dev/null -w "$file: %{http_code}\n" "https://raw.githubusercontent.com/blawar/titledb/d424690446eec6f4484209b9a1c067c7f7511398/$file"; done
+          curl -fLsS 'https://raw.githubusercontent.com/blawar/titledb/d424690446eec6f4484209b9a1c067c7f7511398/US.en.json' -o /tmp/title.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/title.json'))
+          for key in ('70010000000141', '70010000084815', '70010000068159'):
+              r = d[key]
+              print(r['name'], repr(r.get('screenshots'))[:1200])
+          print('Games with screenshots:', sum(bool(r.get('screenshots')) if isinstance(r,dict) else False for r in d.values()))
+          PY

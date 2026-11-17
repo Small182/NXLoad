@@ -85,8 +85,8 @@ def build(database, manual, automatic, ai_translations=None):
             field_bytes(name, 192),
             field_bytes(text(item.get("publisher")), 192),
             field_bytes(release_date(item.get("releaseDate")), 16),
-            field_bytes(summary, 3072),
-            field_bytes(english if ukrainian and english != ukrainian else "", 3072),
+            field_bytes(summary, 6144),
+            field_bytes(english if ukrainian and english != ukrainian else "", 6144),
             "".join(hashes).encode("ascii"),
         ]
         body = zlib.compress(b"\0".join(fields) + b"\0")

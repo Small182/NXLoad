@@ -22,7 +22,7 @@ jobs:
           ref: ${{ inputs.revision || github.sha }}
       - name: Ensure libarchive for Switch
         run: |
-          if aarch64-none-elf-pkg-config --exists libarchive; then
+          if "${DEVKITPRO}/portlibs/switch/bin/aarch64-none-elf-pkg-config" --static --exists libarchive; then
             echo "switch-libarchive is already installed"
           else
             for attempt in 1 2 3; do

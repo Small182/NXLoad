@@ -7,7 +7,6 @@
 
 #define FICHIER_INPUT_CAPACITY 256
 #define DLARCHIVE_ID_CAPACITY 64
-#define DOWNLOAD_DIR "sdmc:/switch/SwitchDownloadProbe"
 #define MEGAUP_FILE_HOST "e13.megaupdownup.org"
 #define BUNNY_NSWGF_URL "https://nswgf.com/a-pretty-odd-bunny-nintendo-switch-nsp-xci-nsz-download-free/"
 

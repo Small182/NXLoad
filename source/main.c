@@ -17,6 +17,7 @@
 
 #include "catalog.h"
 #include "game_info.h"
+#include "storage.h"
 #include "unpack.h"
 
 #define ROWS 9
@@ -157,13 +158,13 @@ static void index_worker(void *arg) { catalog_build_index(arg); }
 static void download_worker(void *arg) {
     FichierJob *job = arg;
     if (job->local_unpack) {
-        job->result = unpack_rar(job, job->url, DOWNLOAD_DIR);
+        job->result = unpack_rar(job, job->url, NXLOAD_DOWNLOAD_DIR);
         return;
     }
     fichier_download(job);
     if (!atomic_load(&job->cancelled) && !strcmp(job->result, "Download saved") &&
         (rar_name(job->path) || rar_signature(job->path)))
-        job->result = unpack_rar(job, job->path, DOWNLOAD_DIR);
+        job->result = unpack_rar(job, job->path, NXLOAD_DOWNLOAD_DIR);
 }
 
 static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
@@ -405,13 +406,13 @@ static int file_compare(const void *a, const void *b) {
 static bool saved_rar(const char *name) {
     if (rar_name(name)) return true;
     char path[320];
-    int bytes = snprintf(path, sizeof(path), DOWNLOAD_DIR "/%s", name);
+    int bytes = snprintf(path, sizeof(path), NXLOAD_DOWNLOAD_DIR "/%s", name);
     return bytes > 0 && (size_t)bytes < sizeof(path) && rar_signature(path);
 }
 
 static void refresh_saved(void) {
     app.saved_count = 0;
-    DIR *dir = opendir(DOWNLOAD_DIR);
+    DIR *dir = opendir(NXLOAD_DOWNLOAD_DIR);
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir)) && app.saved_count < HISTORY_LIMIT) {
@@ -612,7 +613,7 @@ static void start_unpack(const char *file) {
     FichierJob *job = new_transfer(file);
     if (!job) return;
     job->local_unpack = true;
-    snprintf(app.transfer_url, sizeof(app.transfer_url), DOWNLOAD_DIR "/%s", file);
+    snprintf(app.transfer_url, sizeof(app.transfer_url), NXLOAD_DOWNLOAD_DIR "/%s", file);
     job->url = app.transfer_url;
     launch_transfer();
 }
@@ -1043,7 +1044,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.17", 206, 44, 120, gray);
+    text(app.small, "1.0.18", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування триває" : "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();
@@ -1065,7 +1066,7 @@ static void draw(void) {
         rect(190, 200, 900, 305, selected);
         text(app.large, "Відкрити встановлювач DBI?", 224, 230, 828, white);
         text(app.normal, app.saved[app.saved_index].file, 224, 298, 828, white);
-        text(app.small, "У DBI відкрий Browse SD Card → switch → SwitchDownloadProbe", 224, 355, 828, gray);
+        text(app.small, "У DBI відкрий Browse SD Card → " NXLOAD_DOWNLOAD_RELATIVE, 224, 355, 828, gray);
         text(app.normal, "A  Відкрити DBI     B  Назад", 224, 428, 828, blue);
     }
     SDL_RenderPresent(app.renderer);

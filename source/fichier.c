@@ -1,12 +1,12 @@
 #define _GNU_SOURCE
 #include "fichier.h"
 #include "range.h"
+#include "storage.h"
 #include "unpack.h"
 
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
 #include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,11 +31,6 @@
 
 
 typedef enum { HOST_FICHIER, HOST_MEGAUP, HOST_DLARCHIVE, HOST_ROMSHQ, HOST_DATANODES } DownloadHost;
-#ifdef __SWITCH__
-#define OUTPUT_DIR DOWNLOAD_DIR
-#else
-#define OUTPUT_DIR "./SwitchDownloadProbe"
-#endif
 
 typedef struct {
     FichierJob *job;
@@ -243,8 +238,8 @@ static bool open_partial(Transfer *t, bool buffered) {
         fallback = t->fallback_name[0] ? t->fallback_name : generic;
     }
     const char *name = t->name[0] ? t->name : fallback;
-    snprintf(t->job->path, sizeof(t->job->path), "%s/%s", OUTPUT_DIR, name);
-    snprintf(t->partial, sizeof(t->partial), "%s/%s.part", OUTPUT_DIR, name);
+    snprintf(t->job->path, sizeof(t->job->path), "%s/%s", NXLOAD_DOWNLOAD_DIR, name);
+    snprintf(t->partial, sizeof(t->partial), "%s/%s.part", NXLOAD_DOWNLOAD_DIR, name);
     struct stat info;
     if (!stat(t->job->path, &info)) {
         t->error = "Destination file already exists";
@@ -253,7 +248,7 @@ static bool open_partial(Transfer *t, bool buffered) {
     int fd;
 #ifdef __SWITCH__
     struct statvfs storage;
-    if (t->expected && !statvfs(OUTPUT_DIR, &storage) &&
+    if (t->expected && !statvfs(NXLOAD_DOWNLOAD_DIR, &storage) &&
         t->expected > (uint64_t)storage.f_bavail * storage.f_frsize) {
         t->error = "Not enough free space on SD";
         return false;
@@ -818,7 +813,7 @@ static unsigned wait_seconds(const char *html) {
 
 void fichier_download(FichierJob *job) {
     job->result = "Download setup failed";
-    if (mkdir(OUTPUT_DIR, 0777) && errno != EEXIST) {
+    if (!nxload_ensure_storage()) {
         job->result = "Cannot create download directory on SD";
         return;
     }

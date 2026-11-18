@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "catalog.h"
+#include "storage.h"
 
 #include <ctype.h>
 #include <curl/curl.h>
@@ -25,11 +26,6 @@
 #define DRIVE_PREFIX "https://drive.dlarchive.my.id/dl/?id="
 #define PAGE_BYTES (4 * 1024 * 1024)
 #define COVER_BYTES (2 * 1024 * 1024)
-#ifdef __SWITCH__
-#define CACHE_DIR "sdmc:/switch/NXLoad"
-#else
-#define CACHE_DIR "./NXLoad-cache"
-#endif
 #define CACHE_MAGIC "NXLCAT02"
 
 typedef struct {
@@ -544,17 +540,17 @@ bool catalog_read_cache(CatalogIndex *index, CatalogSource source) {
     index->count = 0;
     index->saved_at = 0;
     if (source == CATALOG_ROMSHQ)
-        return read_cache_path(CACHE_DIR "/romshq.bin", index, source) ||
-               read_cache_path(CACHE_DIR "/romshq.prev", index, source);
-    return read_cache_path(CACHE_DIR "/catalog.bin", index, source) ||
-           read_cache_path(CACHE_DIR "/catalog.prev", index, source);
+        return read_cache_path(NXLOAD_DOWNLOAD_DIR "/romshq.bin", index, source) ||
+               read_cache_path(NXLOAD_DOWNLOAD_DIR "/romshq.prev", index, source);
+    return read_cache_path(NXLOAD_DOWNLOAD_DIR "/catalog.bin", index, source) ||
+           read_cache_path(NXLOAD_DOWNLOAD_DIR "/catalog.prev", index, source);
 }
 
 static bool save_cache(const CatalogIndex *index, CatalogSource source) {
-    const char *dest = source == CATALOG_ROMSHQ ? CACHE_DIR "/romshq.bin" : CACHE_DIR "/catalog.bin";
-    const char *temp = source == CATALOG_ROMSHQ ? CACHE_DIR "/romshq.tmp" : CACHE_DIR "/catalog.tmp";
-    const char *backup = source == CATALOG_ROMSHQ ? CACHE_DIR "/romshq.prev" : CACHE_DIR "/catalog.prev";
-    if (mkdir(CACHE_DIR, 0777) && errno != EEXIST) return false;
+    const char *dest = source == CATALOG_ROMSHQ ? NXLOAD_DOWNLOAD_DIR "/romshq.bin" : NXLOAD_DOWNLOAD_DIR "/catalog.bin";
+    const char *temp = source == CATALOG_ROMSHQ ? NXLOAD_DOWNLOAD_DIR "/romshq.tmp" : NXLOAD_DOWNLOAD_DIR "/catalog.tmp";
+    const char *backup = source == CATALOG_ROMSHQ ? NXLOAD_DOWNLOAD_DIR "/romshq.prev" : NXLOAD_DOWNLOAD_DIR "/catalog.prev";
+    if (!nxload_ensure_storage()) return false;
     FILE *file = fopen(temp, "wb");
     if (!file) return false;
     const uint32_t count = (uint32_t)index->count;

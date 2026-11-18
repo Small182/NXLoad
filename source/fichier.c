@@ -297,7 +297,8 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
     if (!range_probe(&source, job, &info)) {
         if (info.status != 429) return false;
         job->http = info.status;
-        job->result = "DLArchive обмежив кількість запитів";
+        job->result = job->dlarchive ? "DLArchive обмежив кількість запитів" :
+                                        "Файловий сервер обмежив кількість запитів";
         return true;
     }
     t->expected = info.length;
@@ -325,7 +326,8 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
         return true;
     }
     if (result == RANGE_RATE_LIMIT) {
-        job->result = "DLArchive обмежив кількість запитів";
+        job->result = job->dlarchive ? "DLArchive обмежив кількість запитів" :
+                                        "Файловий сервер обмежив кількість запитів";
         return true;
     }
     atomic_store(&job->received, 0);
@@ -907,11 +909,18 @@ void fichier_download(FichierJob *job) {
         goto done;
     }
     t.allow_file = true;
-    if (job->dlarchive) curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, (long)FILE_RECEIVE_BUFFER);
+    if (job->dlarchive || job->romshq || job->datanodes)
+        curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, (long)FILE_RECEIVE_BUFFER);
     char initial_url[URL_CAPACITY];
     strcpy(initial_url, url);
 
+    bool probe_file_host = false;
     for (unsigned hop = 0; hop < 10 && !atomic_load(&job->cancelled); ++hop) {
+        if (probe_file_host) {
+            probe_file_host = false;
+            t.name[0] = 0;
+            if (parallel_download(&t, url, referrer) || atomic_load(&job->cancelled)) goto done;
+        }
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_REFERER, referrer[0] ? referrer : NULL);
         if (posting) {
@@ -995,6 +1004,10 @@ void fichier_download(FichierJob *job) {
                 strcmp(next, url)) {
                 // Do not leak an expiring signed URL in the Referer header.
                 redirect_referer(url, referrer);
+                const char *from_card = "https://romshq.com/";
+                const char *www_card = "https://www.romshq.com/";
+                probe_file_host = strncmp(next, from_card, strlen(from_card)) &&
+                                  strncmp(next, www_card, strlen(www_card));
                 strcpy(url, next);
                 job->result = "Забагато перенаправлень до файлу";
                 snprintf(job->tls_detail, sizeof(job->tls_detail),

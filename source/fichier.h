@@ -13,6 +13,7 @@
 typedef struct {
     atomic_bool cancelled;
     atomic_bool unpacking;
+    atomic_bool installing;
     atomic_uint_fast64_t received;
     atomic_uint_fast64_t total;
     atomic_uint streams;
@@ -22,6 +23,7 @@ typedef struct {
     long api_http;
     uint64_t avg_speed;
     char tls_detail[128];
+    char install_error[192];
     char path[256];
     const char *url;
     bool megaup;
@@ -29,6 +31,9 @@ typedef struct {
     bool datanodes;
     bool romshq;
     bool local_unpack;
+    bool local_install;
+    bool install_after_download;
+    bool app_update, update_staged;
     const char *dlarchive_id;
     const char *romshq_id;
 } FichierJob;

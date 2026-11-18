@@ -16,7 +16,6 @@
 #include <switch.h>
 #endif
 
-#define PACKAGE_LIMIT 24
 #define OUTPUT_PATH 320
 
 typedef struct {
@@ -113,13 +112,14 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
     return error;
 }
 
-const char *unpack_rar(FichierJob *job, const char *path, const char *directory) {
+const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
+                       UnpackedPackages *packages) {
     atomic_store(&job->unpacking, true);
     atomic_store(&job->received, 0);
     atomic_store(&job->total, 0);
     atomic_store(&job->streams, 0);
     struct archive *reader = archive_read_new();
-    ExtractedFile *outputs = calloc(PACKAGE_LIMIT, sizeof(*outputs));
+    ExtractedFile *outputs = calloc(RAR_PACKAGE_LIMIT, sizeof(*outputs));
     unsigned char *buffer = malloc(256 * 1024);
     const char *error = "Не вдалося підготувати розархіватор";
     size_t count = 0;
@@ -148,7 +148,7 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory)
             error = "Пакет у RAR захищений паролем";
             break;
         }
-        if (count >= PACKAGE_LIMIT) {
+        if (count >= RAR_PACKAGE_LIMIT) {
             error = "Забагато пакетів в одному RAR";
             break;
         }
@@ -200,6 +200,11 @@ done:
         } else if (output->temporary[0]) {
             unlink(output->temporary);
         }
+    }
+    if (packages && !error) {
+        packages->count = count;
+        for (size_t i = 0; i < count; ++i)
+            strcpy(packages->paths[i], outputs[i].destination);
     }
     free(outputs);
     free(buffer);

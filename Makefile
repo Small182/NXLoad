@@ -8,10 +8,11 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := NXLoad
 APP_TITLE := NXLoad
 APP_AUTHOR := Small182
-APP_VERSION := 1.0.25
+APP_VERSION := 1.0.26
 NXLOAD_BUILD_SHA ?= $(shell git -C "$(TOPDIR)" rev-parse HEAD 2>/dev/null || printf '%s' "$${GITHUB_SHA:-unknown}")
+NXLOAD_BUILD_RUN ?= $(if $(filter push,$(GITHUB_EVENT_NAME)),$(GITHUB_RUN_NUMBER))
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
-CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB -DNXLOAD_VERSION=\"$(APP_VERSION)\" -DNXLOAD_BUILD_SHA=\"$(NXLOAD_BUILD_SHA)\"
+CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB -DNXLOAD_VERSION=\"$(APP_VERSION)\" -DNXLOAD_BUILD_SHA=\"$(NXLOAD_BUILD_SHA)\" -DNXLOAD_BUILD_RUN=\"$(NXLOAD_BUILD_RUN)\"
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)
 PKG_CONFIG := $(PORTLIBS)/bin/aarch64-none-elf-pkg-config
 PORT_PACKAGES := sdl2 SDL2_ttf SDL2_image libxml-2.0 libarchive

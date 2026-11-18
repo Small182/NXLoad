@@ -97,6 +97,7 @@ typedef struct {
     char name[CATALOG_TEXT], url[2048], id[DLARCHIVE_ID_CAPACITY];
     GameFileSource source;
     bool unpack, install_local, install_after_download, app_update;
+    UpdateBuild update;
 } DownloadRequest;
 
 typedef struct {
@@ -162,7 +163,9 @@ typedef struct {
     bool catalog_busy[2];
     size_t download_choice;
     char update_target[256];
-    bool update_ready;
+    bool update_ready, update_checking, update_offered;
+    UpdateCheck update_check;
+    Thread update_thread;
     char query[96], notice[192], delete_file[sizeof(((SavedFile *)0)->file)];
     DownloadRequest active_transfer, draft_transfer, queue[DOWNLOAD_QUEUE_LIMIT];
     size_t queue_count, queue_index;
@@ -385,13 +388,14 @@ static size_t move(size_t current, size_t count, u64 buttons) {
 static void catalog_worker(void *arg) { catalog_request(arg); }
 static void gallery_worker(void *arg) { load_game_gallery(arg); }
 static void index_worker(void *arg) { catalog_build_index(arg); }
+static void update_check_worker(void *arg) { check_update(arg); }
 static void download_worker(void *arg) {
     FichierJob *job = arg;
     const char *path = job->url;
     if (job->app_update) {
-        const char *error = stage_update(job, path);
+        const char *error = stage_update(job, path, &app.active_transfer.update);
         job->update_staged = error == NULL;
-        job->result = error ? error : "Оновлення готове. Натисни +, щоб вийти й застосувати.";
+        job->result = error ? error : "Оновлення готове. Натисни +, щоб застосувати.";
         return;
     }
     if (!job->local_unpack && !job->local_install) {
@@ -1053,6 +1057,15 @@ static unsigned transfer_stage(void) {
 }
 
 static void finish_jobs(void) {
+    if (app.update_checking && R_SUCCEEDED(waitSingle(waiterForThread(&app.update_thread), 0))) {
+        threadWaitForExit(&app.update_thread);
+        threadClose(&app.update_thread);
+        app.update_checking = false;
+        app.update_offered = app.update_check.build.id[0] != 0;
+        snprintf(app.update_notice, sizeof(app.update_notice), "%s",
+                 app.update_check.error ? app.update_check.error : app.update_offered ?
+                 "Доступне оновлення NXLoad" : "Вже встановлено актуальну збірку NXLoad");
+    }
     for (unsigned source = 0; source < 2; ++source) {
         Thread *thread = &app.catalog_thread[source];
         if (!app.catalog_busy[source] || R_FAILED(waitSingle(waiterForThread(thread), 0))) continue;
@@ -1088,7 +1101,10 @@ static void finish_jobs(void) {
         threadClose(&app.download_thread);
         app.download_busy = false;
         app.download_finished = true;
-        if (app.download.update_staged) app.update_ready = true;
+        if (app.download.update_staged) {
+            app.update_ready = true;
+            if (!app.queue_count && envHasNextLoad()) app.close = true;
+        }
         if (app.active_transfer.app_update)
             snprintf(app.update_notice, sizeof(app.update_notice), "%s", app.download.result);
         refresh_saved();
@@ -1153,6 +1169,7 @@ static void launch_next_transfer(void) {
     app.download_busy = start_worker(&app.download_thread, download_worker, job);
     if (!app.download_busy) {
         job->result = "Не вдалося запустити операцію";
+        if (request->app_update) strcpy(app.update_notice, job->result);
         app.download_finished = true;
     }
 }
@@ -1216,21 +1233,52 @@ static bool keyboard(char *out, size_t capacity, const char *title, const char *
     return true;
 }
 
-static void start_update(void) {
-    if (app.update_ready) return;
+static void open_downloads(void);
+
+static void start_update_check(bool manual) {
+    if (app.update_ready || app.update_checking || app.update_offered ||
+        (app.download_busy && app.active_transfer.app_update)) return;
+    for (size_t i = 0; i < app.queue_count; ++i)
+        if (app.queue[i].app_update) return;
     if (!app.update_target[0] || access(app.update_target, R_OK)) {
-        strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
+        if (manual) strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
         return;
     }
     if (!update_configured()) {
-        strcpy(app.update_notice, "Додай токен GitHub у switch/nxload/github-token.txt");
+        if (manual) strcpy(app.update_notice, "Додай токен GitHub у switch/nxload/github-token.txt");
         return;
     }
-    DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true};
+    atomic_init(&app.update_check.cancelled, false);
+    app.update_checking = start_worker(&app.update_thread, update_check_worker, &app.update_check);
+    strcpy(app.update_notice, app.update_checking ? "Перевірка оновлення NXLoad…" :
+           "Не вдалося запустити перевірку оновлення");
+}
+
+static bool update_dialog_visible(void) {
+    return app.update_offered && !app.fullscreen_shot && !app.choose_download &&
+           !app.confirm_install && !app.delete_file[0] && !app.filters_open;
+}
+
+static void respond_to_update(bool install) {
+    app.update_offered = false;
+    if (!install) {
+        app.update_notice[0] = 0;
+        return;
+    }
+    if (app.queue_count == DOWNLOAD_QUEUE_LIMIT) {
+        strcpy(app.update_notice, "Черга заповнена. Перевір оновлення пізніше.");
+        return;
+    }
+    DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true,
+                               .update = app.update_check.build};
     strcpy(request.url, app.update_target);
     const char *message = enqueue_transfer(&request);
-    snprintf(app.update_notice, sizeof(app.update_notice), "%s",
-             *message ? message : "Перевірка нової збірки…");
+    if (app.download_busy) {
+        app.settings_open = false;
+        open_downloads();
+        snprintf(app.update_notice, sizeof(app.update_notice), "%s",
+                 *message ? message : "Завантаження оновлення NXLoad…");
+    }
 }
 
 static void pump_daily_checks(uint64_t ticks) {
@@ -1411,7 +1459,7 @@ static void change_setting(size_t row, bool activate) {
             }
             return;
         case SETTINGS_UPDATE:
-            if (activate) start_update();
+            if (activate) start_update_check(true);
             return;
         default: return;
     }
@@ -1540,6 +1588,10 @@ static void touch_tap(int x, int y) {
         else if (x > 1040) step_screenshot(true);
         return;
     }
+    if (update_dialog_visible()) {
+        if (x >= 224 && x < 1050 && y >= 418 && y < 488) respond_to_update(x < 640);
+        return;
+    }
     if (app.choose_download) {
         if (x >= 225 && x < 1055 && ((y >= 324 && y < 366) || (y >= 384 && y < 426))) {
             app.download_choice = y >= 384;
@@ -1657,7 +1709,7 @@ static void touch_tap(int x, int y) {
 typedef enum { DRAG_NONE, DRAG_GRID, DRAG_DESCRIPTION, DRAG_FILES, DRAG_SAVED, DRAG_QUEUE, DRAG_SETTINGS } DragArea;
 
 static DragArea drag_area(int x, int y) {
-    if (app.fullscreen_shot) return DRAG_NONE;
+    if (app.fullscreen_shot || update_dialog_visible()) return DRAG_NONE;
     if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download) return DRAG_NONE;
     if (app.settings_open)
         return x >= 180 && x < 1100 && y >= SETTINGS_Y &&
@@ -1749,6 +1801,12 @@ static bool poll_touch(bool controller_input) {
 
 static void input(u64 buttons) {
     if (!buttons) return;
+    if (update_dialog_visible()) {
+        if (buttons & HidNpadButton_A) respond_to_update(true);
+        else if (buttons & HidNpadButton_B) respond_to_update(false);
+        else if (buttons & HidNpadButton_Plus) app.close = true;
+        return;
+    }
     if (app.fullscreen_shot) {
         if (buttons & HidNpadButton_B) app.fullscreen_shot = false;
         else if (buttons & (left_buttons | HidNpadButton_L)) step_screenshot(false);
@@ -2259,7 +2317,8 @@ static void draw_game(void) {
 static void draw_downloads(void) {
     rect(40, 106, 1200, 530, panel);
     unsigned stage = app.download_busy ? transfer_stage() : 0;
-    text(app.large, stage == 2 ? "Встановлення" : stage == 1 ? "Розпакування" :
+    text(app.large, app.active_transfer.app_update && (app.download_busy || app.download_finished) ?
+         "Оновлення NXLoad" : stage == 2 ? "Встановлення" : stage == 1 ? "Розпакування" :
          "Завантаження", 66, 128, 1100, white);
     if (app.download_busy || app.download_finished) {
         uint64_t have = atomic_load(&app.download.received), total = atomic_load(&app.download.total);
@@ -2281,7 +2340,7 @@ static void draw_downloads(void) {
         } else if (app.download_busy && have) {
             snprintf(line, sizeof(line), "%.1f МіБ  ·  %.1f МіБ/с", have / 1048576.0, app.speed / 1048576.0);
         } else if (app.download_busy) {
-            strcpy(line, app.active_transfer.app_update ? "Перевірка збірки GitHub Actions…" : "Запит адреси файлу…");
+            strcpy(line, app.active_transfer.app_update ? "Отримання файлу оновлення…" : "Запит адреси файлу…");
         } else if (!strcmp(app.download.result, "Download saved")) {
             snprintf(line, sizeof(line), "Збережено · %.1f МіБ · середня %.1f МіБ/с",
                      have / 1048576.0, app.download.avg_speed / 1048576.0);
@@ -2330,6 +2389,18 @@ static void draw_downloads(void) {
     text(app.small, notice, 66, 608, 1148, gray);
 }
 
+static void draw_update_dialog(void) {
+    char line[112];
+    snprintf(line, sizeof(line), "Збірка %" PRIu64 " · %.8s",
+             app.update_check.build.run, app.update_check.build.sha);
+    rect(190, 200, 900, 305, selected);
+    text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
+    text(app.normal, line, 224, 298, 828, gray);
+    text(app.small, "Оновлення застосовується після завершення роботи NXLoad.", 224, 354, 828, gray);
+    text(app.normal, "A  Встановити", 224, 428, 396, blue);
+    text(app.normal, "B  Пізніше", 656, 428, 390, gray);
+}
+
 static void draw(void) {
     if (app.fullscreen_shot) {
         rect(0, 0, 1280, 720, (SDL_Color){0, 0, 0, 255});
@@ -2343,6 +2414,7 @@ static void draw(void) {
     draw_header();
     if (app.settings_open) {
         draw_settings();
+        if (update_dialog_visible()) draw_update_dialog();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -2363,6 +2435,7 @@ static void draw(void) {
         text(app.small, app.dimmed ? "−  Освітлити екран" : "−  Приглушити екран", 1060, 665, 180, gray);
     }
     if (app.filters_open) draw_filters();
+    if (update_dialog_visible()) draw_update_dialog();
     if (app.choose_download) {
         rect(190, 200, 900, 305, panel);
         text(app.large, "Дія з файлом", 224, 230, 828, white);
@@ -2407,8 +2480,9 @@ int main(int argc, char **argv) {
         !strncmp(self, "sdmc:/", 6) && !strstr(self, "/../") &&
         !strcasecmp(self + self_len - 4, ".nro"))
         strcpy(app.update_target, self);
-    else
-        strcpy(app.update_target, NXLOAD_APP_DIR "/NXLoad.nro");
+    else if (self_len < sizeof(app.update_target) - 5 && self_len >= 5 && self[0] == '/' &&
+             !strstr(self, "/../") && !strcasecmp(self + self_len - 4, ".nro"))
+        snprintf(app.update_target, sizeof(app.update_target), "sdmc:%s", self);
     nx_tls_threading_init();
     bool romfs_ready = R_SUCCEEDED(romfsInit());
     Result entropy = csrngInitialize();
@@ -2445,6 +2519,7 @@ int main(int argc, char **argv) {
         load_favorites();
         load_catalog_metadata();
         open_catalogs();
+        start_update_check(false);
         uint64_t next_frame = 0, next_scroll = 0;
         u64 held = 0;
         while (appletMainLoop() && !app.close) {
@@ -2452,6 +2527,7 @@ int main(int argc, char **argv) {
             while (SDL_PollEvent(&event)) {}
             padUpdate(&pad);
             finish_jobs();
+            if (app.close) break;
             u64 buttons = padGetButtonsDown(&pad);
             u64 vertical = padGetButtons(&pad) & (up_buttons | down_buttons);
             uint64_t now = SDL_GetTicks64();
@@ -2487,6 +2563,7 @@ int main(int argc, char **argv) {
         }
         consoleExit(NULL);
     }
+    if (app.update_checking) atomic_store(&app.update_check.cancelled, true);
     if (app.index_busy) atomic_store(&app.index_job.cancel, true);
     if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
     for (unsigned source = 0; source < 2; ++source)
@@ -2507,6 +2584,10 @@ int main(int argc, char **argv) {
         CoverJob *job = &app.cover_jobs[i];
         if (job->busy) finish_cover(job);
         if (job->connection) curl_easy_cleanup(job->connection);
+    }
+    if (app.update_checking) {
+        threadWaitForExit(&app.update_thread);
+        threadClose(&app.update_thread);
     }
     if (app.index_busy) {
         threadWaitForExit(&app.index_thread);

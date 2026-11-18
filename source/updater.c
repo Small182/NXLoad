@@ -17,13 +17,20 @@
 #define NXLOAD_BUILD_SHA "unknown"
 #endif
 
+#ifndef NXLOAD_BUILD_RUN
+#define NXLOAD_BUILD_RUN ""
+#endif
+
+#define UPDATE_BRANCH "native-1fichier"
+#define BUILD_WORKFLOW ".github/workflows/build.yml"
 #define ACTIONS "https://api.github.com/repos/Small182/NXLoad/actions/"
 #define TOKEN_PATH NXLOAD_APP_DIR "/github-token.txt"
-#define JSON_LIMIT (256 * 1024)
+#define JSON_LIMIT (512 * 1024)
 #define ZIP_LIMIT (96 * UINT64_C(1024) * 1024)
 
 typedef struct {
     FichierJob *job;
+    atomic_bool *cancelled;
     FILE *out;
     char *json;
     size_t size;
@@ -149,13 +156,22 @@ static int progress(void *arg, curl_off_t total, curl_off_t current,
     (void)uploaded;
     Response *r = arg;
     if (r->out && total > 0) atomic_store(&r->job->total, (uint64_t)total);
-    return atomic_load(&r->job->cancelled);
+    return atomic_load(r->cancelled);
 }
 
 static bool request(const char *url, const char *token, Response *r, long *status) {
     CURL *curl = curl_easy_init();
     if (!curl) return false;
     struct curl_slist *headers = curl_slist_append(NULL, "Accept: application/vnd.github+json");
+    if (headers && !r->out) {
+        struct curl_slist *fresh = curl_slist_append(headers, "Cache-Control: no-cache");
+        if (!fresh) {
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            return false;
+        }
+        headers = fresh;
+    }
     char bearer[560];
     int n = snprintf(bearer, sizeof(bearer), "Authorization: Bearer %s", token);
     struct curl_slist *with_token = n > 0 && (size_t)n < sizeof(bearer) && headers ?
@@ -260,58 +276,125 @@ static const char *http_error(long status) {
     return "Не вдалося зв’язатися з GitHub Actions";
 }
 
-const char *stage_update(FichierJob *job, const char *target) {
-    char token[512], stage[320], zip[] = NXLOAD_APP_DIR "/.update-XXXXXX";
-    if (!read_token(token)) return "Додай токен GitHub у switch/nxload/github-token.txt";
-    if (snprintf(stage, sizeof(stage), "%s.new", target) >= (int)sizeof(stage))
-        return "Шлях до NXLoad.nro задовгий";
+static uint64_t build_number(Json run) {
+    Json value = field(run, "run_number");
+    if (!value.begin || value.end - value.begin > 18 ||
+        strspn(value.begin, "0123456789") != (size_t)(value.end - value.begin)) return 0;
+    return strtoull(value.begin, NULL, 10);
+}
 
-    Response r = {.job = job, .json = malloc(JSON_LIMIT + 1)};
-    if (!r.json) return "Бракує пам’яті для оновлення";
-    const char *update_error = "GitHub не повернув артефакт NXLoad з успішної збірки";
-    long status = 0;
-    char url[256], build[24], sha[41], id[24], digest[72];
-    bool zip_created = false;
-    if (!request(ACTIONS "workflows/build.yml/runs?branch=native-1fichier&event=push&status=success&per_page=1",
-                 token, &r, &status)) {
-        update_error = http_error(status);
-        goto done;
-    }
+static bool read_run(Json run, UpdateBuild *build, char id[24]) {
+    build->run = build_number(run);
+    return build->run && literal(field(run, "event"), "\"push\"") &&
+           literal(field(run, "head_branch"), "\"" UPDATE_BRANCH "\"") &&
+           literal(field(run, "path"), "\"" BUILD_WORKFLOW "\"") &&
+           literal(field(run, "conclusion"), "\"success\"") &&
+           id_field(run, id) && string_field(run, "head_sha", build->sha, sizeof(build->sha)) &&
+           strlen(build->sha) == 40 && strspn(build->sha, "0123456789abcdef") == 40;
+}
+
+static bool newest_run(Response *r, UpdateBuild *latest, char run_id[24]) {
+    Json body = {r->json, r->json + r->size};
+    Json runs = field(body, "workflow_runs");
     const char *cursor = NULL;
-    Json body = {r.json, r.json + r.size};
-    Json run = next_object(field(body, "workflow_runs"), &cursor);
-    if (!id_field(run, build) || !string_field(run, "head_sha", sha, sizeof(sha)) ||
-        strlen(sha) != 40 || strspn(sha, "0123456789abcdef") != 40) goto done;
-    if (!strcmp(sha, NXLOAD_BUILD_SHA)) {
-        update_error = "Вже встановлено останню успішну збірку NXLoad";
-        goto done;
-    }
-
-    snprintf(url, sizeof(url), ACTIONS "runs/%s/artifacts?per_page=30", build);
-    if (!request(url, token, &r, &status)) { update_error = http_error(status); goto done; }
-    cursor = NULL;
-    body = (Json){r.json, r.json + r.size};
-    Json artifacts = field(body, "artifacts");
-    bool found = false;
-    for (Json item = next_object(artifacts, &cursor); item.begin; item = next_object(artifacts, &cursor)) {
-        if (literal(field(item, "name"), "\"NXLoad\"") && literal(field(item, "expired"), "false")) {
-            found = id_field(item, id) && string_field(item, "digest", digest, sizeof(digest));
-            break;
+    for (Json run = next_object(runs, &cursor); run.begin; run = next_object(runs, &cursor)) {
+        UpdateBuild candidate = {0};
+        char id[24];
+        if (read_run(run, &candidate, id) && candidate.run > latest->run) {
+            *latest = candidate;
+            strcpy(run_id, id);
         }
     }
-    if (!found) goto done;
+    return latest->run != 0;
+}
 
+static bool read_artifact(Response *r, UpdateBuild *build) {
+    Json artifacts = field((Json){r->json, r->json + r->size}, "artifacts");
+    const char *cursor = NULL;
+    for (Json item = next_object(artifacts, &cursor); item.begin; item = next_object(artifacts, &cursor)) {
+        if (literal(field(item, "name"), "\"NXLoad\"") && literal(field(item, "expired"), "false") &&
+            id_field(item, build->id) && string_field(item, "digest", build->digest, sizeof(build->digest)) &&
+            strlen(build->digest) == 71 && !strncmp(build->digest, "sha256:", 7) &&
+            strspn(build->digest + 7, "0123456789abcdef") == 64) return true;
+    }
+    return false;
+}
+
+void check_update(UpdateCheck *check) {
+    static const char no_build[] = "GitHub ще не повернув файл останньої збірки NXLoad";
+    char token[512], run_id[24], url[320];
+    long status = 0;
+    UpdateBuild candidate = {0};
+    check->build = (UpdateBuild){0};
+    check->error = NULL;
+    if (!read_token(token)) {
+        check->error = "Додай токен GitHub у switch/nxload/github-token.txt";
+        return;
+    }
+    Response r = {.cancelled = &check->cancelled, .json = malloc(JSON_LIMIT + 1)};
+    if (!r.json) {
+        check->error = "Бракує пам’яті для перевірки оновлення";
+        return;
+    }
+    const char *runs = ACTIONS "runs?branch=" UPDATE_BRANCH "&event=push&status=success&per_page=10";
+    if (!request(runs, token, &r, &status)) {
+        check->error = http_error(status);
+        goto done;
+    }
+    if (!newest_run(&r, &candidate, run_id)) {
+        check->error = no_build;
+        goto done;
+    }
+    if (!strcmp(candidate.sha, NXLOAD_BUILD_SHA)) goto done;
+    uint64_t installed = strtoull(NXLOAD_BUILD_RUN, NULL, 10);
+    if (!installed) {
+        // A build without the CI run number can still identify itself by its commit.
+        if (strlen(NXLOAD_BUILD_SHA) == 40 && strspn(NXLOAD_BUILD_SHA, "0123456789abcdef") == 40) {
+            snprintf(url, sizeof(url), "%s&head_sha=%s", runs, NXLOAD_BUILD_SHA);
+            UpdateBuild current = {0};
+            char current_id[24];
+            if (request(url, token, &r, &status) && newest_run(&r, &current, current_id)
+                && !strcmp(current.sha, NXLOAD_BUILD_SHA)) installed = current.run;
+        }
+        if (!installed) {
+            check->error = "Номер цієї збірки невідомий. Встанови актуальний NXLoad.nro вручну.";
+            goto done;
+        }
+    }
+    if (candidate.run <= installed) goto done;
+    snprintf(url, sizeof(url), ACTIONS "runs/%s/artifacts?per_page=30", run_id);
+    if (!request(url, token, &r, &status)) check->error = http_error(status);
+    else if (!read_artifact(&r, &candidate)) check->error = no_build;
+    else check->build = candidate;
+
+done:
+    free(r.json);
+}
+
+const char *stage_update(FichierJob *job, const char *target, const UpdateBuild *build) {
+    char token[512], stage[320], zip[] = NXLOAD_APP_DIR "/.update-XXXXXX";
+    if (!read_token(token)) return "Додай токен GitHub у switch/nxload/github-token.txt";
+    if (!build->id[0]) return "Спочатку перевір наявність оновлення NXLoad";
+    if (snprintf(stage, sizeof(stage), "%s.new", target) >= (int)sizeof(stage))
+        return "Шлях до NXLoad.nro задовгий";
+    if (!nxload_ensure_storage()) return "Не вдалося підготувати каталог оновлення на microSD";
+
+    Response r = {.job = job, .cancelled = &job->cancelled};
+    const char *update_error;
+    long status = 0;
+    char url[256];
+    bool zip_created = false;
     int fd = mkstemp(zip);
     if (fd < 0) { update_error = "Не вдалося створити файл оновлення на microSD"; goto done; }
     zip_created = true;
     r.out = fdopen(fd, "wb");
     if (!r.out) { close(fd); update_error = "Не вдалося записати файл оновлення"; goto done; }
     sha256ContextCreate(&r.sha);
-    snprintf(url, sizeof(url), ACTIONS "artifacts/%s/zip", id);
+    snprintf(url, sizeof(url), ACTIONS "artifacts/%s/zip", build->id);
     bool received = request(url, token, &r, &status);
     bool saved = fclose(r.out) == 0;
     if (!received || !saved) { update_error = http_error(status); goto done; }
-    if (!zip_digest(&r, digest)) { update_error = "Контрольна сума збірки не збігається"; goto done; }
+    if (!zip_digest(&r, build->digest)) { update_error = "Контрольна сума збірки не збігається"; goto done; }
     if (!access(stage, F_OK) && unlink(stage)) {
         update_error = "Не вдалося прибрати попередній тимчасовий файл оновлення";
         goto done;
@@ -324,7 +407,6 @@ const char *stage_update(FichierJob *job, const char *target) {
 
 done:
     if (zip_created) unlink(zip);
-    free(r.json);
     if (atomic_load(&job->cancelled)) {
         if (!update_error) unlink(stage);
         return "Оновлення скасовано";

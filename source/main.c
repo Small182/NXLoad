@@ -26,13 +26,15 @@
 
 #define GRID_COLUMNS 6
 #define GRID_ROWS 2
-#define GRID_PAGE (GRID_COLUMNS * GRID_ROWS)
 #define GRID_X 40
 #define GRID_Y 159
 #define GRID_STEP_X 202
 #define GRID_STEP_Y 219
 #define GRID_WIDTH 190
 #define GRID_HEIGHT 190
+#define GRID_VIEW_TOP (GRID_Y - 6)
+#define GRID_VIEW_BOTTOM (GRID_Y + (GRID_ROWS - 1) * GRID_STEP_Y + GRID_HEIGHT + 6)
+#define GRID_DRAG_THRESHOLD 8
 #define FILE_ROWS 5
 #define HISTORY_LIMIT 96
 #define COVER_SLOTS 36
@@ -107,6 +109,7 @@ typedef struct {
     Screen screen, previous;
     size_t rows[MERGED_CAPACITY];
     size_t game_count, genre_count, game_index, file_index, saved_count, saved_index;
+    int grid_scroll;
     SortMode sort, draft_sort, genre_sort[GENRE_COUNT];
     bool filter_sort_changed;
     size_t genre, draft_genre, filter_row;
@@ -271,8 +274,33 @@ static size_t first_visible(size_t selected_index, size_t rows) {
     return selected_index < rows ? 0 : selected_index - rows + 1;
 }
 
+static int clamp_grid_scroll(int offset) {
+    int rows = (int)((app.game_count + GRID_COLUMNS - 1) / GRID_COLUMNS);
+    return SDL_clamp(offset, 0, SDL_max(0, rows - GRID_ROWS) * GRID_STEP_Y);
+}
+
 static size_t grid_first(void) {
-    return app.game_index / GRID_PAGE * GRID_PAGE;
+    return (size_t)(app.grid_scroll / GRID_STEP_Y) * GRID_COLUMNS;
+}
+
+static size_t grid_end(void) {
+    int bottom = app.grid_scroll + GRID_VIEW_BOTTOM - GRID_VIEW_TOP;
+    size_t rows = (size_t)(bottom + GRID_STEP_Y - 1) / GRID_STEP_Y;
+    return SDL_min(app.game_count, rows * GRID_COLUMNS);
+}
+
+static bool scroll_grid(int delta) {
+    int offset = clamp_grid_scroll(app.grid_scroll + delta);
+    if (offset == app.grid_scroll) return false;
+    app.grid_scroll = offset;
+    int first_row = (offset + GRID_STEP_Y / 2) / GRID_STEP_Y;
+    int selected_row = (int)(app.game_index / GRID_COLUMNS);
+    int row = SDL_clamp(selected_row, first_row, first_row + GRID_ROWS - 1);
+    size_t index = (size_t)row * GRID_COLUMNS + app.game_index % GRID_COLUMNS;
+    app.game_index = SDL_min(index, app.game_count - 1);
+    app.genre_focus = false;
+    app.top_focus = TOP_NONE;
+    return true;
 }
 
 static size_t move(size_t current, size_t count, u64 buttons) {
@@ -407,6 +435,8 @@ static int compare_rows(const void *left, const void *right) {
 
 static void rebuild_view(const char *keep) {
     size_t old_index = app.game_index;
+    int old_scroll = app.grid_scroll;
+    app.grid_scroll = 0;
     app.game_count = 0;
     app.genre_count = 0;
     app.game_index = 0;
@@ -419,15 +449,18 @@ static void rebuild_view(const char *keep) {
     }
     qsort(app.rows, app.game_count, sizeof(app.rows[0]), compare_rows);
     if (!keep || !app.game_count) return;
+    app.game_index = SDL_min(old_index, app.game_count - 1);
     for (size_t i = 0; i < app.game_count; ++i) {
         const CatalogEntry *entry = &app.entries[app.rows[i]];
-        for (unsigned source = 0; source < 2; ++source)
-            if (entry->games[source] && !strcmp(entry->games[source]->page, keep)) {
-                app.game_index = i;
-                return;
-            }
+        const Game *nsroms = entry->games[CATALOG_NSROMS];
+        const Game *romshq = entry->games[CATALOG_ROMSHQ];
+        if ((nsroms && !strcmp(nsroms->page, keep)) || (romshq && !strcmp(romshq->page, keep))) {
+            app.game_index = i;
+            break;
+        }
     }
-    app.game_index = SDL_min(old_index, app.game_count - 1);
+    int row_shift = (int)(app.game_index / GRID_COLUMNS) - (int)(old_index / GRID_COLUMNS);
+    app.grid_scroll = clamp_grid_scroll(old_scroll + row_shift * GRID_STEP_Y);
 }
 
 static void start_next_index(void) {
@@ -577,8 +610,7 @@ static bool cover_visible(const CoverJob *job) {
         return !job->screenshot && uses_cover(&app.active_game, app.active_metadata, job->url);
     }
     if (app.screen != LIBRARY || job->screenshot) return false;
-    size_t first = grid_first();
-    for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
+    for (size_t i = grid_first(), end = grid_end(); i < end; ++i) {
         const CatalogEntry *entry = &app.entries[app.rows[i]];
         if (uses_cover(entry_game(entry), entry->metadata, job->url)) return true;
     }
@@ -629,8 +661,7 @@ static const char *next_cover(bool *screenshot) {
     const CatalogEntry *selected_entry = &app.entries[app.rows[app.game_index]];
     const char *url = missing_cover(entry_game(selected_entry), selected_entry->metadata);
     if (url) return url;
-    size_t first = grid_first();
-    for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
+    for (size_t i = grid_first(), end = grid_end(); i < end; ++i) {
         const CatalogEntry *entry = &app.entries[app.rows[i]];
         url = missing_cover(entry_game(entry), entry->metadata);
         if (url) return url;
@@ -1183,7 +1214,12 @@ static void move_in_library(u64 buttons) {
     else if ((buttons & left_buttons) && index % GRID_COLUMNS) --index;
     else if ((buttons & right_buttons) && index % GRID_COLUMNS < GRID_COLUMNS - 1 &&
              index + 1 < app.game_count) ++index;
-    app.game_index = index;
+    if (index != app.game_index) {
+        app.game_index = index;
+        int row_y = (int)(index / GRID_COLUMNS) * GRID_STEP_Y;
+        app.grid_scroll = clamp_grid_scroll(SDL_clamp(app.grid_scroll,
+            row_y - (GRID_ROWS - 1) * GRID_STEP_Y, row_y));
+    }
 }
 
 static void input(u64 buttons);
@@ -1195,12 +1231,6 @@ static void touch_swipe(int x, int y, int dx, int dy) {
     if (app.screen == LIBRARY) {
         if (y >= TAB_Y && y < TAB_Y + TAB_HEIGHT && horizontal) {
             next_genre_tab(next);
-        } else if (app.game_count) {
-            size_t first = grid_first();
-            if (next && first + GRID_PAGE < app.game_count) app.game_index = first + GRID_PAGE;
-            else if (!next && first) app.game_index = first - GRID_PAGE;
-            app.genre_focus = false;
-            app.top_focus = TOP_NONE;
         }
     } else if (app.screen == GAME) {
         if (horizontal && (app.game_tab != GAME_SCREENSHOTS || (y >= 201 && y < 245)))
@@ -1276,11 +1306,13 @@ static void touch_tap(int x, int y) {
             }
         } else if (x >= 1000 && y >= 607 && y < 644) {
             input(HidNpadButton_ZL);
-        } else if (x >= GRID_X && y >= GRID_Y) {
-            int col = (x - GRID_X) / GRID_STEP_X, row = (y - GRID_Y) / GRID_STEP_Y;
-            size_t index = grid_first() + (size_t)(row * GRID_COLUMNS + col);
-            if (col < GRID_COLUMNS && row < GRID_ROWS && index < app.game_count &&
-                (x - GRID_X) % GRID_STEP_X < GRID_WIDTH && (y - GRID_Y) % GRID_STEP_Y < GRID_HEIGHT) {
+        } else if (x >= GRID_X && y >= GRID_VIEW_TOP && y < GRID_VIEW_BOTTOM) {
+            int grid_x = x - GRID_X, grid_y = y - GRID_Y + app.grid_scroll;
+            if (grid_y < 0) return;
+            int col = grid_x / GRID_STEP_X, row = grid_y / GRID_STEP_Y;
+            size_t index = (size_t)row * GRID_COLUMNS + (size_t)col;
+            if (col < GRID_COLUMNS && index < app.game_count &&
+                grid_x % GRID_STEP_X < GRID_WIDTH && grid_y % GRID_STEP_Y < GRID_HEIGHT) {
                 app.game_index = index;
                 app.genre_focus = false;
                 app.top_focus = TOP_NONE;
@@ -1324,27 +1356,42 @@ static void touch_tap(int x, int y) {
     }
 }
 
-static void poll_touch(void) {
+static bool poll_touch(bool controller_input) {
     static int start_x, start_y, x, y;
-    static bool touching, multiple;
+    static bool touching, cancelled, on_grid, dragged;
     HidTouchScreenState state;
-    if (!hidGetTouchScreenStates(&state, 1)) return;
-    if (state.count > 1) {
-        multiple = true;
-        return;
-    }
-    if (state.count == 1 && !multiple) {
+    if (!hidGetTouchScreenStates(&state, 1)) return false;
+    if (state.count > 1 || (controller_input && state.count)) cancelled = true;
+    if (state.count == 1 && !cancelled) {
+        int previous_y = y;
         x = (int)state.touches[0].x;
         y = (int)state.touches[0].y;
-        if (!touching) { start_x = x; start_y = y; touching = true; }
+        if (!touching) {
+            start_x = x;
+            start_y = y;
+            touching = true;
+            on_grid = app.screen == LIBRARY && app.game_count && !app.filters_open &&
+                      !app.settings_open && !app.delete_file[0] && !app.confirm_install &&
+                      !app.choose_download && y >= GRID_VIEW_TOP && y < GRID_VIEW_BOTTOM;
+            return false;
+        }
+        if (on_grid && (dragged || abs(x - start_x) >= GRID_DRAG_THRESHOLD ||
+                        abs(y - start_y) >= GRID_DRAG_THRESHOLD)) {
+            int delta = (dragged ? previous_y : start_y) - y;
+            dragged = true;
+            return scroll_grid(delta);
+        }
     } else if (!state.count) {
-        if (touching && !multiple) {
+        bool activate = touching && !cancelled && !dragged && !controller_input;
+        touching = cancelled = on_grid = dragged = false;
+        if (activate) {
             int dx = x - start_x, dy = y - start_y;
             if (abs(dx) >= 42 || abs(dy) >= 42) touch_swipe(start_x, start_y, dx, dy);
             else touch_tap(x, y);
+            return true;
         }
-        touching = multiple = false;
     }
+    return false;
 }
 
 static void input(u64 buttons) {
@@ -1580,15 +1627,15 @@ static void draw_library(void) {
         centered_text(app.normal, i ? genre_names[genre_tabs[i]] : "Усі",
                       x + 8, TAB_Y + 7, width - 16, active ? white : gray);
     }
-    size_t first = grid_first();
-    for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
+    const SDL_Rect viewport = {0, GRID_VIEW_TOP, 1280, GRID_VIEW_BOTTOM - GRID_VIEW_TOP};
+    SDL_RenderSetClipRect(app.renderer, &viewport);
+    for (size_t i = grid_first(), end = grid_end(); i < end; ++i) {
         const CatalogEntry *entry = &app.entries[app.rows[i]];
-        size_t pos = i - first;
         bool active = i == app.game_index && !app.genre_focus && !app.top_focus;
         int size = active ? GRID_WIDTH : GRID_THUMB_SIZE;
         int inset = (GRID_WIDTH - size) / 2;
-        int x = GRID_X + (int)(pos % GRID_COLUMNS) * GRID_STEP_X + inset;
-        int y = GRID_Y + (int)(pos / GRID_COLUMNS) * GRID_STEP_Y + inset;
+        int x = GRID_X + (int)(i % GRID_COLUMNS) * GRID_STEP_X + inset;
+        int y = GRID_Y + (int)(i / GRID_COLUMNS) * GRID_STEP_Y - app.grid_scroll + inset;
         draw_grid_cover(cover_texture(entry_game(entry), entry->metadata), x, y, size);
         unsigned rating = entry->metadata ? entry->metadata->rating : 0;
         char score[12] = "—";
@@ -1607,6 +1654,7 @@ static void draw_library(void) {
             }
         }
     }
+    SDL_RenderSetClipRect(app.renderer, NULL);
     if (app.game_count) {
         const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
         text(app.normal, entry_title(entry), 40, 593, 905, white);
@@ -2006,11 +2054,11 @@ int main(int argc, char **argv) {
             }
             held = vertical;
             input(buttons);
-            poll_touch();
+            bool touch_changed = poll_touch(buttons != 0);
             pump_index();
             pump_gallery();
             bool cover_finished = pump_covers();
-            if (buttons || cover_finished || now >= next_frame) {
+            if (buttons || touch_changed || cover_finished || now >= next_frame) {
                 draw();
                 next_frame = now + 150;
             }

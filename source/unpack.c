@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "unpack.h"
+#include "storage.h"
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -9,7 +10,6 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <unistd.h>
 #ifdef __SWITCH__
 #include <fcntl.h>
@@ -62,14 +62,6 @@ static const char *entry_name(const char *path) {
     }
 }
 
-static bool available(const char *directory, uint64_t bytes) {
-    struct statvfs storage;
-    if (statvfs(directory, &storage) != 0 || !storage.f_frsize) return true;
-    uint64_t block = storage.f_frsize;
-    uint64_t needed = bytes / block + (bytes % block != 0);
-    return needed <= (uint64_t)storage.f_bavail;
-}
-
 static bool unused_path(const char *path) {
     struct stat entry;
     return lstat(path, &entry) != 0 && errno == ENOENT;
@@ -80,7 +72,7 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
     int fd = mkstemp(output->temporary);
     if (fd < 0) {
         output->temporary[0] = 0;
-        return "Не вдалося створити тимчасовий файл";
+        return nxload_storage_error(errno, "Не вдалося створити тимчасовий файл");
     }
 #ifdef __SWITCH__
     if (size > UINT32_MAX) {
@@ -89,7 +81,7 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
             R_FAILED(fsdevCreateFile(output->temporary, 0, FsCreateOption_BigFile)))
             return "Не вдалося створити великий пакет на microSD";
         fd = open(output->temporary, O_WRONLY);
-        if (fd < 0) return "Не вдалося відкрити великий пакет на microSD";
+        if (fd < 0) return nxload_storage_error(errno, "Не вдалося відкрити великий пакет на microSD");
     }
 #endif
     FILE *file = fdopen(fd, "wb");
@@ -108,7 +100,7 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
             break;
         }
         if (fwrite(buffer, 1, (size_t)bytes, file) != (size_t)bytes) {
-            error = "Помилка запису під час розпакування";
+            error = nxload_storage_error(errno, "Помилка запису під час розпакування");
             break;
         }
         written += (uint64_t)bytes;
@@ -116,7 +108,8 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
     if (!error && written != size) error = "Пакет у RAR неповний";
-    if (fclose(file) != 0 && !error) error = "Не вдалося зберегти розпакований пакет";
+    if (fclose(file) != 0 && !error)
+        error = nxload_storage_error(errno, "Не вдалося зберегти розпакований пакет");
     return error;
 }
 
@@ -160,8 +153,8 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory)
             break;
         }
         la_int64_t length = archive_entry_size(entry);
-        if (length <= 0 || !available(directory, (uint64_t)length)) {
-            error = length <= 0 ? "У RAR некоректний розмір пакета" : "Бракує місця на microSD";
+        if (length <= 0) {
+            error = "У RAR некоректний розмір пакета";
             break;
         }
 

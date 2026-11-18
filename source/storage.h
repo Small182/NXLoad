@@ -17,6 +17,12 @@
 #define NXLOAD_APP_DIR NXLOAD_STORAGE_PREFIX NXLOAD_APP_RELATIVE
 #define NXLOAD_DOWNLOAD_DIR NXLOAD_STORAGE_PREFIX NXLOAD_DOWNLOAD_RELATIVE
 
+static inline const char *nxload_storage_error(int error, const char *fallback) {
+    if (error == ENOSPC) return "Бракує місця на microSD";
+    if (error == EFBIG) return "Перевищено допустимий розмір файлу на microSD";
+    return fallback;
+}
+
 static inline bool nxload_ensure_directory(const char *path) {
     if (mkdir(path, 0777) == 0) return true;
     if (errno != EEXIST) return false;

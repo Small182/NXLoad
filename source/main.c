@@ -604,7 +604,8 @@ static void download_link(void) {
     if (!job) return;
     strcpy(app.transfer_url, url);
     job->url = app.transfer_url;
-    job->romshq = !strncmp(url, "https://romshq.com/d/", sizeof("https://romshq.com/d/") - 1);
+    job->romshq = !strncmp(url, "https://romshq.com/d/", sizeof("https://romshq.com/d/") - 1) ||
+                  !strncmp(url, "https://www.romshq.com/d/", sizeof("https://www.romshq.com/d/") - 1);
     job->datanodes = !job->romshq;
     launch_transfer();
 }
@@ -1044,7 +1045,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.18", 206, 44, 120, gray);
+    text(app.small, "1.0.19", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування триває" : "Завантаження триває", 950, 40, 290, blue);
     if (app.screen == LIBRARY) draw_library();

@@ -7,6 +7,7 @@
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -18,7 +19,6 @@
 #include <unistd.h>
 #ifdef __SWITCH__
 #include <switch.h>
-#include <sys/statvfs.h>
 #endif
 
 #define HTML_CAPACITY (512 * 1024)
@@ -27,9 +27,6 @@
 #define FILE_RECEIVE_BUFFER (256 * 1024)
 #define DLARCHIVE_ORIGIN "https://drive.dlarchive.my.id"
 #define DLARCHIVE_FILE_HOST "direct-stor.berkasdrive.com"
-#define ROMSHQ_ORIGIN "https://romshq.com"
-
-
 typedef enum { HOST_FICHIER, HOST_MEGAUP, HOST_DLARCHIVE, HOST_ROMSHQ, HOST_DATANODES } DownloadHost;
 
 typedef struct {
@@ -69,7 +66,7 @@ static bool resolve_host_url(const char *base, const char *target,
         !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
         (source == HOST_MEGAUP ? !strcasecmp(host, MEGAUP_FILE_HOST) :
          source == HOST_DLARCHIVE ? !strcasecmp(host, DLARCHIVE_FILE_HOST) :
-         source == HOST_ROMSHQ ? !strcasecmp(host, "romshq.com") :
+         source == HOST_ROMSHQ ? (!strcasecmp(host, "romshq.com") || !strcasecmp(host, "www.romshq.com")) :
          source == HOST_DATANODES ? in_domain(host, "datanodes.to") :
          in_domain(host, "1fichier.com") || in_domain(host, "desfichiers.com")) &&
         !curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) && !strcmp(port, "443") &&
@@ -86,6 +83,15 @@ static bool resolve_host_url(const char *base, const char *target,
     curl_free(port);
     curl_url_cleanup(parsed);
     return ok;
+}
+
+static bool resolve_romshq_url(const char *base, const char *target, const char *prefix,
+                               char out[URL_CAPACITY]) {
+    if (!resolve_host_url(base, target, out, HOST_ROMSHQ)) return false;
+    const char *path = strchr(out + sizeof("https://") - 1, '/');
+    size_t length = strlen(prefix);
+    return path && !strncmp(path, prefix, length) && path[length] &&
+           path[length] != '?' && path[length] != '#';
 }
 
 // Signed ROMsHQ /d/ URLs and DataNodes download pages can redirect to
@@ -247,12 +253,7 @@ static bool open_partial(Transfer *t, bool buffered) {
     }
     int fd;
 #ifdef __SWITCH__
-    struct statvfs storage;
-    if (t->expected && !statvfs(NXLOAD_DOWNLOAD_DIR, &storage) &&
-        t->expected > (uint64_t)storage.f_bavail * storage.f_frsize) {
-        t->error = "Not enough free space on SD";
-        return false;
-    }
+    // A virtual SD can grow during writes. Check the actual write result.
     if (t->expected > UINT32_MAX) {
         Result rc = fsdevCreateFile(t->partial, 0, FsCreateOption_BigFile);
         if (R_FAILED(rc)) {
@@ -260,14 +261,18 @@ static bool open_partial(Transfer *t, bool buffered) {
             return false;
         }
         fd = open(t->partial, O_WRONLY);
-        if (fd < 0) unlink(t->partial);
+        if (fd < 0) {
+            int error = errno;
+            unlink(t->partial);
+            errno = error;
+        }
     } else
 #endif
     {
         fd = open(t->partial, O_WRONLY | O_CREAT | O_EXCL, 0666);
     }
     if (fd < 0) {
-        t->error = "Cannot open .part file on SD";
+        t->error = nxload_storage_error(errno, "Не вдалося відкрити тимчасовий файл на microSD");
         return false;
     }
     t->file = fdopen(fd, "wb");
@@ -340,7 +345,7 @@ static size_t on_body(char *data, size_t size, size_t count, void *arg) {
         if (!t->file && !open_partial(t, true)) return 0;
         size_t written = fwrite(data, 1, n, t->file);
         atomic_fetch_add(&t->job->received, written);
-        if (written != n) t->error = "SD write failed (space or file size limit)";
+        if (written != n) t->error = nxload_storage_error(errno, "Помилка запису на microSD");
         return written;
     }
     if (n > HTML_CAPACITY - t->length) {
@@ -670,7 +675,7 @@ static bool resolve_dlarchive(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
     return true;
 }
 
-static bool read_romshq_reply(const char *p, char target[URL_CAPACITY]) {
+static bool read_romshq_reply(const char *p, const char *page, char target[URL_CAPACITY]) {
     char url[URL_CAPACITY] = {0}, mode[24] = {0};
     bool success = false;
     skip_json_space(&p);
@@ -700,8 +705,7 @@ static bool read_romshq_reply(const char *p, char target[URL_CAPACITY]) {
     skip_json_space(&p);
     if (*p || !success) return false;
     if (!strcmp(mode, "direct"))
-        return !strncmp(url, ROMSHQ_ORIGIN "/d/", sizeof(ROMSHQ_ORIGIN "/d/") - 1) &&
-               resolve_host_url(NULL, url, target, HOST_ROMSHQ);
+        return resolve_romshq_url(page, url, "/d/", target);
     return resolve_host_url(NULL, url, target, HOST_DATANODES);
 }
 
@@ -728,29 +732,56 @@ static void csrf_token(xmlNodePtr node, char out[256]) {
     }
 }
 
+static bool fetch_romshq_card(CURL *curl, Transfer *t, char page[URL_CAPACITY]) {
+    for (unsigned hop = 0; hop <= 5; ++hop) {
+        curl_easy_setopt(curl, CURLOPT_URL, page);
+        CURLcode code = curl_easy_perform(curl);
+        t->job->api_http = t->status;
+        if (code == CURLE_OK && t->status == 200 && !t->challenge) return true;
+        if (t->challenge || t->status == 403) {
+            t->job->result = "ROMsHQ вимагає перевірку в браузері";
+            return false;
+        }
+        if (code != CURLE_OK) {
+            t->job->result = curl_easy_strerror(code);
+            return false;
+        }
+        if (t->status < 300 || t->status >= 400) {
+            t->job->result = "Картка ROMsHQ недоступна";
+            return false;
+        }
+        char *location = NULL, next[URL_CAPACITY];
+        curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &location);
+        if (!resolve_romshq_url(page, location, "/game/", next)) {
+            t->job->result = "ROMsHQ перенаправив картку на непідтримувану адресу";
+            return false;
+        }
+        if (hop == 5 || !strcmp(next, page)) break;
+        strcpy(page, next);
+    }
+
+    t->job->result = "Забагато перенаправлень картки ROMsHQ";
+    return false;
+}
+
 static bool resolve_romshq(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
     FichierJob *job = t->job;
     const char *id = job->romshq_id;
-    char page[URL_CAPACITY], api[160];
+    char page[URL_CAPACITY], api[160], origin[64];
     if (!id || !*id || strlen(id) > 20 || id[strspn(id, "0123456789")] ||
-        !resolve_host_url(NULL, job->url, page, HOST_ROMSHQ) ||
-        strncmp(page, ROMSHQ_ORIGIN "/game/", sizeof(ROMSHQ_ORIGIN "/game/") - 1)) {
+        !resolve_romshq_url(NULL, job->url, "/game/", page)) {
         job->result = "Некоректна картка або ID ROMsHQ";
         return false;
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, page);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    CURLcode code = curl_easy_perform(curl);
-    if (code != CURLE_OK || t->status != 200 || t->challenge) {
-        job->api_http = t->status;
-        job->result = t->challenge || t->status == 403 ?
-            "ROMsHQ вимагає перевірку в браузері" : "Картка ROMsHQ недоступна";
-        return false;
-    }
+    if (!fetch_romshq_card(curl, t, page)) return false;
 
-    char token[256] = {0}, csrf[300];
+    const char *path = strchr(page + sizeof("https://") - 1, '/');
+    snprintf(origin, sizeof(origin), "%.*s", (int)(path - page), page);
+    char token[256] = {0}, csrf[300], origin_header[80];
+    snprintf(origin_header, sizeof(origin_header), "Origin: %s", origin);
     htmlDocPtr doc = htmlReadMemory(t->html, (int)t->length, page, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
     if (doc) {
@@ -759,20 +790,20 @@ static bool resolve_romshq(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
     }
     snprintf(csrf, sizeof(csrf), "X-CSRF-TOKEN: %s", token);
     struct curl_slist *headers = NULL;
-    if (!romshq_headers(&headers, "Origin: " ROMSHQ_ORIGIN) ||
+    if (!romshq_headers(&headers, origin_header) ||
         !romshq_headers(&headers, "Accept: application/json") ||
         !romshq_headers(&headers, "X-Requested-With: XMLHttpRequest") ||
         (token[0] && !romshq_headers(&headers, csrf))) {
         curl_slist_free_all(headers);
         return false;
     }
-    snprintf(api, sizeof(api), ROMSHQ_ORIGIN "/api/download/sign/%s", id);
+    snprintf(api, sizeof(api), "%s/api/download/sign/%s", origin, id);
     curl_easy_setopt(curl, CURLOPT_URL, api);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_REFERER, page);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
-    code = curl_easy_perform(curl);
+    CURLcode code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->api_http);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
@@ -783,7 +814,7 @@ static bool resolve_romshq(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
         job->result = "ROMsHQ не видав підписане посилання";
         return false;
     }
-    if (!read_romshq_reply(t->html, out)) {
+    if (!read_romshq_reply(t->html, page, out)) {
         job->result = "ROMsHQ повернув непідтримуване посилання";
         return false;
     }
@@ -854,8 +885,7 @@ void fichier_download(FichierJob *job) {
         if (job->romshq_id) {
             if (!resolve_romshq(curl, &t, url)) goto done;
             snprintf(referrer, sizeof(referrer), "%s", job->url);
-        } else if (!resolve_host_url(NULL, job->url, url, HOST_ROMSHQ) ||
-                   strncmp(url, ROMSHQ_ORIGIN "/d/", sizeof(ROMSHQ_ORIGIN "/d/") - 1)) {
+        } else if (!resolve_romshq_url(NULL, job->url, "/d/", url)) {
             job->result = "Потрібне підписане посилання ROMsHQ /d/";
             goto done;
         }
@@ -897,6 +927,8 @@ void fichier_download(FichierJob *job) {
             curl_easy_getinfo(curl, CURLINFO_SPEED_DOWNLOAD_T, &speed);
             job->avg_speed = speed > 0 ? (uint64_t)speed : 0;
             bool closed = fclose(t.file) == 0;
+            if (!closed && !t.error)
+                t.error = nxload_storage_error(errno, "Не вдалося зберегти файл на microSD");
             t.file = NULL;
             free(t.write_buffer);
             t.write_buffer = NULL;
@@ -909,7 +941,7 @@ void fichier_download(FichierJob *job) {
                 t.error = "Could not finalize file on SD";
             }
             unlink(t.partial);
-            job->result = t.error ? t.error : closed ? curl_easy_strerror(code) : "SD flush failed";
+            job->result = t.error ? t.error : curl_easy_strerror(code);
             goto done;
         }
         if (code != CURLE_OK || t.error) {
@@ -966,14 +998,14 @@ void fichier_download(FichierJob *job) {
                 strcpy(url, next);
                 job->result = "Забагато перенаправлень до файлу";
                 snprintf(job->tls_detail, sizeof(job->tls_detail),
-                         "Перенаправлення на %s", destination_host);
+                         "Перенаправлення на %.91s", destination_host);
                 continue;
             }
             if (location) {
                 char ignored[URL_CAPACITY], target_host[128] = {0};
                 if (resolve_download_redirect(url, location, ignored, target_host))
                     snprintf(job->tls_detail, sizeof(job->tls_detail),
-                             "Перенаправлення зупинено: %s", target_host);
+                             "Перенаправлення зупинено: %.78s", target_host);
                 else
                     strcpy(job->tls_detail, "Небезпечне або непідтримуване перенаправлення");
             }

@@ -328,7 +328,9 @@ static uint64_t milliseconds(void) {
 
 RangeResult range_download(const RangeSource *source, const RangeInfo *info, FichierJob *job, int fd) {
     off_t length = (off_t)info->length;
-    if ((uint64_t)length != info->length || ftruncate(fd, length)) return RANGE_RETRY_SINGLE;
+    if ((uint64_t)length != info->length) return RANGE_RETRY_SINGLE;
+    if (ftruncate(fd, length))
+        return errno == ENOSPC || errno == EFBIG ? RANGE_SD_ERROR : RANGE_RETRY_SINGLE;
     const unsigned lanes = info->length >= 512 * MIB ? MAX_CONNECTIONS : 4;
     uint64_t block_size = info->length / (lanes * 6);
     if (block_size < 8 * MIB) block_size = 8 * MIB;

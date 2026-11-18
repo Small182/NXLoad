@@ -8,7 +8,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := NXLoad
 APP_TITLE := NXLoad
 APP_AUTHOR := Small182
-APP_VERSION := 1.0.23
+APP_VERSION := 1.0.24
 NXLOAD_BUILD_SHA ?= $(shell git -C "$(TOPDIR)" rev-parse HEAD 2>/dev/null || printf '%s' "$${GITHUB_SHA:-unknown}")
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB -DNXLOAD_VERSION=\"$(APP_VERSION)\" -DNXLOAD_BUILD_SHA=\"$(NXLOAD_BUILD_SHA)\"
@@ -39,8 +39,8 @@ all: $(TITLEDB) $(CATALOG_META) $(GALLERIES)
 	@mkdir -p build
 	@$(MAKE) --no-print-directory -C build -f $(TOPDIR)/Makefile
 
-$(TITLEDB) $(CATALOG_META) &: $(TOPDIR)/tools/build-metadata.py $(TOPDIR)/tools/title_db.py $(TOPDIR)/tools/catalog_metadata.py $(TOPDIR)/tools/nintendo-life.json.gz
-	python3 "$<" "$(TITLEDB)" --catalog-output "$(CATALOG_META)" --nintendo-life "$(TOPDIR)/tools/nintendo-life.json.gz"
+$(TITLEDB) $(CATALOG_META) &: $(TOPDIR)/tools/build-metadata.py $(TOPDIR)/tools/title_db.py $(TOPDIR)/tools/catalog_metadata.py $(TOPDIR)/tools/nintendo-life.json.gz $(TOPDIR)/tools/nintendo-life-ratings.json
+	python3 "$<" "$(TITLEDB)" --catalog-output "$(CATALOG_META)" --nintendo-life "$(TOPDIR)/tools/nintendo-life.json.gz" --nintendo-life-ratings "$(TOPDIR)/tools/nintendo-life-ratings.json"
 
 $(GALLERIES): $(TOPDIR)/tools/build-galleries.py
 	python3 $< $@

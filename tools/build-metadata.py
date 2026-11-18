@@ -62,13 +62,15 @@ def main():
     parser.add_argument("--source", type=Path, help="Read a local TitleDB JSON snapshot")
     parser.add_argument("--catalog-output", type=Path)
     parser.add_argument("--nintendo-life", type=Path)
+    parser.add_argument("--nintendo-life-ratings", type=Path, help="Verified reader scores from individual game pages")
     args = parser.parse_args()
     database = load_catalog(args.source)
     index, count = build(database)
     if not count:
         raise ValueError("TitleDB snapshot contains no matching records")
     if args.catalog_output:
-        data, matched = build_catalog_metadata(database, load_nintendo_life(args.nintendo_life))
+        nintendo_life = load_nintendo_life(args.nintendo_life, args.nintendo_life_ratings)
+        data, matched = build_catalog_metadata(database, nintendo_life)
         write_index(args.catalog_output, data)
         print(f"Nintendo Life: {matched} unambiguous entries in the library metadata index")
     write_index(args.output, index)

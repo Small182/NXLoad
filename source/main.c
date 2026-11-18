@@ -43,7 +43,7 @@
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
 typedef enum {
-    SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG, SETTINGS_AUTO_UPDATE,
+    SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG,
     SETTINGS_REFRESH_CATALOG, SETTINGS_UPDATE, SETTINGS_ROWS
 } SettingRow;
 
@@ -78,7 +78,7 @@ typedef struct {
 typedef struct {
     char name[CATALOG_TEXT], url[2048], id[DLARCHIVE_ID_CAPACITY];
     GameFileSource source;
-    bool unpack, install_local, install_after_download, app_update, background;
+    bool unpack, install_local, install_after_download, app_update;
 } DownloadRequest;
 
 typedef struct {
@@ -106,7 +106,7 @@ typedef struct {
     TTF_Font *large;
     Screen screen, previous;
     size_t rows[MERGED_CAPACITY];
-    size_t game_count, game_index, file_index, saved_count, saved_index;
+    size_t game_count, genre_count, game_index, file_index, saved_count, saved_index;
     SortMode sort, draft_sort, genre_sort[GENRE_COUNT];
     bool filter_sort_changed;
     size_t genre, draft_genre, filter_row;
@@ -203,6 +203,13 @@ static void centered_text(TTF_Font *font, const char *label, int x, int y, int w
     int pixels = 0;
     TTF_SizeUTF8(font, label, &pixels, NULL);
     int offset = SDL_max(0, (width - pixels) / 2);
+    text(font, label, x + offset, y, width - offset, color);
+}
+
+static void right_text(TTF_Font *font, const char *label, int x, int y, int width, SDL_Color color) {
+    int pixels = 0;
+    TTF_SizeUTF8(font, label, &pixels, NULL);
+    int offset = SDL_max(0, width - pixels);
     text(font, label, x + offset, y, width - offset, color);
 }
 
@@ -401,10 +408,12 @@ static int compare_rows(const void *left, const void *right) {
 static void rebuild_view(const char *keep) {
     size_t old_index = app.game_index;
     app.game_count = 0;
+    app.genre_count = 0;
     app.game_index = 0;
     for (size_t i = 0; i < app.entry_count; ++i) {
         const CatalogEntry *entry = &app.entries[i];
         if (app.genre && (!entry->metadata || !(entry->metadata->genres & (1u << (app.genre - 1))))) continue;
+        ++app.genre_count;
         if (!match_query(entry)) continue;
         app.rows[app.game_count++] = i;
     }
@@ -834,7 +843,7 @@ static void finish_jobs(void) {
         if (app.active_transfer.app_update)
             snprintf(app.update_notice, sizeof(app.update_notice), "%s", app.download.result);
         refresh_saved();
-        if (app.queue_count && !app.active_transfer.background)
+        if (app.queue_count && !app.active_transfer.app_update)
             snprintf(app.notice, sizeof(app.notice), "Попереднє: %.170s", app.download.result);
     }
     if (app.download_busy && SDL_GetTicks64() - app.speed_time >= 500) {
@@ -887,12 +896,6 @@ static void launch_next_transfer(void) {
     if (!app.download_busy) {
         job->result = "Не вдалося запустити операцію";
         app.download_finished = true;
-    } else if (request->app_update) {
-        time_t now = time(NULL);
-        if (now > 0) {
-            app.settings.update_checked = now;
-            save_settings(&app.settings);
-        }
     }
 }
 
@@ -909,9 +912,9 @@ static const char *enqueue_transfer(const DownloadRequest *request) {
     if (app.queue_count == DOWNLOAD_QUEUE_LIMIT) return "Черга заповнена";
     app.queue[app.queue_count++] = *request;
     if (app.download_busy) return "Додано до черги";
-    bool background = request->background;
+    bool app_update = request->app_update;
     launch_next_transfer();
-    if (!background) {
+    if (!app_update) {
         app.notice[0] = 0;
         if (app.screen != DOWNLOADS) app.previous = app.screen;
         app.screen = DOWNLOADS;
@@ -956,31 +959,27 @@ static bool keyboard(char *out, size_t capacity, const char *title, const char *
     return true;
 }
 
-static void start_update(bool background) {
+static void start_update(void) {
     if (app.update_ready) return;
     if (!app.update_target[0] || access(app.update_target, R_OK)) {
-        if (!background) strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
+        strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
         return;
     }
     if (!update_configured()) {
-        if (!background) strcpy(app.update_notice, "Додай токен GitHub у switch/nxload/github-token.txt");
+        strcpy(app.update_notice, "Додай токен GitHub у switch/nxload/github-token.txt");
         return;
     }
-    DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true, .background = true};
+    DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true};
     strcpy(request.url, app.update_target);
     const char *message = enqueue_transfer(&request);
-    if (!background) snprintf(app.update_notice, sizeof(app.update_notice), "%s",
-                             *message ? message : "Перевірка нової збірки…");
+    snprintf(app.update_notice, sizeof(app.update_notice), "%s",
+             *message ? message : "Перевірка нової збірки…");
 }
 
 static void pump_daily_checks(uint64_t ticks) {
     if (ticks < app.background_check_at) return;
     app.background_check_at = ticks + 60000;
-    time_t now = time(NULL);
-    schedule_daily_catalogs(now);
-    if (app.settings.auto_update && app.screen == LIBRARY && !app.index_busy && !app.refresh_waiting &&
-        !app.download_busy && !app.queue_count && daily_check_due(now, app.settings.update_checked))
-        start_update(true);
+    schedule_daily_catalogs(time(NULL));
 }
 
 static void download_link(void) {
@@ -1124,7 +1123,6 @@ static void change_setting(size_t row, bool activate) {
         case SETTINGS_RAR: value = &app.settings.delete_rar; break;
         case SETTINGS_NSP: value = &app.settings.delete_nsp; break;
         case SETTINGS_AUTO_CATALOG: value = &app.settings.auto_catalog; break;
-        case SETTINGS_AUTO_UPDATE: value = &app.settings.auto_update; break;
         case SETTINGS_REFRESH_CATALOG:
             if (activate) {
                 refresh_catalogs();
@@ -1132,7 +1130,7 @@ static void change_setting(size_t row, bool activate) {
             }
             return;
         case SETTINGS_UPDATE:
-            if (activate) start_update(false);
+            if (activate) start_update();
             return;
         default: return;
     }
@@ -1593,15 +1591,20 @@ static void draw_library(void) {
         int y = GRID_Y + (int)(pos / GRID_COLUMNS) * GRID_STEP_Y + inset;
         draw_grid_cover(cover_texture(entry_game(entry), entry->metadata), x, y, size);
         unsigned rating = entry->metadata ? entry->metadata->rating : 0;
-        if (rating) {
-            char score[12];
-            snprintf(score, sizeof(score), "%u.%u", rating / 10, rating % 10);
-            int badge_x = x + size - 48, badge_y = y + size - 48;
-            const SDL_Color badge = {17, 24, 38, 230};
-            SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_BLEND);
-            rect(badge_x, badge_y, 42, 42, badge);
-            SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_NONE);
-            centered_text(app.small, score, badge_x, badge_y + 11, 42, white);
+        char score[12] = "—";
+        if (rating) snprintf(score, sizeof(score), "%u.%u", rating / 10, rating % 10);
+        int badge_x = x + size - 48, badge_y = y + size - 48;
+        const SDL_Color badge = {17, 24, 38, 230};
+        SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_BLEND);
+        rect(badge_x, badge_y, 42, 42, badge);
+        SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_NONE);
+        centered_text(app.small, score, badge_x, badge_y + 11, 42, rating ? white : gray);
+        if (active) {
+            SDL_SetRenderDrawColor(app.renderer, blue.r, blue.g, blue.b, blue.a);
+            for (int i = 2; i <= 5; ++i) {
+                SDL_Rect outline = {x - i, y - i, size + 2 * i, size + 2 * i};
+                SDL_RenderDrawRect(app.renderer, &outline);
+            }
         }
     }
     if (app.game_count) {
@@ -1611,35 +1614,39 @@ static void draw_library(void) {
         text(app.normal, app.entry_count ? "Ігор за цими фільтрами не знайдено" : "Каталог порожній",
              48, 176, 790, gray);
     }
-    char count[32];
-    snprintf(count, sizeof(count), "%zu", app.entry_count);
-    text(app.small, count, 40, 631, 240, gray);
-    const char *sort = sort_names[app.sort];
-    int sort_width = 0;
-    TTF_SizeUTF8(app.small, sort, &sort_width, NULL);
-    sort_width = SDL_min(sort_width + 2, 240);
-    text(app.small, sort, 1240 - sort_width, 621, sort_width, blue);
+    char count[192];
+    snprintf(count, sizeof(count), "Всього ігор: %zu", app.entry_count);
+    text(app.small, count, 40, 631, 300, gray);
+    if (app.genre) {
+        snprintf(count, sizeof(count), "%s: %zu", genre_names[app.genre], app.genre_count);
+        text(app.small, count, 340, 631, 340, gray);
+    }
+    if (app.query[0]) {
+        snprintf(count, sizeof(count), "Знайдено: %zu", app.game_count);
+        text(app.small, count, app.genre ? 700 : 340, 631, 230, gray);
+    }
+    right_text(app.small, sort_names[app.sort], 1000, 621, 240, blue);
 }
 
 static void draw_settings(void) {
     static const char *const labels[] = {
         "Дія з файлом за замовчуванням", "Видаляти RAR після розпакування",
         "Видаляти NSP після встановлення", "Щоденне оновлення каталогів",
-        "Щоденне оновлення NXLoad", "Оновити каталоги зараз", "Перевірити оновлення NXLoad",
+        "Оновити каталоги зараз", "Перевірити оновлення NXLoad",
     };
     const char *const on = "Увімкнено", *const off = "Вимкнено";
     const char *const values[] = {
         app.settings.install_default ? "Завантажити й встановити" : "Завантажити",
         app.settings.delete_rar ? on : off, app.settings.delete_nsp ? on : off,
-        app.settings.auto_catalog ? on : off, app.settings.auto_update ? on : off,
-        "", "",
+        app.settings.auto_catalog ? on : off, "", "",
     };
     text(app.large, "Налаштування", 195, 89, 920, white);
     for (size_t i = 0; i < SETTINGS_ROWS; ++i) {
         int y = SETTINGS_Y + (int)i * SETTINGS_STEP;
         rect(180, y, 920, 45, i == app.settings_row ? selected : panel);
         text(app.normal, labels[i], 195, y + 9, 560, white);
-        if (*values[i]) text(app.small, values[i], 785, y + 12, 300, i == app.settings_row ? blue : gray);
+        if (*values[i])
+            right_text(app.small, values[i], 755, y + 12, 330, i == app.settings_row ? blue : gray);
     }
     if (app.index_busy || app.refresh_waiting) {
         char status[128];

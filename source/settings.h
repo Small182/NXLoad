@@ -7,8 +7,8 @@
 typedef struct {
     bool install_default;
     bool delete_rar, delete_nsp;
-    bool auto_update, auto_catalog;
-    time_t update_checked, catalog_checked[2];
+    bool auto_catalog;
+    time_t catalog_checked[2];
 } Settings;
 
 Settings load_settings(void);

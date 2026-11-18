@@ -75,5 +75,13 @@ def build_catalog_metadata(database, nintendo_life):
     return "".join(lines).encode(), sum(bool(row[3]) for row in rows.values())
 
 
-def load_nintendo_life(path):
-    return json.loads(gzip.decompress(path.read_bytes()))
+def load_nintendo_life(path, ratings_path=None):
+    catalog = json.loads(gzip.decompress(path.read_bytes()))
+    if ratings_path:
+        # Some detail pages display reader scores absent from the browse snapshot.
+        for game, rating in json.loads(ratings_path.read_text(encoding="utf-8")).items():
+            if not GAME_PATH.fullmatch(game) or type(rating) is not int or not 1 <= rating <= 100:
+                raise ValueError(f"Invalid Nintendo Life reader score for {game}")
+            if game in catalog and not catalog[game][2]:
+                catalog[game][2] = rating
+    return catalog

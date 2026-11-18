@@ -17,7 +17,7 @@
 #define MIN_PARALLEL_SIZE (32 * MIB)
 #define RANGE_WRITE_BUFFER (1024 * 1024)
 #define RANGE_RECEIVE_BUFFER (256 * 1024)
-#define MAX_CONNECTIONS 8
+#define MAX_CONNECTIONS 4
 #define WRITE_QUEUE_SIZE 8
 
 typedef struct {
@@ -331,8 +331,7 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     if ((uint64_t)length != info->length) return RANGE_RETRY_SINGLE;
     if (ftruncate(fd, length))
         return errno == ENOSPC || errno == EFBIG ? RANGE_SD_ERROR : RANGE_RETRY_SINGLE;
-    const unsigned lanes = (job->romshq || job->datanodes) ? 3 :
-        info->length >= 512 * MIB ? MAX_CONNECTIONS : 4;
+    const unsigned lanes = (job->romshq || job->datanodes) ? 3 : MAX_CONNECTIONS;
     uint64_t block_size = info->length / (lanes * 6);
     if (block_size < 8 * MIB) block_size = 8 * MIB;
     if (block_size > 64 * MIB) block_size = 64 * MIB;

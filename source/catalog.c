@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "catalog.h"
+#include "game_info.h"
 #include "storage.h"
 
 #include <ctype.h>
@@ -225,6 +226,7 @@ static void read_game(xmlNodePtr anchor, Game *game, CatalogSource source) {
         if (n >= sizeof(game->title)) n = sizeof(game->title) - 1;
         for (size_t i = 0; i < n; ++i) game->title[i] = slug[i] == '-' ? ' ' : slug[i];
     }
+    clean_catalog_title(game->title);
 }
 
 static bool contains(const Game *games, size_t count, const char *url) {
@@ -429,7 +431,10 @@ static void read_romshq_files(xmlNodePtr node, GameDetails *details) {
             }
             if (valid) {
                 romshq_file_title(node, file.title);
-                details->files[details->count++] = file;
+                const char *label = file.title;
+                bool excluded = !strncasecmp(label, "Mirror ", 7) &&
+                    (label[7] == '2' || label[7] == '3') && !isdigit((unsigned char)label[8]);
+                if (!excluded) details->files[details->count++] = file;
             }
         }
         read_romshq_files(node->children, details);
@@ -480,6 +485,7 @@ static void load_details(CatalogJob *job) {
         }
         xmlNodePtr heading = find_tag(root, "h1");
         if (heading) node_text(heading, details->title);
+        clean_catalog_title(details->title);
         xmlNodePtr head = find_tag(root, "head");
         for (xmlNodePtr node = head ? head->children : NULL; node; node = node->next) {
             if (!is_element(node, "meta")) continue;
@@ -528,7 +534,10 @@ static bool read_cache_path(const char *path, CatalogIndex *index, CatalogSource
        fread(index->games, sizeof(Game), count, file) == count &&
        fgetc(file) == EOF && !ferror(file);
     fclose(file);
-    for (size_t i = 0; ok && i < count; ++i) ok = valid_game(&index->games[i], source);
+    for (size_t i = 0; ok && i < count; ++i) {
+        ok = valid_game(&index->games[i], source);
+        if (ok) clean_catalog_title(index->games[i].title);
+    }
     if (ok) {
         index->count = count;
         index->saved_at = (time_t)saved_at;

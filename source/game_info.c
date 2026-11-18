@@ -17,6 +17,9 @@
 #define BUILTIN_GALLERY_PATH "romfs:/gallery/"
 #endif
 #define BUILTIN_IMAGE_LIMIT (2 * 1024 * 1024)
+#ifndef CATALOG_META_PATH
+#define CATALOG_META_PATH "romfs:/catalog-meta.tsv"
+#endif
 
 #define NL "https://www.nintendolife.com"
 #define NL_SWITCH "/games/nintendo-switch/"
@@ -78,21 +81,118 @@ static bool remove_suffix(char *name, const char *suffix) {
     return true;
 }
 
-static void clean_heading(char *name) {
+static bool clean_heading(char *name) {
     static const char * const suffixes[] = {
-        "rom download free", "rom free download", "rom download", "rom",
-        "switch download free", "switch free download", "switch download", "nsp", "xci", "nsz", "xcz"
+        "rom download free", "rom free download", "rom download", "rom", "download free", "download",
+        "nsp", "xci", "nsz", "xcz"
     };
+    if (!strncasecmp(name, "download", 8) && name[8] && strchr(" -:|", name[8])) {
+        const char *title = name + 8 + strspn(name + 8, " -:|");
+        if (*title) memmove(name, title, strlen(title) + 1);
+    }
+    bool decorated = false;
     bool removed;
     do {
         removed = false;
         for (size_t i = 0; i < sizeof(suffixes) / sizeof(*suffixes); ++i) {
             if (remove_suffix(name, suffixes[i])) {
                 removed = true;
+                decorated = true;
                 break;
             }
         }
     } while (removed);
+    return decorated;
+}
+
+typedef struct {
+    const char *key;
+    CatalogMetadata value;
+} MetadataRow;
+
+static char *metadata_text;
+static MetadataRow *metadata_rows;
+static size_t metadata_count;
+
+void free_catalog_metadata(void) {
+    free(metadata_rows);
+    free(metadata_text);
+    metadata_rows = NULL;
+    metadata_text = NULL;
+    metadata_count = 0;
+}
+
+bool load_catalog_metadata(void) {
+    free_catalog_metadata();
+    FILE *file = fopen(CATALOG_META_PATH, "rb");
+    if (!file) return false;
+    long size = !fseek(file, 0, SEEK_END) ? ftell(file) : -1;
+    if (size > 0 && size <= 24 * 1024 * 1024 && !fseek(file, 0, SEEK_SET))
+        metadata_text = malloc((size_t)size + 1);
+    bool read = metadata_text && fread(metadata_text, 1, (size_t)size, file) == (size_t)size;
+    fclose(file);
+    if (!read) goto invalid;
+    metadata_text[size] = 0;
+    char *next = metadata_text;
+    if (strcmp(strsep(&next, "\n"), "NXLINFO1")) goto invalid;
+    size_t lines = 0;
+    for (const char *p = next; p && *p; ++p) if (*p == '\n') ++lines;
+    if (!lines || lines > 100000) goto invalid;
+    metadata_rows = calloc(lines, sizeof(*metadata_rows));
+    if (!metadata_rows) goto invalid;
+    for (size_t i = 0; i < lines; ++i) {
+        char *row = strsep(&next, "\n");
+        const char *values[7];
+        for (size_t field = 0; field < 7; ++field) {
+            values[field] = strsep(&row, "\t");
+            if (!values[field]) goto invalid;
+        }
+        if (row || !values[0][0] || !values[1][0] ||
+            (i && strcmp(metadata_rows[i - 1].key, values[0]) >= 0)) goto invalid;
+        metadata_rows[i] = (MetadataRow){values[0], {
+            values[1], values[2], values[3], (unsigned)strtoul(values[4], NULL, 10),
+            (unsigned)strtoul(values[5], NULL, 10), (unsigned)strtoul(values[6], NULL, 10),
+        }};
+    }
+    metadata_count = lines;
+    return true;
+
+invalid:
+    free_catalog_metadata();
+    return false;
+}
+
+static const CatalogMetadata *exact_catalog_metadata(const char *name) {
+    char key[CATALOG_TEXT];
+    title_key(key, name);
+    size_t first = 0, end = metadata_count;
+    while (first < end) {
+        size_t middle = first + (end - first) / 2;
+        int comparison = strcmp(key, metadata_rows[middle].key);
+        if (!comparison) return &metadata_rows[middle].value;
+        if (comparison > 0) first = middle + 1;
+        else end = middle;
+    }
+    return NULL;
+}
+
+void clean_catalog_title(char name[CATALOG_TEXT]) {
+    if (!clean_heading(name) || exact_catalog_metadata(name)) return;
+    char key[CATALOG_TEXT];
+    title_key(key, name);
+    if (!strcmp(key, "12switch") || !strcmp(key, "everybody12switch")) return;
+    if (!remove_suffix(name, "nintendo switch")) remove_suffix(name, "switch");
+}
+
+static const CatalogMetadata *find_catalog_metadata(const Game *game) {
+    if (!game) return NULL;
+    char title[CATALOG_TEXT];
+    strcpy(title, game->title);
+    clean_heading(title);
+    const CatalogMetadata *metadata = exact_catalog_metadata(title);
+    if (!metadata && (remove_suffix(title, "nintendo switch") || remove_suffix(title, "switch")))
+        metadata = exact_catalog_metadata(title);
+    return metadata;
 }
 
 typedef struct {
@@ -165,6 +265,11 @@ size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED
     for (size_t i = 0; i < other; ++i)
         if (!matched || !matched[i])
             entries[count++] = (CatalogEntry){.games = {NULL, &indexes[CATALOG_ROMSHQ].games[i]}};
+    for (size_t i = 0; i < count; ++i) {
+        const CatalogMetadata *a = find_catalog_metadata(entries[i].games[CATALOG_NSROMS]);
+        const CatalogMetadata *b = find_catalog_metadata(entries[i].games[CATALOG_ROMSHQ]);
+        entries[i].metadata = !a || (b && !a->nintendo_life[0] && b->nintendo_life[0]) ? b : a;
+    }
     free(keys);
     free(matched);
     return count;
@@ -395,6 +500,17 @@ void load_game_gallery(GalleryJob *job) {
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
     if (bundled_gallery(key, &job->result)) return;
+    CatalogFetchStatus status = {0};
+    if (job->nintendo_life[0] && !atomic_load(&job->cancel)) {
+        char url[CATALOG_URL];
+        snprintf(url, sizeof(url), NL "%.*s", (int)(sizeof(url) - sizeof(NL)), job->nintendo_life);
+        if (fetch_gallery(job, url, key, alternate, &status)) return;
+        titledb_gallery(job);
+        if (!job->result.count && !atomic_load(&job->cancel))
+            snprintf(job->result.issue, sizeof(job->result.issue),
+                     "Галерея Nintendo Life недоступна · HTTP %ld", status.http);
+        return;
+    }
     char slugs[2][CATALOG_TEXT] = {{0}};
     make_slug(slugs[0], name);
     if (!job->title[0]) {
@@ -410,7 +526,6 @@ void load_game_gallery(GalleryJob *job) {
             snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)(size - (sizeof("-switch") - 1)), slug);
     }
 
-    CatalogFetchStatus status = {0};
     const char *platforms[] = {NL_SWITCH, NL_ESHOP};
     for (size_t i = 0; i < 2 && !job->result.issue[0] && !atomic_load(&job->cancel); ++i) {
         if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;

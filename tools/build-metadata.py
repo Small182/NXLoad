@@ -7,6 +7,7 @@ import re
 import struct
 import zlib
 
+from catalog_metadata import build_catalog_metadata, load_nintendo_life
 from title_db import description, load_catalog, selected_games, text
 
 MAGIC = b"NXLTDB03"
@@ -59,15 +60,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--source", type=Path, help="Read a local TitleDB JSON snapshot")
+    parser.add_argument("--catalog-output", type=Path)
+    parser.add_argument("--nintendo-life", type=Path)
     args = parser.parse_args()
-    index, count = build(load_catalog(args.source))
+    database = load_catalog(args.source)
+    index, count = build(database)
     if not count:
         raise ValueError("TitleDB snapshot contains no matching records")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output.with_suffix(".tmp")
-    temporary.write_bytes(index)
-    temporary.replace(args.output)
+    if args.catalog_output:
+        data, matched = build_catalog_metadata(database, load_nintendo_life(args.nintendo_life))
+        write_index(args.catalog_output, data)
+        print(f"Nintendo Life: {matched} unambiguous entries in the library metadata index")
+    write_index(args.output, index)
     print(f"TitleDB: {count} games, English descriptions, {len(index):,} bytes")
+
+
+def write_index(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(path)
 
 
 if __name__ == "__main__":

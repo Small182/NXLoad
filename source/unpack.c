@@ -203,5 +203,5 @@ done:
     }
     free(outputs);
     free(buffer);
-    return error ? error : "RAR розпаковано. Пакети готові до встановлення";
+    return error;
 }

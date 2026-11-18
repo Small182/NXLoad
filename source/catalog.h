@@ -27,7 +27,13 @@ typedef struct {
 } Game;
 
 typedef struct {
+    const char *title, *cover, *nintendo_life;
+    unsigned released, genres, rating;
+} CatalogMetadata;
+
+typedef struct {
     const Game *games[2];
+    const CatalogMetadata *metadata;
 } CatalogEntry;
 
 typedef struct {

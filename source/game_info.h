@@ -25,6 +25,7 @@ typedef struct {
 
 typedef struct {
     char page[CATALOG_URL];
+    char nintendo_life[CATALOG_URL];
     char title[CATALOG_TEXT];
     char heading[CATALOG_TEXT];
     char catalog_title[CATALOG_TEXT];
@@ -33,6 +34,9 @@ typedef struct {
     atomic_bool cancel;
 } GalleryJob;
 
+bool load_catalog_metadata(void);
+void free_catalog_metadata(void);
+void clean_catalog_title(char name[CATALOG_TEXT]);
 size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY]);
 bool read_game_metadata(GameMetadata *metadata, const char *title, const char *heading);
 void load_game_gallery(GalleryJob *job);

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "language.h"
 #include "install.h"
 
 #include <switch.h>
@@ -157,7 +158,7 @@ static void hex_id(char out[33], const void *id) {
 }
 
 static const char *service_error(FichierJob *job, const char *message, Result rc) {
-    snprintf(job->install_error, sizeof(job->install_error), "%s (0x%08x)", message, rc);
+    snprintf(job->install_error, sizeof(job->install_error), "%s (0x%08x)", tr(message), rc);
     return job->install_error;
 }
 

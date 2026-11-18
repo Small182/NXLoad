@@ -22,6 +22,7 @@
 #include "install.h"
 #include "storage.h"
 #include "settings.h"
+#include "language.h"
 #include "unpack.h"
 #include "updater.h"
 
@@ -54,15 +55,15 @@ typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
 typedef enum {
     SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG,
-    SETTINGS_NSROMS, SETTINGS_ROMSHQ, SETTINGS_THEME,
+    SETTINGS_NSROMS, SETTINGS_ROMSHQ, SETTINGS_THEME, SETTINGS_LANGUAGE,
     SETTINGS_REFRESH_CATALOG, SETTINGS_UPDATE, SETTINGS_ROWS
 } SettingRow;
 
 #define TAB_Y 96
 #define TAB_HEIGHT 41
 #define SETTINGS_Y 152
-#define SETTINGS_STEP 46
-#define SETTINGS_VISIBLE 9
+#define SETTINGS_STEP 41
+#define SETTINGS_VISIBLE 10
 #define TOP_Y 21
 #define TOP_HEIGHT 53
 #define SEARCH_X 929
@@ -224,6 +225,7 @@ static void rect(int x, int y, int w, int h, SDL_Color color) {
 
 static void aligned_text(TTF_Font *font, const char *str, int x, int y, int width,
                          SDL_Color color, int alignment) {
+    str = tr(str);
     if (!str || !*str || width <= 0) return;
     size_t slot = 0;
     for (size_t i = 0; i < TEXT_SLOTS; ++i) {
@@ -1106,10 +1108,10 @@ static void finish_jobs(void) {
             if (!app.queue_count && envHasNextLoad()) app.close = true;
         }
         if (app.active_transfer.app_update)
-            snprintf(app.update_notice, sizeof(app.update_notice), "%s", app.download.result);
+            snprintf(app.update_notice, sizeof(app.update_notice), "%s", tr(app.download.result));
         refresh_saved();
         if (app.queue_count && !app.active_transfer.app_update)
-            snprintf(app.notice, sizeof(app.notice), "Попереднє: %.170s", app.download.result);
+            snprintf(app.notice, sizeof(app.notice), tr("Попереднє: %.170s"), tr(app.download.result));
     }
     if (app.download_busy) {
         unsigned stage = transfer_stage();
@@ -1206,7 +1208,7 @@ static void choose_transfer(const DownloadRequest *request) {
 static void select_file_action(const GameFile *file) {
     DownloadRequest request = {.source = file->source};
     const char *title = app.active_metadata ? app.active_metadata->title : app.active_game.title;
-    snprintf(request.name, sizeof(request.name), "%.120s · %.64s", title, file->title);
+    snprintf(request.name, sizeof(request.name), "%.120s · %.64s", title, tr(file->title));
     strcpy(request.id, file->id);
     strcpy(request.url, file->source == FILE_ROMSHQ_SIGNED ? app.game_sources[CATALOG_ROMSHQ].page : file->url);
     choose_transfer(&request);
@@ -1216,9 +1218,9 @@ static bool keyboard(char *out, size_t capacity, const char *title, const char *
     SwkbdConfig config;
     if (R_FAILED(swkbdCreate(&config, 0))) return false;
     swkbdConfigMakePresetDefault(&config);
-    swkbdConfigSetHeaderText(&config, title);
-    swkbdConfigSetGuideText(&config, guide);
-    swkbdConfigSetOkButtonText(&config, button);
+    swkbdConfigSetHeaderText(&config, tr(title));
+    swkbdConfigSetGuideText(&config, tr(guide));
+    swkbdConfigSetOkButtonText(&config, tr(button));
     swkbdConfigSetInitialText(&config, out);
     swkbdConfigSetStringLenMax(&config, capacity - 1);
     char value[2048];
@@ -1452,6 +1454,7 @@ static void change_setting(size_t row, bool activate) {
         case SETTINGS_NSROMS: value = &app.settings.source_enabled[CATALOG_NSROMS]; break;
         case SETTINGS_ROMSHQ: value = &app.settings.source_enabled[CATALOG_ROMSHQ]; break;
         case SETTINGS_THEME: value = &app.settings.light_theme; break;
+        case SETTINGS_LANGUAGE: value = &app.settings.english; break;
         case SETTINGS_REFRESH_CATALOG:
             if (activate) {
                 refresh_catalogs();
@@ -1468,6 +1471,7 @@ static void change_setting(size_t row, bool activate) {
         app.settings_notice[0] = 0;
         app.background_check_at = 0;
         apply_theme();
+        set_english(app.settings.english);
         if (row == SETTINGS_NSROMS || row == SETTINGS_ROMSHQ) {
             app.file_index = 0;
             app.file_scroll = 0;
@@ -1622,7 +1626,7 @@ static void touch_tap(int x, int y) {
         } else if (x >= 180 && x < 1100 && y >= SETTINGS_Y) {
             size_t visible = (size_t)(y - SETTINGS_Y) / SETTINGS_STEP;
             size_t row = first_visible(app.settings_row, SETTINGS_VISIBLE) + visible;
-            if (visible < SETTINGS_VISIBLE && row < SETTINGS_ROWS && (y - SETTINGS_Y) % SETTINGS_STEP < 42) {
+            if (visible < SETTINGS_VISIBLE && row < SETTINGS_ROWS && (y - SETTINGS_Y) % SETTINGS_STEP < 38) {
                 app.settings_row = row;
                 change_setting(row, true);
             }
@@ -1976,7 +1980,10 @@ static void input(u64 buttons) {
         buttons = HidNpadButton_X;
     }
     if (buttons & HidNpadButton_B) {
-        app.genre_focus = true;
+        app.game_index = 0;
+        app.grid_scroll = 0;
+        app.prefetch_at = 0;
+        app.genre_focus = false;
         app.top_focus = TOP_NONE;
         return;
     }
@@ -2105,14 +2112,14 @@ static void draw_library(void) {
              48, 176, 790, gray);
     }
     char count[192];
-    snprintf(count, sizeof(count), "Всього ігор: %zu", app.entry_count);
+    snprintf(count, sizeof(count), tr("Всього ігор: %zu"), app.entry_count);
     text(app.small, count, 40, 631, 300, gray);
     if (app.genre || app.favorites_open) {
-        snprintf(count, sizeof(count), "%s: %zu", app.favorites_open ? "Вибране" : genre_names[app.genre], app.genre_count);
+        snprintf(count, sizeof(count), "%s: %zu", tr(app.favorites_open ? "Вибране" : genre_names[app.genre]), app.genre_count);
         text(app.small, count, 340, 631, 340, gray);
     }
     if (app.query[0]) {
-        snprintf(count, sizeof(count), "Знайдено: %zu", app.game_count);
+        snprintf(count, sizeof(count), tr("Знайдено: %zu"), app.game_count);
         text(app.small, count, (app.genre || app.favorites_open) ? 700 : 340, 631, 230, gray);
     }
     right_text(app.small, sort_names[app.sort], 1000, 621, 240, blue);
@@ -2122,7 +2129,7 @@ static void draw_settings(void) {
     static const char *const labels[] = {
         "Дія з файлом за замовчуванням", "Видаляти RAR після розпакування",
         "Видаляти NSP після встановлення", "Щоденне оновлення каталогів",
-        "Джерело NSRoms", "Джерело ROMsHQ", "Тема",
+        "Джерело NSRoms", "Джерело ROMsHQ", "Тема", "Мова",
         "Оновити каталоги зараз", "Перевірити оновлення NXLoad",
     };
     const char *const on = "Увімкнено", *const off = "Вимкнено";
@@ -2132,13 +2139,14 @@ static void draw_settings(void) {
         app.settings.auto_catalog ? on : off,
         app.settings.source_enabled[CATALOG_NSROMS] ? on : off,
         app.settings.source_enabled[CATALOG_ROMSHQ] ? on : off,
-        app.settings.light_theme ? "Світла" : "Темна", "", "",
+        app.settings.light_theme ? "Світла" : "Темна",
+        app.settings.english ? "English" : "Українська", "", "",
     };
     text(app.large, "Налаштування", 195, 89, 920, white);
     size_t first = first_visible(app.settings_row, SETTINGS_VISIBLE);
     for (size_t i = first; i < SETTINGS_ROWS && i < first + SETTINGS_VISIBLE; ++i) {
         int y = SETTINGS_Y + (int)(i - first) * SETTINGS_STEP;
-        rect(180, y, 920, 42, i == app.settings_row ? selected : panel);
+        rect(180, y, 920, 38, i == app.settings_row ? selected : panel);
         text(app.normal, labels[i], 195, y + 9, 560, white);
         if (*values[i])
             right_text(app.small, values[i], 755, y + 12, 330, i == app.settings_row ? blue : gray);
@@ -2148,13 +2156,13 @@ static void draw_settings(void) {
         unsigned page = app.index_busy ? atomic_load(&app.index_job.page) : 0;
         unsigned pages = app.index_busy ? atomic_load(&app.index_job.pages) : 0;
         if (app.download_busy) strcpy(status, "Оновлення каталогів чекає завершення завантаження");
-        else if (pages) snprintf(status, sizeof(status), "Оновлення каталогів · %u / %u", page, pages);
+        else if (pages) snprintf(status, sizeof(status), tr("Оновлення каталогів · %u / %u"), page, pages);
         else strcpy(status, "Оновлення каталогів…");
         text(app.small, status, 195, 566, 895, gray);
     } else if (app.index_notice[0][0] || app.index_notice[1][0]) {
         char status[2 * CATALOG_TEXT + 8];
-        snprintf(status, sizeof(status), "%s%s%s", app.index_notice[0],
-                 app.index_notice[0][0] && app.index_notice[1][0] ? "  ·  " : "", app.index_notice[1]);
+        snprintf(status, sizeof(status), "%s%s%s", tr(app.index_notice[0]),
+                 app.index_notice[0][0] && app.index_notice[1][0] ? "  ·  " : "", tr(app.index_notice[1]));
         text(app.small, status, 195, 566, 895, gray);
     }
     const char *update = app.update_ready ? "NXLoad оновиться під час виходу" :
@@ -2170,9 +2178,9 @@ static void draw_filters(void) {
     rect(226, 165, 828, 3, blue);
     text(app.large, "Сортування та жанри", 253, 190, 780, white);
     char line[192];
-    snprintf(line, sizeof(line), "Порядок     ‹  %s  ›", sort_names[app.draft_sort]);
+    snprintf(line, sizeof(line), tr("Порядок     ‹  %s  ›"), tr(sort_names[app.draft_sort]));
     row(0, app.filter_row, 253, 270, 774, line);
-    snprintf(line, sizeof(line), "Жанр        ‹  %s  ›", genre_names[app.draft_genre]);
+    snprintf(line, sizeof(line), tr("Жанр        ‹  %s  ›"), tr(genre_names[app.draft_genre]));
     row(1, app.filter_row, 253, 327, 774, line);
     text(app.small, "← / →  Змінити", 263, 417, 747, gray);
     text(app.small, "A  Застосувати", 263, 458, 386, blue);
@@ -2185,19 +2193,19 @@ static void draw_cover(void) {
     fit_cover(cover, 56, 127, 308, 308);
     unsigned rating = app.active_metadata ? app.active_metadata->rating : 0;
     char score[48] = "Рейтинг · —";
-    if (rating) snprintf(score, sizeof(score), "Рейтинг · %u.%u / 10", rating / 10, rating % 10);
+    if (rating) snprintf(score, sizeof(score), tr("Рейтинг · %u.%u / 10"), rating / 10, rating % 10);
     text(app.small, score, 65, 460, 293, blue);
     char release[48];
     unsigned date = app.active_metadata ? app.active_metadata->released : 0;
     if (app.metadata.released[0])
-        snprintf(release, sizeof(release), "Дата виходу · %s", app.metadata.released);
+        snprintf(release, sizeof(release), tr("Дата виходу · %s"), app.metadata.released);
     else if (date)
-        snprintf(release, sizeof(release), "Дата виходу · %04u-%02u-%02u",
+        snprintf(release, sizeof(release), tr("Дата виходу · %04u-%02u-%02u"),
                  date / 10000, date / 100 % 100, date % 100);
     else strcpy(release, "Дата виходу · —");
     text(app.small, release, 65, 493, 293, gray);
     char developer[CATALOG_TEXT + 32];
-    snprintf(developer, sizeof(developer), "Розробник · %s",
+    snprintf(developer, sizeof(developer), tr("Розробник · %s"),
              app.metadata.developer[0] ? app.metadata.developer : "—");
     text(app.small, developer, 65, 526, 293, gray);
 }
@@ -2252,7 +2260,7 @@ static void draw_game_screenshots(void) {
     }
     if (!app.fullscreen_shot) {
         char count[72];
-        snprintf(count, sizeof(count), "L / R   %zu / %zu     A  На весь екран",
+        snprintf(count, sizeof(count), tr("L / R   %zu / %zu     A  На весь екран"),
                  app.screenshot_index + 1, app.gallery.count);
         text(app.small, count, 430, 604, 769, blue);
     }
@@ -2324,38 +2332,38 @@ static void draw_downloads(void) {
         uint64_t have = atomic_load(&app.download.received), total = atomic_load(&app.download.total);
         double percent = total ? SDL_min(100.0, 100.0 * have / total) : 0;
         char line[192];
-        text(app.normal, app.active_transfer.name, 66, 182, 825, white);
+        text(app.normal, tr(app.active_transfer.name), 66, 182, 825, white);
         rect(66, 225, 1148, 8, selected);
         rect(66, 225, (int)(1148 * percent / 100.0), 8, blue);
         if (stage == 2) {
             if (total)
-                snprintf(line, sizeof(line), "Встановлення на microSD · %.1f%% · %.1f / %.1f МіБ",
+                snprintf(line, sizeof(line), tr("Встановлення на microSD · %.1f%% · %.1f / %.1f МіБ"),
                          percent, have / 1048576.0, total / 1048576.0);
             else strcpy(line, "Перевірка пакета NSP…");
         } else if (stage == 1) {
-            snprintf(line, sizeof(line), "Розпакування RAR · %.1f / %.1f МіБ", have / 1048576.0, total / 1048576.0);
+            snprintf(line, sizeof(line), tr("Розпакування RAR · %.1f / %.1f МіБ"), have / 1048576.0, total / 1048576.0);
         } else if (app.download_busy && total) {
-            snprintf(line, sizeof(line), "%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с",
+            snprintf(line, sizeof(line), tr("%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с"),
                      percent, have / 1048576.0, total / 1048576.0, app.speed / 1048576.0);
         } else if (app.download_busy && have) {
-            snprintf(line, sizeof(line), "%.1f МіБ  ·  %.1f МіБ/с", have / 1048576.0, app.speed / 1048576.0);
+            snprintf(line, sizeof(line), tr("%.1f МіБ  ·  %.1f МіБ/с"), have / 1048576.0, app.speed / 1048576.0);
         } else if (app.download_busy) {
             strcpy(line, app.active_transfer.app_update ? "Отримання файлу оновлення…" : "Запит адреси файлу…");
         } else if (!strcmp(app.download.result, "Download saved")) {
-            snprintf(line, sizeof(line), "Збережено · %.1f МіБ · середня %.1f МіБ/с",
+            snprintf(line, sizeof(line), tr("Збережено · %.1f МіБ · середня %.1f МіБ/с"),
                      have / 1048576.0, app.download.avg_speed / 1048576.0);
         } else if (atomic_load(&app.download.installing) || atomic_load(&app.download.unpacking) ||
                    app.active_transfer.install_local || app.active_transfer.install_after_download || app.active_transfer.app_update) {
-            snprintf(line, sizeof(line), "%s", app.download.result);
+            snprintf(line, sizeof(line), "%s", tr(app.download.result));
         } else {
-            snprintf(line, sizeof(line), "%s  ·  API HTTP %ld  ·  Файл HTTP %ld",
-                     app.download.result, app.download.api_http, app.download.http);
+            snprintf(line, sizeof(line), tr("%s  ·  API HTTP %ld  ·  Файл HTTP %ld"),
+                     tr(app.download.result), app.download.api_http, app.download.http);
         }
         text(app.small, line, 66, 249, 815, blue);
         if (app.download_busy && have < total && app.speed > 0 && app.speed_stage == stage) {
             uint64_t seconds = (uint64_t)SDL_min(359999.0, (total - have) / app.speed + 0.99);
             char eta[80];
-            snprintf(eta, sizeof(eta), "Залишилось %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64,
+            snprintf(eta, sizeof(eta), tr("Залишилось %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64),
                      seconds / 3600, seconds / 60 % 60, seconds % 60);
             right_text(app.small, eta, 889, 249, 325, blue);
         }
@@ -2365,7 +2373,7 @@ static void draw_downloads(void) {
     rect(650, 298, 1, 288, selected);
     text(app.normal, "Збережені файли", 66, 293, 560, app.queue_focus ? gray : white);
     char queue_title[80];
-    snprintf(queue_title, sizeof(queue_title), "У черзі · %zu", app.queue_count);
+    snprintf(queue_title, sizeof(queue_title), tr("У черзі · %zu"), app.queue_count);
     text(app.normal, queue_title, 677, 293, 537, app.queue_focus ? white : gray);
     size_t first = first_visible(app.saved_index, FILE_ROWS);
     for (size_t i = first; i < app.saved_count && i < first + FILE_ROWS; ++i)
@@ -2375,7 +2383,7 @@ static void draw_downloads(void) {
     for (size_t i = first; i < app.queue_count && i < first + FILE_ROWS; ++i) {
         if (app.queue[i].install_after_download) {
             char label[CATALOG_TEXT];
-            snprintf(label, sizeof(label), "↓ + Встановити · %.145s", app.queue[i].name);
+            snprintf(label, sizeof(label), tr("↓ + Встановити · %.145s"), tr(app.queue[i].name));
             row(i, app.queue_focus ? app.queue_index : SIZE_MAX, 677,
                 332 + (int)(i - first) * 46, 537, label);
         } else {
@@ -2391,7 +2399,7 @@ static void draw_downloads(void) {
 
 static void draw_update_dialog(void) {
     char line[112];
-    snprintf(line, sizeof(line), "Збірка %" PRIu64 " · %.8s",
+    snprintf(line, sizeof(line), tr("Збірка %" PRIu64 " · %.8s"),
              app.update_check.build.run, app.update_check.build.sha);
     rect(190, 200, 900, 305, selected);
     text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
@@ -2422,7 +2430,7 @@ static void draw(void) {
     else if (app.screen == GAME) draw_game();
     else draw_downloads();
     if (app.screen == LIBRARY) {
-        text(app.small, "A  Відкрити    B  Розділи    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування",
+        text(app.small, "A  Відкрити    B  На початок    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування",
              40, 665, 1200, gray);
     } else if (app.screen == GAME) {
         text(app.small, "← / →  Вкладки    Y  Вибране    B  Назад    ↑  Верхнє меню    −  Налаштування",
@@ -2447,7 +2455,9 @@ static void draw(void) {
         rect(190, 200, 900, 305, selected);
         text(app.large, "Відкрити встановлювач DBI?", 224, 230, 828, white);
         text(app.normal, app.saved[app.saved_index].file, 224, 298, 828, white);
-        text(app.small, "У DBI відкрий Browse SD Card → " NXLOAD_DOWNLOAD_RELATIVE, 224, 355, 828, gray);
+        char dbi_guide[148];
+        snprintf(dbi_guide, sizeof(dbi_guide), "%s%s", tr("У DBI відкрий Browse SD Card → "), NXLOAD_DOWNLOAD_RELATIVE);
+        text(app.small, dbi_guide, 224, 355, 828, gray);
         text(app.normal, "A  Відкрити DBI", 224, 428, 396, blue);
         text(app.normal, "B  Назад", 656, 428, 390, gray);
     } else if (app.delete_file[0]) {
@@ -2516,6 +2526,7 @@ int main(int argc, char **argv) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
         app.settings = load_settings();
         apply_theme();
+        set_english(app.settings.english);
         load_favorites();
         load_catalog_metadata();
         open_catalogs();

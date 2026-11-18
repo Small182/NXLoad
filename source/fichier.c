@@ -2,6 +2,7 @@
 #include "fichier.h"
 #include "range.h"
 #include "storage.h"
+#include "language.h"
 #include "unpack.h"
 
 #include <curl/curl.h>
@@ -1011,14 +1012,14 @@ void fichier_download(FichierJob *job) {
                 strcpy(url, next);
                 job->result = "Забагато перенаправлень до файлу";
                 snprintf(job->tls_detail, sizeof(job->tls_detail),
-                         "Перенаправлення на %.91s", destination_host);
+                         tr("Перенаправлення на %.91s"), destination_host);
                 continue;
             }
             if (location) {
                 char ignored[URL_CAPACITY], target_host[128] = {0};
                 if (resolve_download_redirect(url, location, ignored, target_host))
                     snprintf(job->tls_detail, sizeof(job->tls_detail),
-                             "Перенаправлення зупинено: %.78s", target_host);
+                             tr("Перенаправлення зупинено: %.78s"), target_host);
                 else
                     strcpy(job->tls_detail, "Небезпечне або непідтримуване перенаправлення");
             }

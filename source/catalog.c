@@ -2,6 +2,7 @@
 #include "catalog.h"
 #include "game_info.h"
 #include "storage.h"
+#include "language.h"
 
 #include <ctype.h>
 #include <curl/curl.h>
@@ -629,9 +630,9 @@ static void load_details(CatalogJob *job) {
         xmlFreeDoc(doc);
     } else {
         if (status.curl)
-            snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна · cURL %d", status.curl);
+            snprintf(job->error, sizeof(job->error), tr("Сторінка гри недоступна · cURL %d"), status.curl);
         else
-            snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна · HTTP %ld", status.http);
+            snprintf(job->error, sizeof(job->error), tr("Сторінка гри недоступна · HTTP %ld"), status.http);
     }
 }
 
@@ -800,11 +801,11 @@ void catalog_build_index(CatalogIndexJob *job) {
         if (!loaded) {
             if (!pages && page > 1 && status.http == 404) job->complete = true;
             else if (status.curl == CURLE_PEER_FAILED_VERIFICATION)
-                snprintf(job->error, sizeof(job->error), "Стор. %u · TLS 60 · X.509 0x%lX", page, status.verify);
+                snprintf(job->error, sizeof(job->error), tr("Стор. %u · TLS 60 · X.509 0x%lX"), page, status.verify);
             else if (status.curl)
-                snprintf(job->error, sizeof(job->error), "Сторінка %u · cURL %d", page, status.curl);
+                snprintf(job->error, sizeof(job->error), tr("Сторінка %u · cURL %d"), page, status.curl);
             else
-                snprintf(job->error, sizeof(job->error), "Сторінка %u · HTTP %ld", page, status.http);
+                snprintf(job->error, sizeof(job->error), tr("Сторінка %u · HTTP %ld"), page, status.http);
             break;
         }
 
@@ -821,7 +822,7 @@ void catalog_build_index(CatalogIndexJob *job) {
 
         if (job->index.count == previous) {
             if (previous && !pages) job->complete = true;
-            else snprintf(job->error, sizeof(job->error), "Каталог · немає ігор на сторінці %u", page);
+            else snprintf(job->error, sizeof(job->error), tr("Каталог · немає ігор на сторінці %u"), page);
             break;
         }
         if (pages && page >= pages) {

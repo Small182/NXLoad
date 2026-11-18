@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "language.h"
 #include "game_info.h"
 
 #include <curl/curl.h>
@@ -495,7 +496,7 @@ void load_game_gallery(GalleryJob *job) {
         titledb_gallery(job);
         if (!job->result.count && !atomic_load(&job->cancel))
             snprintf(job->result.issue, sizeof(job->result.issue),
-                     "Галерея Nintendo Life недоступна · HTTP %ld", status.http);
+                     tr("Галерея Nintendo Life недоступна · HTTP %ld"), status.http);
         return;
     }
     char slugs[2][CATALOG_TEXT] = {{0}};

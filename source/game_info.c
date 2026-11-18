@@ -197,81 +197,63 @@ static const CatalogMetadata *find_catalog_metadata(const Game *game) {
 
 typedef struct {
     char key[CATALOG_TEXT];
+    const CatalogMetadata *metadata;
     size_t index;
     CatalogSource source;
 } MergeKey;
 
 static int compare_merge_key(const void *a, const void *b) {
-    return strcmp(((const MergeKey *)a)->key, ((const MergeKey *)b)->key);
-}
-
-static void merge_matches(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY],
-                          MergeKey *keys, bool *matched, bool platform_suffix) {
-    size_t count = 0;
-    // Include established matches when checking ambiguity, so remaining records cannot
-    // get paired against the wrong edition after the first pass.
-    for (unsigned source = 0; source < 2; ++source) {
-        for (size_t i = 0; i < indexes[source].count; ++i) {
-            char title[CATALOG_TEXT];
-            strcpy(title, indexes[source].games[i].title);
-            clean_heading(title);
-            if (platform_suffix && source == CATALOG_NSROMS) {
-                char stripped[CATALOG_TEXT];
-                strcpy(stripped, title);
-                if (remove_suffix(stripped, "nintendo switch") || remove_suffix(stripped, "switch")) {
-                    if (strpbrk(stripped, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"))
-                        strcpy(title, stripped);
-                }
-            }
-            MergeKey *key = &keys[count];
-            title_key(key->key, title);
-            if (!key->key[0]) continue;
-            key->index = i;
-            key->source = (CatalogSource)source;
-            ++count;
-        }
-    }
-    qsort(keys, count, sizeof(*keys), compare_merge_key);
-    for (size_t start = 0; start < count;) {
-        size_t end = start + 1;
-        while (end < count && !strcmp(keys[start].key, keys[end].key)) ++end;
-        if (end - start == 2 && keys[start].source != keys[start + 1].source) {
-            const MergeKey *left = &keys[start], *right = &keys[start + 1];
-            if (left->source == CATALOG_ROMSHQ) {
-                const MergeKey *tmp = left;
-                left = right;
-                right = tmp;
-            }
-            if (!entries[left->index].games[CATALOG_ROMSHQ] && !matched[right->index]) {
-                entries[left->index].games[CATALOG_ROMSHQ] = &indexes[CATALOG_ROMSHQ].games[right->index];
-                matched[right->index] = true;
-            }
-        }
-        start = end;
-    }
+    const MergeKey *left = a, *right = b;
+    int order = strcmp(left->key, right->key);
+    if (order) return order;
+    if (left->source != right->source) return (int)left->source - (int)right->source;
+    return (left->index > right->index) - (left->index < right->index);
 }
 
 size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY]) {
-    size_t count = indexes[CATALOG_NSROMS].count;
-    size_t other = indexes[CATALOG_ROMSHQ].count;
-    for (size_t i = 0; i < count; ++i)
-        entries[i] = (CatalogEntry){.games = {&indexes[CATALOG_NSROMS].games[i], NULL}};
-    bool *matched = other ? calloc(other, sizeof(*matched)) : NULL;
-    MergeKey *keys = count && matched ? malloc((count + other) * sizeof(*keys)) : NULL;
-    if (keys) {
-        merge_matches(indexes, entries, keys, matched, false);
-        merge_matches(indexes, entries, keys, matched, true);
+    size_t total = indexes[CATALOG_NSROMS].count + indexes[CATALOG_ROMSHQ].count;
+    if (!total) return 0;
+    MergeKey *keys = malloc(total * sizeof(*keys));
+    size_t count = 0;
+    for (unsigned source = 0; source < 2; ++source) {
+        for (size_t i = 0; i < indexes[source].count; ++i) {
+            const Game *game = &indexes[source].games[i];
+            const CatalogMetadata *metadata = find_catalog_metadata(game);
+            if (!keys) {
+                CatalogEntry *entry = &entries[count++];
+                *entry = (CatalogEntry){.metadata = metadata};
+                entry->games[source] = game;
+                continue;
+            }
+            MergeKey *key = &keys[count++];
+            key->index = i;
+            key->source = (CatalogSource)source;
+            key->metadata = metadata;
+            if (metadata) {
+                title_key(key->key, metadata->title);
+            } else {
+                char title[CATALOG_TEXT];
+                strcpy(title, game->title);
+                clean_catalog_title(title);
+                title_key(key->key, title);
+            }
+        }
     }
-    for (size_t i = 0; i < other; ++i)
-        if (!matched || !matched[i])
-            entries[count++] = (CatalogEntry){.games = {NULL, &indexes[CATALOG_ROMSHQ].games[i]}};
-    for (size_t i = 0; i < count; ++i) {
-        const CatalogMetadata *a = find_catalog_metadata(entries[i].games[CATALOG_NSROMS]);
-        const CatalogMetadata *b = find_catalog_metadata(entries[i].games[CATALOG_ROMSHQ]);
-        entries[i].metadata = !a || (b && !a->nintendo_life[0] && b->nintendo_life[0]) ? b : a;
+    if (!keys) return count;
+    qsort(keys, total, sizeof(*keys), compare_merge_key);
+    count = 0;
+    for (size_t i = 0; i < total; ++i) {
+        const MergeKey *key = &keys[i];
+        if (!i || !key->key[0] || strcmp(key->key, keys[i - 1].key))
+            entries[count++] = (CatalogEntry){0};
+        CatalogEntry *entry = &entries[count - 1];
+        if (!entry->games[key->source])
+            entry->games[key->source] = &indexes[key->source].games[key->index];
+        if (key->metadata && (!entry->metadata ||
+             (!entry->metadata->nintendo_life[0] && key->metadata->nintendo_life[0])))
+            entry->metadata = key->metadata;
     }
     free(keys);
-    free(matched);
     return count;
 }
 

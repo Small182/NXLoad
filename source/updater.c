@@ -204,6 +204,10 @@ static bool read_token(char token[512]) {
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") == n;
 }
 
+bool update_configured(void) {
+    return !access(TOKEN_PATH, R_OK);
+}
+
 static bool zip_digest(Response *r, const char *expected) {
     const char hex[] = "0123456789abcdef";
     unsigned char bytes[SHA256_HASH_SIZE];

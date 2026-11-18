@@ -20,6 +20,7 @@
 #include "game_info.h"
 #include "install.h"
 #include "storage.h"
+#include "settings.h"
 #include "unpack.h"
 #include "updater.h"
 
@@ -29,28 +30,45 @@
 #define GRID_X 40
 #define GRID_Y 159
 #define GRID_STEP_X 202
-#define GRID_STEP_Y 225
+#define GRID_STEP_Y 219
 #define GRID_WIDTH 190
-#define GRID_HEIGHT 214
+#define GRID_HEIGHT 190
 #define FILE_ROWS 5
 #define HISTORY_LIMIT 96
 #define COVER_SLOTS 36
 #define COVER_WORKERS 3
-#define GRID_ART_SIZE 160
+#define GRID_THUMB_SIZE 180
 #define DOWNLOAD_QUEUE_LIMIT 24
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
-typedef enum { GAME_OVERVIEW, GAME_SCREENSHOTS, GAME_FILES } GameTab;
-typedef enum { SORT_NAME, SORT_RELEASE, SORT_RATING, SORT_COUNT } SortMode;
+typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
+typedef enum {
+    SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG, SETTINGS_AUTO_UPDATE,
+    SETTINGS_REFRESH_CATALOG, SETTINGS_UPDATE, SETTINGS_ROWS
+} SettingRow;
 
-static const char *const sort_names[] = {"За алфавітом", "За датою виходу", "За рейтингом"};
+#define TAB_Y 96
+#define TAB_HEIGHT 41
+#define SETTINGS_Y 152
+#define SETTINGS_STEP 59
+#define TOP_Y 21
+#define TOP_HEIGHT 53
+#define SEARCH_X 929
+#define DOWNLOADS_X 1108
+#define SETTINGS_X 1175
+#define TOP_END 1240
+typedef enum { GAME_OVERVIEW, GAME_SCREENSHOTS, GAME_FILES } GameTab;
+typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
+
+static const char *const sort_names[] = {"За рейтингом", "За алфавітом", "За датою виходу"};
 static const char *const genre_names[] = {
     "Усі жанри", "Екшн", "Пригоди", "Аркада", "Настільні", "Освітні", "Файтинг",
-    "Шутер від першої особи", "Музика", "Для вечірок", "Платформер", "Головоломка",
-    "Перегони", "RPG", "Шутер", "Симуляція", "Спорт", "Стратегія", "Інше",
+    "Шутер від першої особи", "Музика", "Для вечірок", "Платформер", "Головоломки",
+    "Гонки", "RPG", "Шутер", "Симуляція", "Спорт", "Стратегія", "Інше",
 };
 #define GENRE_COUNT (sizeof(genre_names) / sizeof(genre_names[0]))
 static const size_t genre_tabs[] = {0, 1, 2, 13, 11, 12, 17};
+static const int tab_widths[] = {156, 156, 156, 156, 192, 156, 156};
 #define TAB_COUNT (sizeof(genre_tabs) / sizeof(genre_tabs[0]))
 
 typedef struct {
@@ -60,7 +78,7 @@ typedef struct {
 typedef struct {
     char name[CATALOG_TEXT], url[2048], id[DLARCHIVE_ID_CAPACITY];
     GameFileSource source;
-    bool unpack, install_local, install_after_download, app_update;
+    bool unpack, install_local, install_after_download, app_update, background;
 } DownloadRequest;
 
 typedef struct {
@@ -89,9 +107,14 @@ typedef struct {
     Screen screen, previous;
     size_t rows[MERGED_CAPACITY];
     size_t game_count, game_index, file_index, saved_count, saved_index;
-    SortMode sort, draft_sort;
+    SortMode sort, draft_sort, genre_sort[GENRE_COUNT];
+    bool filter_sort_changed;
     size_t genre, draft_genre, filter_row;
-    bool filters_open, genre_focus;
+    bool filters_open, genre_focus, settings_open;
+    TopFocus top_focus;
+    size_t settings_row;
+    Settings settings;
+    uint64_t background_check_at;
     CatalogIndex catalogs[2];
     CatalogEntry entries[MERGED_CAPACITY];
     size_t entry_count;
@@ -101,7 +124,7 @@ typedef struct {
     unsigned refresh_waiting;
     CatalogSource file_source;
     bool file_source_chosen, romshq_candidate;
-    char index_notice[2][CATALOG_TEXT];
+    char index_notice[2][CATALOG_TEXT], settings_notice[192], update_notice[192];
     Game active_game, game_sources[2];
     const CatalogMetadata *active_metadata;
     GameTab game_tab;
@@ -176,6 +199,59 @@ static void text(TTF_Font *font, const char *str, int x, int y, int width, SDL_C
     SDL_FreeSurface(surface);
 }
 
+static void centered_text(TTF_Font *font, const char *label, int x, int y, int width, SDL_Color color) {
+    int pixels = 0;
+    TTF_SizeUTF8(font, label, &pixels, NULL);
+    int offset = SDL_max(0, (width - pixels) / 2);
+    text(font, label, x + offset, y, width - offset, color);
+}
+
+static void icon_circle(int x, int y, int radius, int thickness, SDL_Color color) {
+    int inner = radius - thickness;
+    SDL_SetRenderDrawColor(app.renderer, color.r, color.g, color.b, color.a);
+    for (int dy = -radius; dy <= radius; ++dy) {
+        int outer = radius;
+        while (outer * outer + dy * dy > radius * radius) --outer;
+        int hole = inner;
+        while (hole >= 0 && hole * hole + dy * dy >= inner * inner) --hole;
+        if (hole < 0) {
+            SDL_RenderDrawLine(app.renderer, x - outer, y + dy, x + outer, y + dy);
+        } else {
+            SDL_RenderDrawLine(app.renderer, x - outer, y + dy, x - hole - 1, y + dy);
+            SDL_RenderDrawLine(app.renderer, x + hole + 1, y + dy, x + outer, y + dy);
+        }
+    }
+}
+
+static void draw_header(void) {
+    const bool focused = app.screen == LIBRARY && !app.settings_open;
+    if (focused && app.top_focus == TOP_SEARCH) rect(SEARCH_X, TOP_Y, 163, TOP_HEIGHT, selected);
+    if (focused && app.top_focus == TOP_DOWNLOADS)
+        rect(DOWNLOADS_X, TOP_Y, 57, TOP_HEIGHT, selected);
+    if ((focused && app.top_focus == TOP_SETTINGS) || app.settings_open)
+        rect(SETTINGS_X, TOP_Y, TOP_END - SETTINGS_X, TOP_HEIGHT, selected);
+
+    if (app.screen == LIBRARY && !app.settings_open) {
+        icon_circle(SEARCH_X + 19, 42, 8, 2, white);
+        for (int i = 0; i < 3; ++i)
+            SDL_RenderDrawLine(app.renderer, SEARCH_X + 24 + i, 47, SEARCH_X + 30 + i, 53);
+        text(app.normal, "Пошук", SEARCH_X + 44, 32, 105, white);
+    } else {
+        text(app.normal, "‹ Назад", SEARCH_X + 10, 32, 150, white);
+    }
+    const int arrow_x = DOWNLOADS_X + 28, arrow_y = 34;
+    rect(arrow_x - 4, arrow_y, 9, 16, white);
+    for (int i = 0; i < 13; ++i) rect(arrow_x - 12 + i, arrow_y + 14 + i, 25 - 2 * i, 1, white);
+
+    const int gear_x = SETTINGS_X + 31, gear_y = 47;
+    static const SDL_Point teeth[] = {{0,-11}, {8,-8}, {11,0}, {8,8},
+                                      {0,11}, {-8,8}, {-11,0}, {-8,-8}};
+    icon_circle(gear_x, gear_y, 11, 6, white);
+    for (size_t i = 0; i < sizeof(teeth) / sizeof(teeth[0]); ++i)
+        rect(gear_x + teeth[i].x - 2, gear_y + teeth[i].y - 2, 5, 5, white);
+    if (app.update_ready) icon_circle(gear_x + 16, gear_y - 14, 4, 4, blue);
+}
+
 static void row(size_t i, size_t cursor, int x, int y, int width, const char *label) {
     if (i == cursor) {
         rect(x, y, width, 42, selected);
@@ -215,6 +291,7 @@ static void download_worker(void *arg) {
         if (atomic_load(&job->cancelled) || strcmp(job->result, "Download saved")) return;
         path = job->path;
     }
+    bool rar_delete_failed = false, nsp_delete_failed = false;
     if (job->local_unpack || rar_name(path) || rar_signature(path)) {
         UnpackedPackages packages = {0};
         const char *error = unpack_rar(job, path, NXLOAD_DOWNLOAD_DIR,
@@ -223,8 +300,9 @@ static void download_worker(void *arg) {
             job->result = error;
             return;
         }
-        job->result = unlink(path) ? "RAR розпаковано · не вдалося видалити архів" :
-                                    "RAR розпаковано · архів видалено";
+        rar_delete_failed = job->delete_rar && unlink(path) != 0;
+        job->result = rar_delete_failed ? "RAR розпаковано · не вдалося видалити архів" :
+                      job->delete_rar ? "RAR розпаковано · архів видалено" : "RAR розпаковано · архів збережено";
         if (!job->install_after_download) return;
         for (size_t i = 0; i < packages.count; ++i) {
             if (!nsp_name(packages.paths[i])) {
@@ -233,11 +311,12 @@ static void download_worker(void *arg) {
             }
         }
         for (size_t i = 0; i < packages.count; ++i) {
-            const char *install_error = install_nsp(job, packages.paths[i]);
-            if (install_error) {
-                job->result = install_error;
+            error = install_nsp(job, packages.paths[i]);
+            if (error) {
+                job->result = error;
                 return;
             }
+            if (job->delete_nsp && unlink(packages.paths[i])) nsp_delete_failed = true;
         }
     } else if (job->install_after_download || job->local_install) {
         if (!nsp_name(path) && !nsp_signature(path)) {
@@ -249,10 +328,13 @@ static void download_worker(void *arg) {
             job->result = error;
             return;
         }
+        nsp_delete_failed = job->delete_nsp && unlink(path) != 0;
     } else {
         return;
     }
-    job->result = "Встановлено на microSD · NSP збережено";
+    job->result = rar_delete_failed || nsp_delete_failed ?
+        "Встановлено на microSD · не всі файли вдалося видалити" :
+        job->delete_nsp ? "Встановлено на microSD · NSP видалено" : "Встановлено на microSD · NSP збережено";
 }
 
 static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
@@ -354,7 +436,15 @@ static void start_next_index(void) {
     app.show_partial_index = app.catalogs[source].count == 0;
     app.index_notice[source][0] = 0;
     app.index_busy = start_worker(&app.index_thread, index_worker, job);
-    if (!app.index_busy) strcpy(app.index_notice[source], "Не вдалося запустити оновлення");
+    if (!app.index_busy) {
+        strcpy(app.index_notice[source], "Не вдалося запустити оновлення");
+    } else {
+        time_t now = time(NULL);
+        if (now > 0) {
+            app.settings.catalog_checked[source] = now;
+            save_settings(&app.settings);
+        }
+    }
 }
 
 static void refresh_catalogs(void) {
@@ -654,15 +744,22 @@ static void remake_catalog(void) {
     rebuild_view(keep[0] ? keep : NULL);
 }
 
-static void open_catalogs(void) {
-    time_t now = time(NULL);
+static void schedule_daily_catalogs(time_t now) {
+    if (!app.settings.auto_catalog) return;
     for (unsigned source = 0; source < 2; ++source) {
-        CatalogIndex *index = &app.catalogs[source];
-        bool cached = catalog_read_cache(index, (CatalogSource)source);
-        if (!cached || now < index->saved_at || now - index->saved_at >= CATALOG_CACHE_TTL)
+        if (app.index_busy && app.index_job.source == (CatalogSource)source) continue;
+        time_t cached = app.catalogs[source].saved_at;
+        time_t checked = app.settings.catalog_checked[source];
+        if (daily_check_due(now, cached) && daily_check_due(now, checked))
             app.refresh_waiting |= 1u << source;
     }
+}
+
+static void open_catalogs(void) {
+    for (unsigned source = 0; source < 2; ++source)
+        catalog_read_cache(&app.catalogs[source], (CatalogSource)source);
     remake_catalog();
+    schedule_daily_catalogs(time(NULL));
     start_next_index();
 }
 
@@ -734,8 +831,10 @@ static void finish_jobs(void) {
         app.download_busy = false;
         app.download_finished = true;
         if (app.download.update_staged) app.update_ready = true;
+        if (app.active_transfer.app_update)
+            snprintf(app.update_notice, sizeof(app.update_notice), "%s", app.download.result);
         refresh_saved();
-        if (app.queue_count)
+        if (app.queue_count && !app.active_transfer.background)
             snprintf(app.notice, sizeof(app.notice), "Попереднє: %.170s", app.download.result);
     }
     if (app.download_busy && SDL_GetTicks64() - app.speed_time >= 500) {
@@ -778,6 +877,8 @@ static void launch_next_transfer(void) {
     job->local_install = request->install_local;
     job->install_after_download = request->install_after_download;
     job->app_update = request->app_update;
+    job->delete_rar = app.settings.delete_rar;
+    job->delete_nsp = app.settings.delete_nsp;
     app.speed_time = SDL_GetTicks64();
     app.previous_bytes = 0;
     app.speed = 0;
@@ -786,6 +887,12 @@ static void launch_next_transfer(void) {
     if (!app.download_busy) {
         job->result = "Не вдалося запустити операцію";
         app.download_finished = true;
+    } else if (request->app_update) {
+        time_t now = time(NULL);
+        if (now > 0) {
+            app.settings.update_checked = now;
+            save_settings(&app.settings);
+        }
     }
 }
 
@@ -802,16 +909,19 @@ static const char *enqueue_transfer(const DownloadRequest *request) {
     if (app.queue_count == DOWNLOAD_QUEUE_LIMIT) return "Черга заповнена";
     app.queue[app.queue_count++] = *request;
     if (app.download_busy) return "Додано до черги";
-    app.notice[0] = 0;
+    bool background = request->background;
     launch_next_transfer();
-    if (app.screen != DOWNLOADS) app.previous = app.screen;
-    app.screen = DOWNLOADS;
+    if (!background) {
+        app.notice[0] = 0;
+        if (app.screen != DOWNLOADS) app.previous = app.screen;
+        app.screen = DOWNLOADS;
+    }
     return "";
 }
 
 static void choose_transfer(const DownloadRequest *request) {
     app.draft_transfer = *request;
-    app.download_choice = 0;
+    app.download_choice = app.settings.install_default ? 1 : 0;
     app.choose_download = true;
 }
 
@@ -846,18 +956,31 @@ static bool keyboard(char *out, size_t capacity, const char *title, const char *
     return true;
 }
 
-static void start_update(void) {
-    if (app.update_ready) {
-        strcpy(app.notice, "Оновлення готове. Натисни +, щоб вийти й застосувати.");
-        return;
-    }
+static void start_update(bool background) {
+    if (app.update_ready) return;
     if (!app.update_target[0] || access(app.update_target, R_OK)) {
-        strcpy(app.notice, "Для оновлення запусти NXLoad.nro з microSD");
+        if (!background) strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
         return;
     }
-    DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true};
+    if (!update_configured()) {
+        if (!background) strcpy(app.update_notice, "Додай токен GitHub у switch/nxload/github-token.txt");
+        return;
+    }
+    DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true, .background = true};
     strcpy(request.url, app.update_target);
-    strcpy(app.notice, enqueue_transfer(&request));
+    const char *message = enqueue_transfer(&request);
+    if (!background) snprintf(app.update_notice, sizeof(app.update_notice), "%s",
+                             *message ? message : "Перевірка нової збірки…");
+}
+
+static void pump_daily_checks(uint64_t ticks) {
+    if (ticks < app.background_check_at) return;
+    app.background_check_at = ticks + 60000;
+    time_t now = time(NULL);
+    schedule_daily_catalogs(now);
+    if (app.settings.auto_update && app.screen == LIBRARY && !app.index_busy && !app.refresh_waiting &&
+        !app.download_busy && !app.queue_count && daily_check_due(now, app.settings.update_checked))
+        start_update(true);
 }
 
 static void download_link(void) {
@@ -974,11 +1097,59 @@ static size_t current_genre_tab(void) {
     return TAB_COUNT;
 }
 
+static void select_genre(size_t genre) {
+    app.genre = genre;
+    app.sort = app.genre_sort[genre];
+    rebuild_view(NULL);
+}
+
+static int tab_left(size_t tab) {
+    int left = 40;
+    for (size_t i = 0; i < tab; ++i) left += tab_widths[i] + 12;
+    return left;
+}
+
+static void toggle_settings(void) {
+    app.settings_open = !app.settings_open;
+    if (app.settings_open) {
+        app.settings_row = 0;
+        app.settings_notice[0] = 0;
+    }
+}
+
+static void change_setting(size_t row, bool activate) {
+    bool *value = NULL;
+    switch (row) {
+        case SETTINGS_DEFAULT: value = &app.settings.install_default; break;
+        case SETTINGS_RAR: value = &app.settings.delete_rar; break;
+        case SETTINGS_NSP: value = &app.settings.delete_nsp; break;
+        case SETTINGS_AUTO_CATALOG: value = &app.settings.auto_catalog; break;
+        case SETTINGS_AUTO_UPDATE: value = &app.settings.auto_update; break;
+        case SETTINGS_REFRESH_CATALOG:
+            if (activate) {
+                refresh_catalogs();
+                app.settings_notice[0] = 0;
+            }
+            return;
+        case SETTINGS_UPDATE:
+            if (activate) start_update(false);
+            return;
+        default: return;
+    }
+    *value = !*value;
+    if (save_settings(&app.settings)) {
+        app.settings_notice[0] = 0;
+        app.background_check_at = 0;
+    } else {
+        *value = !*value;
+        strcpy(app.settings_notice, "Не вдалося зберегти налаштування на microSD");
+    }
+}
+
 static void next_genre_tab(bool right) {
     size_t current = current_genre_tab();
     size_t next = current == TAB_COUNT ? 0 : (current + (right ? 1 : TAB_COUNT - 1)) % TAB_COUNT;
-    app.genre = genre_tabs[next];
-    rebuild_view(NULL);
+    select_genre(genre_tabs[next]);
 }
 
 static void move_in_library(u64 buttons) {
@@ -986,8 +1157,21 @@ static void move_in_library(u64 buttons) {
         next_genre_tab((buttons & HidNpadButton_R) != 0);
         return;
     }
+    if (app.top_focus) {
+        if ((buttons & left_buttons) && app.top_focus > TOP_SEARCH) --app.top_focus;
+        if ((buttons & right_buttons) && app.top_focus < TOP_SETTINGS) ++app.top_focus;
+        if (buttons & down_buttons) {
+            app.top_focus = TOP_NONE;
+            app.genre_focus = true;
+        }
+        return;
+    }
     if (app.genre_focus) {
         if (buttons & (left_buttons | right_buttons)) next_genre_tab((buttons & right_buttons) != 0);
+        if (buttons & up_buttons) {
+            app.top_focus = current_genre_tab() >= TAB_COUNT - 2 ? TOP_SETTINGS : TOP_SEARCH;
+            app.genre_focus = false;
+        }
         if (buttons & (down_buttons | HidNpadButton_A)) app.genre_focus = false;
         return;
     }
@@ -1009,15 +1193,16 @@ static void input(u64 buttons);
 static void touch_swipe(int x, int y, int dx, int dy) {
     bool horizontal = abs(dx) > abs(dy);
     bool next = (horizontal ? dx : dy) < 0;
-    if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download) return;
+    if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download || app.settings_open) return;
     if (app.screen == LIBRARY) {
-        if (y >= 96 && y < 137 && horizontal) {
+        if (y >= TAB_Y && y < TAB_Y + TAB_HEIGHT && horizontal) {
             next_genre_tab(next);
         } else if (app.game_count) {
             size_t first = grid_first();
             if (next && first + GRID_PAGE < app.game_count) app.game_index = first + GRID_PAGE;
             else if (!next && first) app.game_index = first - GRID_PAGE;
             app.genre_focus = false;
+            app.top_focus = TOP_NONE;
         }
     } else if (app.screen == GAME) {
         if (horizontal && (app.game_tab != GAME_SCREENSHOTS || (y >= 201 && y < 245)))
@@ -1061,18 +1246,35 @@ static void touch_tap(int x, int y) {
         }
         return;
     }
-    if (y >= 20 && y < 76) {
-        if (x >= 1065) input(HidNpadButton_Y);
-        else if (x >= 875) input(app.screen == LIBRARY ? HidNpadButton_X : HidNpadButton_B);
+    if (app.settings_open) {
+        if (y >= TOP_Y && y < TOP_Y + TOP_HEIGHT &&
+            ((x >= SEARCH_X && x < DOWNLOADS_X) || (x >= SETTINGS_X && x < TOP_END))) {
+            toggle_settings();
+        } else if (x >= 180 && x < 1100 && y >= SETTINGS_Y) {
+            size_t row = (size_t)(y - SETTINGS_Y) / SETTINGS_STEP;
+            if (row < SETTINGS_ROWS && (y - SETTINGS_Y) % SETTINGS_STEP < 45) {
+                app.settings_row = row;
+                change_setting(row, true);
+            }
+        }
+        return;
+    }
+    if (y >= TOP_Y && y < TOP_Y + TOP_HEIGHT) {
+        if (x >= SETTINGS_X && x < TOP_END) toggle_settings();
+        else if (x >= DOWNLOADS_X && x < SETTINGS_X) input(HidNpadButton_Y);
+        else if (x >= SEARCH_X && x < DOWNLOADS_X)
+            input(app.screen == LIBRARY ? HidNpadButton_X : HidNpadButton_B);
         return;
     }
     if (app.screen == LIBRARY) {
-        if (x >= 40 && y >= 96 && y < 137) {
-            size_t tab = (size_t)(x - 40) / 171;
-            if (tab < TAB_COUNT) {
-                app.genre = genre_tabs[tab];
+        if (x >= 40 && y >= TAB_Y && y < TAB_Y + TAB_HEIGHT) {
+            for (size_t i = 0; i < TAB_COUNT; ++i) {
+                int left = tab_left(i);
+                if (x < left || x >= left + tab_widths[i]) continue;
                 app.genre_focus = false;
-                rebuild_view(NULL);
+                app.top_focus = TOP_NONE;
+                select_genre(genre_tabs[i]);
+                break;
             }
         } else if (x >= 1000 && y >= 607 && y < 644) {
             input(HidNpadButton_ZL);
@@ -1083,6 +1285,7 @@ static void touch_tap(int x, int y) {
                 (x - GRID_X) % GRID_STEP_X < GRID_WIDTH && (y - GRID_Y) % GRID_STEP_Y < GRID_HEIGHT) {
                 app.game_index = index;
                 app.genre_focus = false;
+                app.top_focus = TOP_NONE;
                 input(HidNpadButton_A);
             }
         }
@@ -1169,15 +1372,27 @@ static void input(u64 buttons) {
         return;
     }
     if (buttons & HidNpadButton_Plus) { app.close = true; return; }
-    if ((buttons & HidNpadButton_Minus) && !app.filters_open) { start_update(); return; }
+    if (app.settings_open) {
+        if (buttons & (HidNpadButton_B | HidNpadButton_Minus)) toggle_settings();
+        else {
+            app.settings_row = move(app.settings_row, SETTINGS_ROWS, buttons);
+            if (buttons & (HidNpadButton_A | left_buttons | right_buttons))
+                change_setting(app.settings_row, (buttons & HidNpadButton_A) != 0);
+        }
+        return;
+    }
+    if (!app.filters_open && (buttons & HidNpadButton_Minus)) { toggle_settings(); return; }
     if (app.filters_open) {
         app.filter_row = move(app.filter_row, 2, buttons);
         if (buttons & (left_buttons | right_buttons)) {
             bool next = (buttons & right_buttons) != 0;
-            if (!app.filter_row)
+            if (!app.filter_row) {
                 app.draft_sort = (app.draft_sort + (next ? 1 : SORT_COUNT - 1)) % SORT_COUNT;
-            else
+                app.filter_sort_changed = true;
+            } else {
                 app.draft_genre = (app.draft_genre + (next ? 1 : GENRE_COUNT - 1)) % GENRE_COUNT;
+                if (!app.filter_sort_changed) app.draft_sort = app.genre_sort[app.draft_genre];
+            }
         }
         if (buttons & HidNpadButton_A) {
             char keep[CATALOG_URL] = "";
@@ -1185,6 +1400,7 @@ static void input(u64 buttons) {
                 strcpy(keep, game_at(app.game_index)->page);
             app.sort = app.draft_sort;
             app.genre = app.draft_genre;
+            app.genre_sort[app.genre] = app.sort;
             rebuild_view(keep[0] ? keep : NULL);
             app.filters_open = false;
         } else if (buttons & (HidNpadButton_B | HidNpadButton_ZL)) {
@@ -1284,8 +1500,14 @@ static void input(u64 buttons) {
         app.draft_sort = app.sort;
         app.draft_genre = app.genre;
         app.filter_row = 0;
+        app.filter_sort_changed = false;
         app.filters_open = true;
         return;
+    }
+    if (app.top_focus && (buttons & HidNpadButton_A)) {
+        if (app.top_focus == TOP_SETTINGS) { toggle_settings(); return; }
+        if (app.top_focus == TOP_DOWNLOADS) { input(HidNpadButton_Y); return; }
+        buttons = HidNpadButton_X;
     }
     bool was_genre_focus = app.genre_focus;
     move_in_library(buttons);
@@ -1295,12 +1517,8 @@ static void input(u64 buttons) {
     } else if ((buttons & HidNpadButton_B) && app.query[0]) {
         app.query[0] = 0;
         rebuild_view(NULL);
-    } else if (buttons & HidNpadButton_ZR) {
-        refresh_catalogs();
     } else if ((buttons & HidNpadButton_A) && !was_genre_focus && !app.genre_focus) {
-        if (!app.game_count) {
-            if (!app.entry_count && !app.index_busy) refresh_catalogs();
-        } else if (!app.catalog_busy) {
+        if (app.game_count && !app.catalog_busy) {
             const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
             app.active_game = *game_at(app.game_index);
             app.active_metadata = entry->metadata;
@@ -1340,74 +1558,109 @@ static void fit_cover(SDL_Texture *texture, int x, int y, int width, int height)
     SDL_RenderCopy(app.renderer, texture, NULL, &dst);
 }
 
-static void metadata_line(const CatalogMetadata *metadata, char out[64]) {
-    out[0] = 0;
-    if (!metadata) return;
-    unsigned date = metadata->released;
-    unsigned rating = metadata->rating;
-    if (date) snprintf(out, 64, "%04u-%02u-%02u", date / 10000, date / 100 % 100, date % 100);
-    if (rating) {
-        size_t used = strlen(out);
-        snprintf(out + used, 64 - used, "%s%u.%u/10", used ? "  ·  " : "", rating / 10, rating % 10);
+static void draw_grid_cover(SDL_Texture *cover, int x, int y, int size) {
+    int w, h;
+    if (!cover || SDL_QueryTexture(cover, NULL, NULL, &w, &h) || w <= 0 || h <= 0) {
+        rect(x, y, size, size, panel);
+        return;
     }
+    int edge = SDL_min(w, h);
+    SDL_Rect src = {(w - edge) / 2, (h - edge) / 2, edge, edge};
+    SDL_Rect dst = {x, y, size, size};
+    SDL_RenderCopy(app.renderer, cover, &src, &dst);
 }
 
 static void draw_library(void) {
     for (size_t i = 0; i < TAB_COUNT; ++i) {
-        int x = 40 + (int)i * 171;
+        int x = tab_left(i), width = tab_widths[i];
         bool active = app.genre == genre_tabs[i];
         if (active) {
-            rect(x, 96, 160, 41, selected);
-            rect(x, 134, 160, 3, blue);
-            if (app.genre_focus) rect(x, 96, 3, 41, blue);
+            rect(x, TAB_Y, width, TAB_HEIGHT, selected);
+            rect(x, TAB_Y + TAB_HEIGHT - 3, width, 3, blue);
+            if (app.genre_focus) rect(x, TAB_Y, 3, TAB_HEIGHT, blue);
         }
-        text(app.normal, i ? genre_names[genre_tabs[i]] : "Усі", x + 12, 103, 140, active ? white : gray);
+        centered_text(app.normal, i ? genre_names[genre_tabs[i]] : "Усі",
+                      x + 8, TAB_Y + 7, width - 16, active ? white : gray);
     }
-    char line[192];
     size_t first = grid_first();
     for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
         const CatalogEntry *entry = &app.entries[app.rows[i]];
         size_t pos = i - first;
-        int x = GRID_X + (int)(pos % GRID_COLUMNS) * GRID_STEP_X;
-        int y = GRID_Y + (int)(pos / GRID_COLUMNS) * GRID_STEP_Y;
-        bool active = i == app.game_index && !app.genre_focus;
-        rect(x, y, GRID_WIDTH, GRID_HEIGHT, active ? selected : panel);
-        if (active) rect(x, y, GRID_WIDTH, 3, blue);
-        int art_x = x + (GRID_WIDTH - GRID_ART_SIZE) / 2;
-        rect(art_x, y + 6, GRID_ART_SIZE, GRID_ART_SIZE, background);
-        SDL_Texture *cover = cover_texture(entry_game(entry), entry->metadata);
-        if (cover) fit_cover(cover, art_x, y + 6, GRID_ART_SIZE, GRID_ART_SIZE);
-        text(app.small, entry_title(entry), x + 9, y + 169, 172, active ? white : gray);
-        metadata_line(entry->metadata, line);
-        text(app.small, line, x + 9, y + 192, 172, active ? blue : gray);
+        bool active = i == app.game_index && !app.genre_focus && !app.top_focus;
+        int size = active ? GRID_WIDTH : GRID_THUMB_SIZE;
+        int inset = (GRID_WIDTH - size) / 2;
+        int x = GRID_X + (int)(pos % GRID_COLUMNS) * GRID_STEP_X + inset;
+        int y = GRID_Y + (int)(pos / GRID_COLUMNS) * GRID_STEP_Y + inset;
+        draw_grid_cover(cover_texture(entry_game(entry), entry->metadata), x, y, size);
+        unsigned rating = entry->metadata ? entry->metadata->rating : 0;
+        if (rating) {
+            char score[12];
+            snprintf(score, sizeof(score), "%u.%u", rating / 10, rating % 10);
+            int badge_x = x + size - 48, badge_y = y + size - 48;
+            const SDL_Color badge = {17, 24, 38, 230};
+            SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_BLEND);
+            rect(badge_x, badge_y, 42, 42, badge);
+            SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_NONE);
+            centered_text(app.small, score, badge_x, badge_y + 11, 42, white);
+        }
     }
-    if (!app.game_count && !app.index_busy)
+    if (app.game_count) {
+        const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
+        text(app.normal, entry_title(entry), 40, 593, 905, white);
+    } else if (!app.index_busy) {
         text(app.normal, app.entry_count ? "Ігор за цими фільтрами не знайдено" : "Каталог порожній",
              48, 176, 790, gray);
-
-    const char *genre = app.genre ? genre_names[app.genre] : "Усі жанри";
-    if (app.query[0])
-        snprintf(line, sizeof(line), "%zu ігор · %s · Пошук: %.80s", app.game_count, genre, app.query);
-    else
-        snprintf(line, sizeof(line), "%zu ігор · %s", app.game_count, genre);
-    text(app.small, line, 40, 615, 605, gray);
-    snprintf(line, sizeof(line), "ZL  %s", sort_names[app.sort]);
-    text(app.small, line, 1000, 615, 240, blue);
-    for (unsigned source = 0; source < 2; ++source) {
-        const char *name = source_name((CatalogSource)source);
-        const char *notice = app.index_notice[source];
-        if (app.index_busy && app.index_job.source == (CatalogSource)source) {
-            unsigned page = atomic_load(&app.index_job.page), pages = atomic_load(&app.index_job.pages);
-            if (app.download_busy) snprintf(line, sizeof(line), "%s %zu · пауза", name, app.catalogs[source].count);
-            else if (pages) snprintf(line, sizeof(line), "%s %zu · оновлення %u/%u", name, app.catalogs[source].count, page, pages);
-            else snprintf(line, sizeof(line), "%s %zu · оновлення…", name, app.catalogs[source].count);
-        } else if (notice[0]) {
-            snprintf(line, sizeof(line), "%s %zu · %.145s", name, app.catalogs[source].count, notice);
-        } else {
-            snprintf(line, sizeof(line), "%s %zu", name, app.catalogs[source].count);
-        }
-        text(app.small, line, 40 + (int)source * 610, 640, 600, notice[0] ? blue : gray);
     }
+    char count[32];
+    snprintf(count, sizeof(count), "%zu", app.entry_count);
+    text(app.small, count, 40, 631, 240, gray);
+    const char *sort = sort_names[app.sort];
+    int sort_width = 0;
+    TTF_SizeUTF8(app.small, sort, &sort_width, NULL);
+    sort_width = SDL_min(sort_width + 2, 240);
+    text(app.small, sort, 1240 - sort_width, 621, sort_width, blue);
+}
+
+static void draw_settings(void) {
+    static const char *const labels[] = {
+        "Дія з файлом за замовчуванням", "Видаляти RAR після розпакування",
+        "Видаляти NSP після встановлення", "Щоденне оновлення каталогів",
+        "Щоденне оновлення NXLoad", "Оновити каталоги зараз", "Перевірити оновлення NXLoad",
+    };
+    const char *const on = "Увімкнено", *const off = "Вимкнено";
+    const char *const values[] = {
+        app.settings.install_default ? "Завантажити й встановити" : "Завантажити",
+        app.settings.delete_rar ? on : off, app.settings.delete_nsp ? on : off,
+        app.settings.auto_catalog ? on : off, app.settings.auto_update ? on : off,
+        "", "",
+    };
+    text(app.large, "Налаштування", 195, 89, 920, white);
+    for (size_t i = 0; i < SETTINGS_ROWS; ++i) {
+        int y = SETTINGS_Y + (int)i * SETTINGS_STEP;
+        rect(180, y, 920, 45, i == app.settings_row ? selected : panel);
+        text(app.normal, labels[i], 195, y + 9, 560, white);
+        if (*values[i]) text(app.small, values[i], 785, y + 12, 300, i == app.settings_row ? blue : gray);
+    }
+    if (app.index_busy || app.refresh_waiting) {
+        char status[128];
+        unsigned page = app.index_busy ? atomic_load(&app.index_job.page) : 0;
+        unsigned pages = app.index_busy ? atomic_load(&app.index_job.pages) : 0;
+        if (app.download_busy) strcpy(status, "Оновлення каталогів чекає завершення завантаження");
+        else if (pages) snprintf(status, sizeof(status), "Оновлення каталогів · %u / %u", page, pages);
+        else strcpy(status, "Оновлення каталогів…");
+        text(app.small, status, 195, 566, 895, gray);
+    } else if (app.index_notice[0][0] || app.index_notice[1][0]) {
+        char status[384];
+        snprintf(status, sizeof(status), "%s%s%s", app.index_notice[0],
+                 app.index_notice[0][0] && app.index_notice[1][0] ? "  ·  " : "", app.index_notice[1]);
+        text(app.small, status, 195, 566, 895, gray);
+    }
+    const char *update = app.update_ready ? "NXLoad оновиться під час виходу" :
+        app.download_busy && app.active_transfer.app_update ? "Перевірка або завантаження NXLoad…" :
+        app.update_notice;
+    text(app.small, update, 195, 592, 895, blue);
+    text(app.small, app.settings_notice, 195, 618, 895, blue);
+    text(app.small, "A  Обрати    B  Назад    +  Вихід", 40, 665, 1200, gray);
 }
 
 static void draw_filters(void) {
@@ -1628,19 +1881,21 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.22", 206, 44, 120, gray);
-    if (app.update_ready)
-        text(app.small, "+  Застосувати оновлення", 610, 40, 260, blue);
-    else if (app.download_busy)
+    text(app.small, NXLOAD_VERSION, 206, 44, 120, gray);
+    if (app.download_busy && !app.active_transfer.app_update)
         text(app.small, atomic_load(&app.download.installing) ? "Встановлення…" :
-             atomic_load(&app.download.unpacking) ? "Розпакування…" : "Завантаження…", 685, 40, 170, blue);
-    text(app.normal, app.screen == LIBRARY ? "Пошук" : "‹ Назад", 885, 32, 170, gray);
-    text(app.normal, "Завантаження", 1070, 32, 170, blue);
+             atomic_load(&app.download.unpacking) ? "Розпакування…" : "Завантаження…", 685, 40, 190, blue);
+    draw_header();
+    if (app.settings_open) {
+        draw_settings();
+        SDL_RenderPresent(app.renderer);
+        return;
+    }
     if (app.screen == LIBRARY) draw_library();
     else if (app.screen == GAME) draw_game();
     else draw_downloads();
     const char *footer = app.screen == LIBRARY ?
-        "A  Відкрити    X  Пошук    L / R  Жанри    ZL  Сортування    ZR  Оновити    Y  Завантаження    −  Оновити NXLoad" :
+        "A  Відкрити    X  Пошук    L / R  Жанри    ZL  Сортування    Y  Завантаження    −  Налаштування" :
         app.screen == GAME ? (app.game_tab == GAME_FILES ?
         (app.file_source_chosen ?
         "A  Дія з файлом    B  Джерела    L / R  Вкладки    Y  Завантаження    +  Вихід" :
@@ -1722,6 +1977,7 @@ int main(int argc, char **argv) {
     hidInitializeTouchScreen();
     if (ok) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
+        app.settings = load_settings();
         load_catalog_metadata();
         open_catalogs();
         uint64_t next_frame = 0, next_scroll = 0;
@@ -1734,6 +1990,7 @@ int main(int argc, char **argv) {
             u64 buttons = padGetButtonsDown(&pad);
             u64 vertical = padGetButtons(&pad) & (up_buttons | down_buttons);
             uint64_t now = SDL_GetTicks64();
+            pump_daily_checks(now);
             if (held != vertical || (buttons & (up_buttons | down_buttons))) {
                 next_scroll = now + 280;
             } else if (vertical && now >= next_scroll) {

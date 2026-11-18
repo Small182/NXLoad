@@ -409,12 +409,12 @@ static void pump_covers(void) {
         free(job->bytes);
         job->bytes = NULL;
     }
-    if (app.cover_busy || app.download_busy || app.gallery_busy) return;
+    if (app.cover_busy || app.gallery_busy) return;
 
     const char *url = NULL;
     bool screenshot = false;
     if (app.screen == GAME) {
-        if (app.game_tab == GAME_SCREENSHOTS && app.gallery.count) {
+        if (app.game_tab == GAME_SCREENSHOTS && app.gallery.count && !app.download_busy) {
             const char *image = app.gallery.screenshots[app.screenshot_index];
             if (!find_cover(image)) {
                 screenshot = true;
@@ -872,7 +872,9 @@ static void touch_swipe(int x, int y, int dx, int dy) {
             app.genre_focus = false;
         }
     } else if (app.screen == GAME) {
-        if (app.game_tab == GAME_SCREENSHOTS && horizontal)
+        if (horizontal && (app.game_tab != GAME_SCREENSHOTS || (y >= 201 && y < 245)))
+            input(next ? HidNpadButton_R : HidNpadButton_L);
+        else if (horizontal)
             input(next ? HidNpadButton_Right : HidNpadButton_Left);
         else if (app.game_tab == GAME_OVERVIEW && !horizontal && app.description) {
             int height = 0;

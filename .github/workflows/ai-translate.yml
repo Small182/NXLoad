@@ -1,13 +1,6 @@
 name: Improve Ukrainian game descriptions with AI
 
 on:
-  push:
-    branches: [native-1fichier]
-    paths:
-      - tools/ai-translate.py
-      - tools/local-translate.py
-      - tools/build-metadata.py
-      - .github/workflows/ai-translate.yml
   workflow_dispatch:
     inputs:
       stage:

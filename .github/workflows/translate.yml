@@ -1,12 +1,6 @@
 name: Translate NXLoad descriptions
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - .github/workflows/translate.yml
-      - tools/translate-metadata.py
-      - tools/title_db.py
-      - tools/descriptions.uk.json
 
 permissions:
   contents: read

@@ -134,7 +134,7 @@ bool load_catalog_metadata(void) {
     if (!read) goto invalid;
     metadata_text[size] = 0;
     char *next = metadata_text;
-    if (strcmp(strsep(&next, "\n"), "NXLINFO1")) goto invalid;
+    if (strcmp(strsep(&next, "\n"), "NXLINFO2")) goto invalid;
     size_t lines = 0;
     for (const char *p = next; p && *p; ++p) if (*p == '\n') ++lines;
     if (!lines || lines > 100000) goto invalid;
@@ -142,16 +142,16 @@ bool load_catalog_metadata(void) {
     if (!metadata_rows) goto invalid;
     for (size_t i = 0; i < lines; ++i) {
         char *row = strsep(&next, "\n");
-        const char *values[7];
-        for (size_t field = 0; field < 7; ++field) {
+        const char *values[8];
+        for (size_t field = 0; field < 8; ++field) {
             values[field] = strsep(&row, "\t");
             if (!values[field]) goto invalid;
         }
         if (row || !values[0][0] || !values[1][0] ||
             (i && strcmp(metadata_rows[i - 1].key, values[0]) >= 0)) goto invalid;
         metadata_rows[i] = (MetadataRow){values[0], {
-            values[1], values[2], values[3], (unsigned)strtoul(values[4], NULL, 10),
-            (unsigned)strtoul(values[5], NULL, 10), (unsigned)strtoul(values[6], NULL, 10),
+            values[1], values[2], values[3], values[4], (unsigned)strtoul(values[5], NULL, 10),
+            (unsigned)strtoul(values[6], NULL, 10), (unsigned)strtoul(values[7], NULL, 10),
         }};
     }
     metadata_count = lines;

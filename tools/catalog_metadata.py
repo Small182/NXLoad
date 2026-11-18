@@ -17,6 +17,7 @@ GENRES = (
 )
 GAME_PATH = re.compile(r"/games/(?:nintendo-switch|switch-eshop)/[a-zA-Z0-9_~.%+-]+")
 COVER = re.compile(r"https://images\.nintendolife\.com/[a-f0-9]+/[^?#\s]+\.(?:jpg|webp|png)")
+ESHOP_ICON = re.compile(r"https://img-eshop\.cdn\.nintendo\.net/i/[a-f0-9]{64}\.jpg")
 
 
 def released_on(value):
@@ -41,7 +42,12 @@ def build_catalog_metadata(database, nintendo_life):
                    if isinstance(categories, list) and genre in categories)
         if mask & (1 << 6):
             mask |= 1 << 13
-        rows[encoded_key.decode()] = (cell(name, 191), "", "", released_on(item.get("releaseDate")), mask, 0)
+        icon = item.get("iconUrl") or ""
+        if not isinstance(icon, str) or not ESHOP_ICON.fullmatch(icon):
+            icon = ""
+        else:
+            icon += "?w=256&h=256"
+        rows[encoded_key.decode()] = (cell(name, 191), icon, "", "", released_on(item.get("releaseDate")), mask, 0)
 
     matches = defaultdict(list)
     for path, (name, cover, rating) in nintendo_life.items():
@@ -60,13 +66,13 @@ def build_catalog_metadata(database, nintendo_life):
         )
         if not cover:
             cover = next((row[1] for row in candidates if row[1]), "")
-        _, _, _, released, genres, _ = rows.get(key, ("", "", "", 0, 0, 0))
-        rows[key] = (name, cover, path, released, genres, rating)
+        _, icon, _, _, released, genres, _ = rows.get(key, ("", "", "", "", 0, 0, 0))
+        rows[key] = (name, icon, cover, path, released, genres, rating)
 
-    lines = ["NXLINFO1\n"]
+    lines = ["NXLINFO2\n"]
     for key, row in sorted(rows.items()):
         lines.append("\t".join(map(str, (key, *row))) + "\n")
-    return "".join(lines).encode(), sum(bool(row[2]) for row in rows.values())
+    return "".join(lines).encode(), sum(bool(row[3]) for row in rows.values())
 
 
 def load_nintendo_life(path):

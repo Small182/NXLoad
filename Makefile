@@ -8,7 +8,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := NXLoad
 APP_TITLE := NXLoad
 APP_AUTHOR := Small182
-APP_VERSION := 1.0.20
+APP_VERSION := 1.0.21
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ -DCURL_STATICLIB
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)
@@ -17,6 +17,7 @@ PORT_PACKAGES := sdl2 SDL2_ttf SDL2_image libxml-2.0 libarchive
 PORT_LIBS := $(shell $(PKG_CONFIG) --static --libs $(PORT_PACKAGES))
 TITLEDB := $(TOPDIR)/romfs/titledb.bin
 CATALOG_META := $(TOPDIR)/romfs/catalog-meta.tsv
+ROMSHQ_SEED := $(TOPDIR)/romfs/romshq.tsv.gz
 GALLERIES := $(TOPDIR)/romfs/gallery/.ready
 NXLOAD_NETWORK := $(TOPDIR)/.nxdeps/install
 NETWORK_LIBS := $(addprefix $(NXLOAD_NETWORK)/lib/,libcurl.a libmbedtls.a libmbedx509.a libmbedcrypto.a)
@@ -46,9 +47,9 @@ $(GALLERIES): $(TOPDIR)/tools/build-galleries.py
 clean:
 	rm -rf build $(TARGET).elf $(TARGET).nacp $(TARGET).nro
 else
-OFILES := main.o catalog.o game_info.o fichier.o unpack.o range.o tls_platform.o
+OFILES := main.o catalog.o game_info.o cover_cache.o fichier.o unpack.o range.o tls_platform.o
 all: $(OUTPUT).nro
-$(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(TITLEDB) $(CATALOG_META) $(GALLERIES)
+$(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(TITLEDB) $(CATALOG_META) $(GALLERIES) $(ROMSHQ_SEED)
 $(OUTPUT).elf: $(OFILES)
 -include $(addprefix $(DEPSDIR)/,$(OFILES:.o=.d))
 endif

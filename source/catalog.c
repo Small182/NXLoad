@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 #ifdef __SWITCH__
 #include <switch.h>
 #endif
@@ -28,6 +29,9 @@
 #define PAGE_BYTES (4 * 1024 * 1024)
 #define COVER_BYTES (2 * 1024 * 1024)
 #define CACHE_MAGIC "NXLCAT02"
+#ifndef ROMSHQ_SEED
+#define ROMSHQ_SEED "romfs:/romshq.tsv.gz"
+#endif
 
 typedef struct {
     unsigned char *data;
@@ -50,7 +54,7 @@ static int should_cancel(void *ptr, curl_off_t a, curl_off_t b, curl_off_t c, cu
 }
 
 static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t limit,
-                    CatalogFetchStatus *status) {
+                    CatalogFetchStatus *status, bool thumbnail) {
     *status = (CatalogFetchStatus){0};
     Buffer buf = { .data = malloc(limit + 1), .capacity = limit };
     if (!buf.data) {
@@ -67,8 +71,8 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
 #endif
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 16L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, thumbnail ? 3L : 8L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, thumbnail ? 7L : 16L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.3");
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
@@ -80,6 +84,8 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     status->curl = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status->http);
+    if (status->curl == CURLE_PEER_FAILED_VERIFICATION)
+        curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &status->verify);
     if (status->curl != CURLE_OK || status->http != 200 || !buf.size) {
         free(buf.data);
         return (Buffer){0};
@@ -96,7 +102,7 @@ static unsigned char *fetch_resource(const char *url, atomic_bool *cancel, size_
         *status = (CatalogFetchStatus){ .curl = CURLE_FAILED_INIT };
         return NULL;
     }
-    Buffer data = fetch(curl, cancel, url, limit, status);
+    Buffer data = fetch(curl, cancel, url, limit, status, false);
     curl_easy_cleanup(curl);
     *bytes = data.size;
     return data.data;
@@ -107,13 +113,20 @@ unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t 
     return fetch_resource(url, cancel, COVER_BYTES, bytes, &status);
 }
 
+unsigned char *catalog_fetch_thumbnail(CURL *connection, const char *url, atomic_bool *cancel, size_t *bytes) {
+    CatalogFetchStatus status;
+    Buffer image = fetch(connection, cancel, url, COVER_BYTES, &status, true);
+    *bytes = image.size;
+    return image.data;
+}
+
 unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
                                       CatalogFetchStatus *status) {
     return fetch_resource(url, cancel, PAGE_BYTES, bytes, status);
 }
 
 static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, CatalogFetchStatus *status) {
-    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status);
+    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status, false);
     if (!buf.data) return NULL;
     htmlDocPtr doc = htmlReadMemory((char *)buf.data, (int)buf.size, url, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);
@@ -303,6 +316,32 @@ static unsigned declared_pages(xmlDocPtr doc) {
     return count <= CATALOG_MAX_PAGES ? count : 0;
 }
 
+static unsigned romshq_pages(xmlNodePtr node) {
+    unsigned max = 0;
+    for (; node; node = node->next) {
+        if (is_element(node, "a")) {
+            xmlChar *href = xmlGetProp(node, BAD_CAST "href");
+            if (href) {
+                const char *url = (const char *)href;
+                if (!strncmp(url, ROMSHQ "/browse?", sizeof(ROMSHQ "/browse?") - 1) ||
+                    !strncmp(url, "/browse?", sizeof("/browse?") - 1)) {
+                    const char *field = strstr(url, "page=");
+                    if (field && (field[-1] == '?' || field[-1] == '&')) {
+                        char *end;
+                        unsigned long page = strtoul(field + 5, &end, 10);
+                        if ((!*end || *end == '&') && page <= CATALOG_MAX_PAGES && page > max)
+                            max = (unsigned)page;
+                    }
+                }
+                xmlFree(href);
+            }
+        }
+        unsigned children = romshq_pages(node->children);
+        if (children > max) max = children;
+    }
+    return max;
+}
+
 static bool load_page(CURL *curl, CatalogIndexJob *job, unsigned page,
                       Game *games, size_t *count, CatalogFetchStatus *status) {
     char url[CATALOG_URL];
@@ -317,8 +356,9 @@ static bool load_page(CURL *curl, CatalogIndexJob *job, unsigned page,
     if (!doc) return false;
     *count = 0;
     read_catalog(xmlDocGetRootElement(doc), games, count, job->source);
-    unsigned pages = job->source == CATALOG_NSROMS ? declared_pages(doc) : 0;
-    if (pages) atomic_store(&job->pages, pages);
+    unsigned pages = job->source == CATALOG_NSROMS ? declared_pages(doc) :
+                     romshq_pages(xmlDocGetRootElement(doc));
+    if (pages > atomic_load(&job->pages)) atomic_store(&job->pages, pages);
     xmlFreeDoc(doc);
     return true;
 }
@@ -466,8 +506,7 @@ static void read_romshq_screenshots(xmlNodePtr node, GameDetails *details) {
 static void load_details(CatalogJob *job) {
     GameDetails *details = &job->details;
     strcpy(details->title, job->game.title);
-    char cover[CATALOG_URL];
-    strcpy(cover, job->game.cover);
+    strcpy(details->cover_url, job->game.cover);
     CURL *curl = curl_easy_init();
     CatalogFetchStatus status = {.curl = CURLE_FAILED_INIT};
     htmlDocPtr doc = curl ? fetch_page(curl, &job->cancel, job->game.page, &status) : NULL;
@@ -491,7 +530,7 @@ static void load_details(CatalogJob *job) {
             if (!is_element(node, "meta")) continue;
             xmlChar *property = xmlGetProp(node, BAD_CAST "property");
             xmlChar *value = xmlGetProp(node, BAD_CAST "content");
-            if (!xmlStrcmp(property, BAD_CAST "og:image")) site_url(value, cover, job->source);
+            if (!xmlStrcmp(property, BAD_CAST "og:image")) site_url(value, details->cover_url, job->source);
             xmlFree(property);
             xmlFree(value);
         }
@@ -501,9 +540,6 @@ static void load_details(CatalogJob *job) {
             snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна · cURL %d", status.curl);
         else
             snprintf(job->error, sizeof(job->error), "Сторінка гри недоступна · HTTP %ld", status.http);
-    }
-    if (cover[0] && !atomic_load(&job->cancel)) {
-        details->cover = catalog_fetch_cover(cover, &job->cancel, &details->cover_bytes);
     }
 }
 
@@ -545,12 +581,61 @@ static bool read_cache_path(const char *path, CatalogIndex *index, CatalogSource
     return ok;
 }
 
+static bool read_romshq_seed(CatalogIndex *index) {
+    gzFile file = gzopen(ROMSHQ_SEED, "rb");
+    if (!file) return false;
+    char line[CATALOG_TEXT + 2 * CATALOG_URL + 4];
+    unsigned long long timestamp = 0;
+    bool ok = gzgets(file, line, sizeof(line)) && sscanf(line, "NXLSEED1 %llu", &timestamp) == 1 &&
+              timestamp > 0 && timestamp <= INT64_MAX && (time_t)timestamp > index->saved_at;
+    Game *games = ok ? calloc(CATALOG_CAPACITY, sizeof(*games)) : NULL;
+    if (!games) ok = false;
+    size_t count = 0;
+    while (ok && gzgets(file, line, sizeof(line))) {
+        size_t length = strlen(line);
+        char *field = line;
+        if (!length || line[length - 1] != '\n' || count == CATALOG_CAPACITY) {
+            ok = false;
+            break;
+        }
+        line[length - 1] = 0;
+        const char *title = strsep(&field, "\t");
+        const char *page = strsep(&field, "\t");
+        const char *cover = field;
+        if (!page || !cover || !title[0] || strlen(title) >= CATALOG_TEXT ||
+            strlen(page) >= CATALOG_URL || strlen(cover) >= CATALOG_URL) {
+            ok = false;
+            break;
+        }
+        Game *game = &games[count];
+        strcpy(game->title, title);
+        strcpy(game->page, page);
+        strcpy(game->cover, cover);
+        ok = valid_game(game, CATALOG_ROMSHQ);
+        if (ok) {
+            clean_catalog_title(game->title);
+            ++count;
+        }
+    }
+    ok = ok && gzeof(file) && count > index->count;
+    if (gzclose(file) != Z_OK) ok = false;
+    if (ok) {
+        memcpy(index->games, games, count * sizeof(*games));
+        index->count = count;
+        index->saved_at = (time_t)timestamp;
+    }
+    free(games);
+    return ok;
+}
+
 bool catalog_read_cache(CatalogIndex *index, CatalogSource source) {
     index->count = 0;
     index->saved_at = 0;
-    if (source == CATALOG_ROMSHQ)
-        return read_cache_path(NXLOAD_DOWNLOAD_DIR "/romshq.bin", index, source) ||
-               read_cache_path(NXLOAD_DOWNLOAD_DIR "/romshq.prev", index, source);
+    if (source == CATALOG_ROMSHQ) {
+        bool cached = read_cache_path(NXLOAD_DOWNLOAD_DIR "/romshq.bin", index, source) ||
+                      read_cache_path(NXLOAD_DOWNLOAD_DIR "/romshq.prev", index, source);
+        return read_romshq_seed(index) || cached;
+    }
     return read_cache_path(NXLOAD_DOWNLOAD_DIR "/catalog.bin", index, source) ||
            read_cache_path(NXLOAD_DOWNLOAD_DIR "/catalog.prev", index, source);
 }
@@ -622,6 +707,8 @@ void catalog_build_index(CatalogIndexJob *job) {
         unsigned pages = atomic_load(&job->pages);
         if (!loaded) {
             if (!pages && page > 1 && status.http == 404) job->complete = true;
+            else if (status.curl == CURLE_PEER_FAILED_VERIFICATION)
+                snprintf(job->error, sizeof(job->error), "Стор. %u · TLS 60 · X.509 0x%lX", page, status.verify);
             else if (status.curl)
                 snprintf(job->error, sizeof(job->error), "Сторінка %u · cURL %d", page, status.curl);
             else

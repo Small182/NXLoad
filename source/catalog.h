@@ -5,14 +5,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
+#include <curl/curl.h>
 #include "fichier.h"
 
 #define CATALOG_URL 512
 #define CATALOG_TEXT 192
 #define CATALOG_PAGE_GAMES 64
-#define CATALOG_CAPACITY 4096
+#define CATALOG_CAPACITY 8192
 #define MERGED_CAPACITY (2 * CATALOG_CAPACITY)
-#define CATALOG_MAX_PAGES 120
+#define CATALOG_MAX_PAGES 512
 #define CATALOG_CACHE_TTL (24 * 60 * 60)
 #define CATALOG_FILE_COUNT 24
 #define CATALOG_SCREENSHOTS 32
@@ -27,7 +28,7 @@ typedef struct {
 } Game;
 
 typedef struct {
-    const char *title, *cover, *nintendo_life;
+    const char *title, *eshop_icon, *cover, *nintendo_life;
     unsigned released, genres, rating;
 } CatalogMetadata;
 
@@ -49,8 +50,7 @@ typedef struct {
     size_t count;
     char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL];
     size_t screenshot_count;
-    unsigned char *cover;
-    size_t cover_bytes;
+    char cover_url[CATALOG_URL];
 } GameDetails;
 
 typedef struct {
@@ -64,6 +64,7 @@ typedef struct {
 
 typedef struct {
     long http;
+    long verify;
     int curl;
 } CatalogFetchStatus;
 
@@ -89,6 +90,7 @@ void catalog_request(CatalogJob *job);
 void catalog_build_index(CatalogIndexJob *job);
 bool catalog_read_cache(CatalogIndex *index, CatalogSource source);
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes);
+unsigned char *catalog_fetch_thumbnail(CURL *connection, const char *url, atomic_bool *cancel, size_t *bytes);
 unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
                                       CatalogFetchStatus *status);
 

@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "catalog.h"
+#include "cover_cache.h"
 #include "game_info.h"
 #include "storage.h"
 #include "unpack.h"
@@ -32,6 +33,8 @@
 #define FILE_ROWS 5
 #define HISTORY_LIMIT 96
 #define COVER_SLOTS 36
+#define COVER_WORKERS 3
+#define GRID_ART_SIZE 160
 #define DOWNLOAD_QUEUE_LIMIT 24
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
@@ -69,13 +72,14 @@ typedef struct {
     atomic_bool cancel;
     unsigned char *bytes;
     size_t count;
-    bool screenshot;
+    Thread thread;
+    CURL *connection;
+    bool screenshot, busy, from_disk;
 } CoverJob;
 
 typedef struct {
     SDL_Window *window;
     SDL_Renderer *renderer;
-    SDL_Texture *cover;
     SDL_Texture *description;
     TTF_Font *small;
     TTF_Font *normal;
@@ -116,9 +120,8 @@ typedef struct {
     GameDetails details;
     CatalogJob pending;
     FichierJob download;
-    Thread catalog_thread, download_thread, cover_thread;
-    bool cover_busy;
-    CoverJob cover_job;
+    Thread catalog_thread, download_thread;
+    CoverJob cover_jobs[COVER_WORKERS];
     CachedCover covers[COVER_SLOTS];
     uint64_t previous_bytes;
     double speed;
@@ -353,103 +356,169 @@ static SDL_Texture *decode_cover(const unsigned char *bytes, size_t count, bool 
 
 static void cover_worker(void *arg) {
     CoverJob *job = arg;
-    job->bytes = job->screenshot ? load_gallery_image(job->url, &job->cancel, &job->count) :
-                 catalog_fetch_cover(job->url, &job->cancel, &job->count);
+    if (job->screenshot) {
+        job->bytes = load_gallery_image(job->url, &job->cancel, &job->count);
+        return;
+    }
+    job->bytes = cover_cache_read(job->url, &job->count);
+    job->from_disk = job->bytes != NULL;
+    if (job->from_disk || atomic_load(&job->cancel)) return;
+    if (!job->connection) job->connection = curl_easy_init();
+    if (job->connection)
+        job->bytes = catalog_fetch_thumbnail(job->connection, job->url, &job->cancel, &job->count);
 }
 
 static CachedCover *find_cover(const char *url) {
     if (!url[0]) return NULL;
     for (size_t i = 0; i < COVER_SLOTS; ++i) {
-        if (!strcmp(app.covers[i].url, url)) {
-            app.covers[i].last_used = SDL_GetTicks64();
-            return &app.covers[i];
+        CachedCover *entry = &app.covers[i];
+        if (strcmp(entry->url, url)) continue;
+        uint64_t now = SDL_GetTicks64();
+        if (entry->texture) entry->last_used = now;
+        else if (now - entry->last_used >= 30000) {
+            entry->url[0] = 0;
+            return NULL;
         }
+        return entry;
     }
     return NULL;
 }
 
-static const char *missing_cover(const Game *game, const CatalogMetadata *metadata) {
-    if (metadata && metadata->cover[0]) {
-        CachedCover *cover = find_cover(metadata->cover);
-        if (!cover) return metadata->cover;
-        if (cover->texture) return NULL;
-    }
-    return game->cover[0] && !find_cover(game->cover) ? game->cover : NULL;
+static void cover_urls(const Game *game, const CatalogMetadata *metadata, const char *urls[3]) {
+    urls[0] = metadata ? metadata->eshop_icon : "";
+    urls[1] = metadata ? metadata->cover : "";
+    urls[2] = game->cover;
 }
 
-static SDL_Texture *cover_texture(const Game *game, const CatalogMetadata *metadata, SDL_Texture *fallback) {
-    if (metadata && metadata->cover[0]) {
-        const CachedCover *cover = find_cover(metadata->cover);
+static bool cover_pending(const char *url) {
+    for (size_t i = 0; i < COVER_WORKERS; ++i)
+        if (app.cover_jobs[i].busy && !strcmp(app.cover_jobs[i].url, url)) return true;
+    return false;
+}
+
+static const char *missing_cover(const Game *game, const CatalogMetadata *metadata) {
+    const char *urls[3];
+    cover_urls(game, metadata, urls);
+    for (size_t i = 0; i < 3; ++i) {
+        if (!urls[i][0]) continue;
+        CachedCover *cover = find_cover(urls[i]);
+        if (cover && cover->texture) return NULL;
+        if (!cover) return cover_pending(urls[i]) ? NULL : urls[i];
+    }
+    return NULL;
+}
+
+static SDL_Texture *cover_texture(const Game *game, const CatalogMetadata *metadata) {
+    const char *urls[3];
+    cover_urls(game, metadata, urls);
+    for (size_t i = 0; i < 3; ++i) {
+        CachedCover *cover = find_cover(urls[i]);
         if (cover && cover->texture) return cover->texture;
     }
-    if (fallback) return fallback;
-    const CachedCover *cover = find_cover(game->cover);
-    return cover ? cover->texture : NULL;
+    return NULL;
 }
 
-static void pump_covers(void) {
-    CoverJob *job = &app.cover_job;
-    if (app.cover_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.cover_thread), 0))) {
-        threadWaitForExit(&app.cover_thread);
-        threadClose(&app.cover_thread);
-        app.cover_busy = false;
-        CachedCover *entry = &app.covers[0];
-        for (size_t i = 0; i < COVER_SLOTS; ++i) {
-            CachedCover *candidate = &app.covers[i];
-            if (!candidate->url[0]) {
-                entry = candidate;
-                break;
-            }
-            if (candidate->last_used < entry->last_used) entry = candidate;
-        }
-        SDL_DestroyTexture(entry->texture);
-        strcpy(entry->url, job->url);
-        entry->texture = decode_cover(job->bytes, job->count, job->screenshot);
-        entry->last_used = SDL_GetTicks64();
-        free(job->bytes);
-        job->bytes = NULL;
-    }
-    if (app.cover_busy || app.gallery_busy) return;
+static bool uses_cover(const Game *game, const CatalogMetadata *metadata, const char *url) {
+    const char *urls[3];
+    cover_urls(game, metadata, urls);
+    for (size_t i = 0; i < 3; ++i)
+        if (!strcmp(url, urls[i])) return true;
+    return false;
+}
 
-    const char *url = NULL;
-    bool screenshot = false;
+static bool cover_visible(const CoverJob *job) {
     if (app.screen == GAME) {
-        if (app.game_tab == GAME_SCREENSHOTS && app.gallery.count && !app.download_busy) {
-            const char *image = app.gallery.screenshots[app.screenshot_index];
-            if (!find_cover(image)) {
-                screenshot = true;
-                url = image;
+        if (app.game_tab == GAME_SCREENSHOTS)
+            return job->screenshot && app.gallery.count &&
+                   !strcmp(job->url, app.gallery.screenshots[app.screenshot_index]);
+        return !job->screenshot && uses_cover(&app.active_game, app.active_metadata, job->url);
+    }
+    if (app.screen != LIBRARY || job->screenshot) return false;
+    size_t first = grid_first();
+    for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
+        const CatalogEntry *entry = &app.entries[app.rows[i]];
+        if (uses_cover(entry_game(entry), entry->metadata, job->url)) return true;
+    }
+    return false;
+}
+
+static void finish_cover(CoverJob *job) {
+    threadWaitForExit(&job->thread);
+    threadClose(&job->thread);
+    job->busy = false;
+    if (!atomic_load(&job->cancel)) {
+        SDL_Texture *texture = decode_cover(job->bytes, job->count, job->screenshot);
+        if (job->from_disk && !texture) {
+            cover_cache_discard(job->url);
+        } else {
+            if (!job->screenshot && !job->from_disk && texture)
+                cover_cache_write(job->url, job->bytes, job->count);
+            CachedCover *entry = &app.covers[0];
+            for (size_t i = 0; i < COVER_SLOTS; ++i) {
+                CachedCover *candidate = &app.covers[i];
+                if (!candidate->url[0]) {
+                    entry = candidate;
+                    break;
+                }
+                if (candidate->last_used < entry->last_used) entry = candidate;
             }
-        }
-        if (!url && app.game_tab != GAME_SCREENSHOTS)
-            url = missing_cover(&app.active_game, app.active_metadata);
-    } else if (app.screen == LIBRARY && app.game_count) {
-        const CatalogEntry *selected = &app.entries[app.rows[app.game_index]];
-        url = missing_cover(entry_game(selected), selected->metadata);
-        if (!url) {
-            size_t first = grid_first();
-            for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
-                const CatalogEntry *entry = &app.entries[app.rows[i]];
-                url = missing_cover(entry_game(entry), entry->metadata);
-                if (url) break;
-            }
+            SDL_DestroyTexture(entry->texture);
+            strcpy(entry->url, job->url);
+            entry->texture = texture;
+            entry->last_used = SDL_GetTicks64();
         }
     }
-    if (url) {
+    free(job->bytes);
+    job->bytes = NULL;
+}
+
+static const char *next_cover(bool *screenshot) {
+    *screenshot = false;
+    if (app.screen == GAME) {
+        if (app.game_tab != GAME_SCREENSHOTS)
+            return missing_cover(&app.active_game, app.active_metadata);
+        if (!app.gallery.count || app.download_busy) return NULL;
+        const char *image = app.gallery.screenshots[app.screenshot_index];
+        *screenshot = true;
+        return !find_cover(image) && !cover_pending(image) ? image : NULL;
+    }
+    if (app.screen != LIBRARY || !app.game_count) return NULL;
+    const CatalogEntry *selected_entry = &app.entries[app.rows[app.game_index]];
+    const char *url = missing_cover(entry_game(selected_entry), selected_entry->metadata);
+    if (url) return url;
+    size_t first = grid_first();
+    for (size_t i = first; i < app.game_count && i < first + GRID_PAGE; ++i) {
+        const CatalogEntry *entry = &app.entries[app.rows[i]];
+        url = missing_cover(entry_game(entry), entry->metadata);
+        if (url) return url;
+    }
+    return NULL;
+}
+
+static bool pump_covers(void) {
+    bool finished = false;
+    for (size_t i = 0; i < COVER_WORKERS; ++i) {
+        CoverJob *job = &app.cover_jobs[i];
+        if (!job->busy) continue;
+        if (!cover_visible(job)) atomic_store(&job->cancel, true);
+        if (R_SUCCEEDED(waitSingle(waiterForThread(&job->thread), 0))) {
+            finish_cover(job);
+            finished = true;
+        }
+    }
+    if (app.gallery_busy) return finished;
+    for (size_t i = 0; i < COVER_WORKERS; ++i) {
+        CoverJob *job = &app.cover_jobs[i];
+        if (job->busy) continue;
+        const char *url = next_cover(&job->screenshot);
+        if (!url) break;
         strcpy(job->url, url);
         atomic_init(&job->cancel, false);
+        job->from_disk = false;
         job->count = 0;
-        job->screenshot = screenshot;
-        app.cover_busy = start_worker(&app.cover_thread, cover_worker, job);
+        job->busy = start_worker(&job->thread, cover_worker, job);
     }
-}
-
-static void update_cover(void) {
-    SDL_DestroyTexture(app.cover);
-    app.cover = decode_cover(app.details.cover, app.details.cover_bytes, false);
-    free(app.details.cover);
-    app.details.cover = NULL;
-    app.details.cover_bytes = 0;
+    return finished;
 }
 
 static void update_description(void) {
@@ -475,7 +544,7 @@ static void pump_gallery(void) {
     }
     if (app.screen == GAME && app.game_tab == GAME_SCREENSHOTS &&
         !app.gallery_busy && !app.gallery_requested &&
-        !app.download_busy && !app.catalog_busy && !app.cover_busy) {
+        !app.download_busy && !app.catalog_busy) {
         memset(job, 0, sizeof(*job));
         atomic_init(&job->cancel, false);
         strcpy(job->page, app.active_game.page);
@@ -598,14 +667,12 @@ static void finish_jobs(void) {
                 app.gallery_requested = true;
             }
             strcpy(app.game_error, job->error);
-            update_cover();
+            if (job->details.cover_url[0])
+                strcpy(app.active_game.cover, job->details.cover_url);
             if (!app.metadata.title[0] &&
                 read_game_metadata(&app.metadata, app.active_game.title, app.details.title))
                 update_description();
-        } else {
-            free(job->details.cover);
         }
-        job->details.cover = NULL;
     }
     if (app.download_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.download_thread), 0))) {
         threadWaitForExit(&app.download_thread);
@@ -1150,8 +1217,6 @@ static void input(u64 buttons) {
                     guess_romshq_page(&app.game_sources[CATALOG_ROMSHQ], app.metadata.title[0] ?
                                       app.metadata.title : entry_title(entry));
             app.gallery_requested = false;
-            SDL_DestroyTexture(app.cover);
-            app.cover = NULL;
             update_description();
             app.game_error[0] = 0;
             app.file_index = 0;
@@ -1181,7 +1246,7 @@ static void metadata_line(const CatalogMetadata *metadata, char out[64]) {
     if (date) snprintf(out, 64, "%04u-%02u-%02u", date / 10000, date / 100 % 100, date % 100);
     if (rating) {
         size_t used = strlen(out);
-        snprintf(out + used, 64 - used, "%s★ %u.%u", used ? "  ·  " : "", rating / 10, rating % 10);
+        snprintf(out + used, 64 - used, "%s%u.%u/10", used ? "  ·  " : "", rating / 10, rating % 10);
     }
 }
 
@@ -1206,12 +1271,13 @@ static void draw_library(void) {
         bool active = i == app.game_index && !app.genre_focus;
         rect(x, y, GRID_WIDTH, GRID_HEIGHT, active ? selected : panel);
         if (active) rect(x, y, GRID_WIDTH, 3, blue);
-        rect(x + 7, y + 8, 176, 147, background);
-        SDL_Texture *cover = cover_texture(entry_game(entry), entry->metadata, NULL);
-        if (cover) fit_cover(cover, x + 7, y + 8, 176, 147);
-        text(app.small, entry_title(entry), x + 9, y + 160, 172, active ? white : gray);
+        int art_x = x + (GRID_WIDTH - GRID_ART_SIZE) / 2;
+        rect(art_x, y + 6, GRID_ART_SIZE, GRID_ART_SIZE, background);
+        SDL_Texture *cover = cover_texture(entry_game(entry), entry->metadata);
+        if (cover) fit_cover(cover, art_x, y + 6, GRID_ART_SIZE, GRID_ART_SIZE);
+        text(app.small, entry_title(entry), x + 9, y + 169, 172, active ? white : gray);
         metadata_line(entry->metadata, line);
-        text(app.small, line, x + 9, y + 187, 172, active ? blue : gray);
+        text(app.small, line, x + 9, y + 192, 172, active ? blue : gray);
     }
     if (!app.game_count && !app.index_busy)
         text(app.normal, app.entry_count ? "Ігор за цими фільтрами не знайдено" : "Каталог порожній",
@@ -1225,18 +1291,20 @@ static void draw_library(void) {
     text(app.small, line, 40, 615, 605, gray);
     snprintf(line, sizeof(line), "ZL  %s", sort_names[app.sort]);
     text(app.small, line, 1000, 615, 240, blue);
-    if (app.index_busy) {
-        CatalogIndexJob *job = &app.index_job;
-        unsigned page = atomic_load(&job->page), pages = atomic_load(&job->pages);
-        if (app.download_busy) snprintf(line, sizeof(line), "%s · пауза", source_name(job->source));
-        else if (pages) snprintf(line, sizeof(line), "%s · %u/%u", source_name(job->source), page, pages);
-        else snprintf(line, sizeof(line), "%s · оновлення…", source_name(job->source));
-        text(app.small, line, 655, 615, 320, blue);
-    } else {
-        const char *status = app.notice[0] ? app.notice :
-            app.index_notice[CATALOG_NSROMS][0] ? app.index_notice[CATALOG_NSROMS] :
-            app.index_notice[CATALOG_ROMSHQ];
-        text(app.small, status, 655, 615, 320, gray);
+    for (unsigned source = 0; source < 2; ++source) {
+        const char *name = source_name((CatalogSource)source);
+        const char *notice = app.index_notice[source];
+        if (app.index_busy && app.index_job.source == (CatalogSource)source) {
+            unsigned page = atomic_load(&app.index_job.page), pages = atomic_load(&app.index_job.pages);
+            if (app.download_busy) snprintf(line, sizeof(line), "%s %zu · пауза", name, app.catalogs[source].count);
+            else if (pages) snprintf(line, sizeof(line), "%s %zu · оновлення %u/%u", name, app.catalogs[source].count, page, pages);
+            else snprintf(line, sizeof(line), "%s %zu · оновлення…", name, app.catalogs[source].count);
+        } else if (notice[0]) {
+            snprintf(line, sizeof(line), "%s %zu · %.145s", name, app.catalogs[source].count, notice);
+        } else {
+            snprintf(line, sizeof(line), "%s %zu", name, app.catalogs[source].count);
+        }
+        text(app.small, line, 40 + (int)source * 610, 640, 600, notice[0] ? blue : gray);
     }
 }
 
@@ -1256,7 +1324,7 @@ static void draw_filters(void) {
 
 static void draw_cover(void) {
     rect(56, 127, 308, 308, background);
-    SDL_Texture *cover = cover_texture(&app.active_game, app.active_metadata, app.cover);
+    SDL_Texture *cover = cover_texture(&app.active_game, app.active_metadata);
     fit_cover(cover, 56, 127, 308, 308);
     text(app.normal, "Nintendo Switch", 65, 459, 293, white);
     text(app.small, app.metadata.publisher, 65, 498, 293, gray);
@@ -1268,7 +1336,7 @@ static void draw_cover(void) {
     if (app.active_metadata && app.active_metadata->rating) {
         char score[48];
         unsigned rating = app.active_metadata->rating;
-        snprintf(score, sizeof(score), "★ %u.%u / 10", rating / 10, rating % 10);
+        snprintf(score, sizeof(score), "%u.%u / 10", rating / 10, rating % 10);
         text(app.small, score, 65, 561, 293, blue);
     }
     if (app.active_metadata && app.active_metadata->nintendo_life[0])
@@ -1444,7 +1512,7 @@ static void draw_downloads(void) {
 static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
-    text(app.small, "1.0.20", 206, 44, 120, gray);
+    text(app.small, "1.0.21", 206, 44, 120, gray);
     if (app.download_busy)
         text(app.small, atomic_load(&app.download.unpacking) ? "Розпакування…" : "Завантаження…", 685, 40, 170, blue);
     text(app.normal, app.screen == LIBRARY ? "Пошук" : "‹ Назад", 885, 32, 170, gray);
@@ -1543,8 +1611,8 @@ int main(void) {
             poll_touch();
             pump_index();
             pump_gallery();
-            pump_covers();
-            if (buttons || now >= next_frame) {
+            bool cover_finished = pump_covers();
+            if (buttons || cover_finished || now >= next_frame) {
                 draw();
                 next_frame = now + 150;
             }
@@ -1567,18 +1635,18 @@ int main(void) {
         atomic_store(&app.pending.cancel, true);
         threadWaitForExit(&app.catalog_thread);
         threadClose(&app.catalog_thread);
-        free(app.pending.details.cover);
     }
     if (app.download_busy) {
         atomic_store(&app.download.cancelled, true);
         threadWaitForExit(&app.download_thread);
         threadClose(&app.download_thread);
     }
-    if (app.cover_busy) {
-        atomic_store(&app.cover_job.cancel, true);
-        threadWaitForExit(&app.cover_thread);
-        threadClose(&app.cover_thread);
-        free(app.cover_job.bytes);
+    for (size_t i = 0; i < COVER_WORKERS; ++i)
+        if (app.cover_jobs[i].busy) atomic_store(&app.cover_jobs[i].cancel, true);
+    for (size_t i = 0; i < COVER_WORKERS; ++i) {
+        CoverJob *job = &app.cover_jobs[i];
+        if (job->busy) finish_cover(job);
+        if (job->connection) curl_easy_cleanup(job->connection);
     }
     if (app.index_busy) {
         threadWaitForExit(&app.index_thread);
@@ -1589,7 +1657,6 @@ int main(void) {
         threadClose(&app.gallery_thread);
     }
     for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
-    SDL_DestroyTexture(app.cover);
     SDL_DestroyTexture(app.description);
     if (app.small) TTF_CloseFont(app.small);
     if (app.normal) TTF_CloseFont(app.normal);

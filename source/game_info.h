@@ -9,6 +9,7 @@
 typedef struct {
     char title[CATALOG_TEXT];
     char publisher[CATALOG_TEXT];
+    char developer[CATALOG_TEXT];
     char released[16];
     char description[6144];
     char original[6144];

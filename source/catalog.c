@@ -363,6 +363,94 @@ static bool load_page(CURL *curl, CatalogIndexJob *job, unsigned page,
     return true;
 }
 
+static bool labeled_size(const char *label, char size[32]) {
+    static const char *const units[] = {"TiB", "GiB", "MiB", "KiB", "TB", "GB", "MB", "KB", "bytes", "B"};
+    for (const char *p = label; *p; ++p) {
+        if (!isdigit((unsigned char)*p) || (p > label && isalnum((unsigned char)p[-1])) ||
+            (p - label >= 2 && (p[-1] == '.' || p[-1] == ',') && isdigit((unsigned char)p[-2])))
+            continue;
+        const char *end = p + strspn(p, "0123456789");
+        if ((*end == '.' || *end == ',') && isdigit((unsigned char)end[1]))
+            end += 1 + strspn(end + 1, "0123456789");
+        int digits = (int)(end - p);
+        if (digits > 12) { p = end - 1; continue; }
+        const char *unit = end + strspn(end, " \t\r\n");
+        if ((unsigned char)unit[0] == 0xc2 && (unsigned char)unit[1] == 0xa0) unit += 2;
+        for (size_t i = 0; i < sizeof(units) / sizeof(*units); ++i) {
+            size_t length = strlen(units[i]);
+            if (!strncasecmp(unit, units[i], length) && !isalnum((unsigned char)unit[length])) {
+                snprintf(size, 32, "%.*s %s", digits, p, units[i]);
+                return true;
+            }
+        }
+        p = end - 1;
+    }
+    return false;
+}
+
+static bool size_attribute(xmlNodePtr node, const char *name, bool bytes, char size[32]) {
+    xmlChar *value = xmlGetProp(node, BAD_CAST name);
+    const char *label = (const char *)value;
+    bool ok = value && labeled_size(label, size);
+    if (value && !ok && bytes && isdigit((unsigned char)*label)) {
+        char *end;
+        errno = 0;
+        unsigned long long length = strtoull(label, &end, 10);
+        if (!errno && length && !*end) {
+            if (length >= 1073741824ULL) snprintf(size, 32, "%.2f GiB", length / 1073741824.0);
+            else if (length >= 1048576ULL) snprintf(size, 32, "%.2f MiB", length / 1048576.0);
+            else if (length >= 1024ULL) snprintf(size, 32, "%.2f KiB", length / 1024.0);
+            else snprintf(size, 32, "%llu B", length);
+            ok = true;
+        }
+    }
+    xmlFree(value);
+    return ok;
+}
+
+static bool download_link_node(xmlNodePtr node) {
+    if (xmlHasProp(node, BAD_CAST "data-romshq-download")) return true;
+    if (!is_element(node, "a")) return false;
+    xmlChar *href = xmlGetProp(node, BAD_CAST "href");
+    const char *url = (const char *)href;
+    bool found = url && (!strncmp(url, DRIVE_PREFIX, sizeof(DRIVE_PREFIX) - 1) ||
+        !strncmp(url, "https://datanodes.to/", sizeof("https://datanodes.to/") - 1) ||
+        !strncmp(url, "https://1fichier.com/", sizeof("https://1fichier.com/") - 1));
+    xmlFree(href);
+    return found;
+}
+
+static unsigned download_links(xmlNodePtr node) {
+    unsigned count = 0;
+    for (; node && count < 2; node = node->next) {
+        if (node->type != XML_ELEMENT_NODE) continue;
+        if (download_link_node(node)) ++count;
+        else count += download_links(node->children);
+    }
+    return count;
+}
+
+static bool size_from_children(xmlNodePtr node, char size[32]) {
+    for (; node; node = node->next) {
+        if (node->type == XML_TEXT_NODE && node->content &&
+            labeled_size((const char *)node->content, size)) return true;
+        if (node->type == XML_ELEMENT_NODE && size_from_children(node->children, size)) return true;
+    }
+    return false;
+}
+
+static void read_file_size(xmlNodePtr node, char size[32]) {
+    for (unsigned depth = 0; node && depth < 3 && node->type == XML_ELEMENT_NODE; ++depth, node = node->parent) {
+        if (depth && download_links(node->children) != 1) break;
+        if (size_attribute(node, "data-size-bytes", true, size) ||
+            size_attribute(node, "data-file-size", true, size) ||
+            size_attribute(node, "data-size", true, size)) return;
+        char label[CATALOG_TEXT];
+        node_text(node, label);
+        if (size_from_children(node->children, size) || labeled_size(label, size)) return;
+    }
+}
+
 static void read_files(xmlNodePtr node, GameDetails *details) {
     for (; node; node = node->next) {
         if (is_element(node, "a")) {
@@ -378,6 +466,7 @@ static void read_files(xmlNodePtr node, GameDetails *details) {
                     memcpy(file->id, id, n);
                     file->id[n] = 0;
                     node_text(node, file->title);
+                    read_file_size(node, file->size);
                     if (!file->title[0]) strcpy(file->title, "Файл DLArchive");
                 }
             }
@@ -471,6 +560,7 @@ static void read_romshq_files(xmlNodePtr node, GameDetails *details) {
             }
             if (valid) {
                 romshq_file_title(node, file.title);
+                read_file_size(node, file.size);
                 const char *label = file.title;
                 bool excluded = !strncasecmp(label, "Mirror ", 7) &&
                     (label[7] == '2' || label[7] == '3') && !isdigit((unsigned char)label[8]);
@@ -510,6 +600,8 @@ static void load_details(CatalogJob *job) {
     CURL *curl = curl_easy_init();
     CatalogFetchStatus status = {.curl = CURLE_FAILED_INIT};
     htmlDocPtr doc = curl ? fetch_page(curl, &job->cancel, job->game.page, &status) : NULL;
+    if (!doc && curl && status.curl == CURLE_OPERATION_TIMEDOUT && !atomic_load(&job->cancel))
+        doc = fetch_page(curl, &job->cancel, job->game.page, &status);
     job->http = status.http;
     if (curl) curl_easy_cleanup(curl);
     if (doc) {

@@ -298,6 +298,11 @@ static bool read_metadata_record(FILE *file, GameMetadata *metadata) {
         inputs += bytes;
         available -= bytes;
     }
+    if (available) {
+        const char *end = memchr(inputs, 0, available);
+        if (end && (size_t)(end - inputs) < sizeof(result.developer))
+            memcpy(result.developer, inputs, (size_t)(end - inputs) + 1);
+    }
     *metadata = result;
     return metadata->title[0] != 0;
 }

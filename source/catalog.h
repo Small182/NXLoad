@@ -42,6 +42,7 @@ typedef struct {
     char id[DLARCHIVE_ID_CAPACITY];
     char url[CATALOG_URL];
     GameFileSource source;
+    char size[32];
 } GameFile;
 
 typedef struct {

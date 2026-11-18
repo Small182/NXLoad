@@ -7,7 +7,7 @@
 typedef struct {
     bool install_default;
     bool delete_rar, delete_nsp;
-    bool auto_catalog;
+    bool auto_catalog, source_enabled[2], light_theme;
     time_t catalog_checked[2];
 } Settings;
 

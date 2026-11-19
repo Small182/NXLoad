@@ -67,10 +67,9 @@ typedef enum {
 #define SETTINGS_VISIBLE 10
 #define TOP_Y 21
 #define TOP_HEIGHT 53
-#define SEARCH_X 929
 #define DOWNLOADS_X 1108
-#define HOME_SEARCH_X 976
-#define HOME_SEARCH_WIDTH (DOWNLOADS_X - HOME_SEARCH_X - 8)
+#define HEADER_ACTION_X 976
+#define HEADER_ACTION_WIDTH (DOWNLOADS_X - HEADER_ACTION_X - 8)
 #define COMPACT_BACK_X 1055
 #define COMPACT_BACK_WIDTH 112
 #define SETTINGS_X 1175
@@ -314,8 +313,8 @@ static void draw_header(void) {
     const bool downloads = app.screen == DOWNLOADS;
     const bool library = app.screen == LIBRARY;
     if (focused && app.top_focus == TOP_SEARCH) {
-        const int x = downloads ? COMPACT_BACK_X : library ? HOME_SEARCH_X : SEARCH_X;
-        const int width = downloads ? COMPACT_BACK_WIDTH : library ? HOME_SEARCH_WIDTH : 163;
+        const int x = downloads ? COMPACT_BACK_X : HEADER_ACTION_X;
+        const int width = downloads ? COMPACT_BACK_WIDTH : HEADER_ACTION_WIDTH;
         rect(x, TOP_Y, width, TOP_HEIGHT, selected);
     }
     if (focused && app.top_focus == TOP_DOWNLOADS)
@@ -324,14 +323,14 @@ static void draw_header(void) {
         rect(SETTINGS_X, TOP_Y, TOP_END - SETTINGS_X, TOP_HEIGHT, selected);
 
     if (library && !app.settings_open) {
-        icon_circle(HOME_SEARCH_X + 17, 42, 8, 2, white);
+        icon_circle(HEADER_ACTION_X + 17, 42, 8, 2, white);
         for (int i = 0; i < 3; ++i)
-            SDL_RenderDrawLine(app.renderer, HOME_SEARCH_X + 22 + i, 47, HOME_SEARCH_X + 28 + i, 53);
-        text(app.normal, "Пошук", HOME_SEARCH_X + 35, 32, HOME_SEARCH_WIDTH - 39, white);
+            SDL_RenderDrawLine(app.renderer, HEADER_ACTION_X + 22 + i, 47, HEADER_ACTION_X + 28 + i, 53);
+        text(app.normal, "Пошук", HEADER_ACTION_X + 35, 32, HEADER_ACTION_WIDTH - 39, white);
     } else if (downloads || app.settings_open) {
         right_text(app.normal, "‹ Назад", COMPACT_BACK_X + 8, 32, COMPACT_BACK_WIDTH - 16, white);
     } else {
-        text(app.normal, "‹ Назад", SEARCH_X + 10, 32, 150, white);
+        right_text(app.normal, "‹ Назад", HEADER_ACTION_X + 8, 32, HEADER_ACTION_WIDTH - 16, white);
     }
     if (!downloads && !app.settings_open) {
         const int arrow_x = DOWNLOADS_X + 28, arrow_y = 34;
@@ -1663,9 +1662,8 @@ static void touch_tap(int x, int y) {
         else if (downloads) {
             if (back_hit) input(HidNpadButton_B);
         } else if (x >= DOWNLOADS_X && x < SETTINGS_X) open_downloads();
-        else if (app.screen == LIBRARY) {
-            if (x >= HOME_SEARCH_X && x < HOME_SEARCH_X + HOME_SEARCH_WIDTH) input(HidNpadButton_X);
-        } else if (x >= SEARCH_X && x < DOWNLOADS_X) input(HidNpadButton_B);
+        else if (x >= HEADER_ACTION_X && x < HEADER_ACTION_X + HEADER_ACTION_WIDTH)
+            input(app.screen == LIBRARY ? HidNpadButton_X : HidNpadButton_B);
         return;
     }
     if (app.screen == LIBRARY) {

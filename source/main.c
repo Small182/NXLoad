@@ -163,7 +163,7 @@ typedef struct {
     bool confirm_install, choose_download, close, download_busy, download_finished;
     bool catalog_busy[2];
     size_t download_choice;
-    char update_target[256];
+    char update_target[256], staged_update_sha[41];
     bool update_ready, update_checking, update_offered;
     UpdateCheck update_check;
     Thread update_thread;
@@ -1108,6 +1108,7 @@ static void finish_jobs(void) {
         app.download_finished = true;
         if (app.download.update_staged) {
             app.update_ready = true;
+            strcpy(app.staged_update_sha, app.active_transfer.update.sha);
             if (!app.queue_count && envHasNextLoad()) app.close = true;
         }
         if (app.active_transfer.app_update)
@@ -2433,7 +2434,8 @@ static void draw_update_dialog(void) {
     rect(190, 200, 900, 305, selected);
     text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
     text(app.normal, line, 224, 298, 828, gray);
-    text(app.small, "Оновлення застосовується після завершення роботи NXLoad.", 224, 354, 828, gray);
+    text(app.small, "Оновлення застосовується після завершення роботи NXLoad.", 224, 343, 828, gray);
+    text(app.small, app.update_target, 224, 374, 828, gray);
     text(app.normal, "A  Встановити", 224, 428, 396, blue);
     text(app.normal, "B  Пізніше", 656, 428, 390, gray);
 }
@@ -2516,11 +2518,11 @@ int main(int argc, char **argv) {
     const char *self = argc > 0 && argv && argv[0] ? argv[0] : "";
     size_t self_len = strlen(self);
     if (self_len < sizeof(app.update_target) && self_len >= 10 &&
-        !strncmp(self, "sdmc:/", 6) && !strstr(self, "/../") &&
+        !strncmp(self, "sdmc:/", 6) && !strchr(self, '"') && !strstr(self, "/../") &&
         !strcasecmp(self + self_len - 4, ".nro"))
         strcpy(app.update_target, self);
     else if (self_len < sizeof(app.update_target) - 5 && self_len >= 5 && self[0] == '/' &&
-             !strstr(self, "/../") && !strcasecmp(self + self_len - 4, ".nro"))
+             !strchr(self, '"') && !strstr(self, "/../") && !strcasecmp(self + self_len - 4, ".nro"))
         snprintf(app.update_target, sizeof(app.update_target), "sdmc:%s", self);
     nx_tls_threading_init();
     bool romfs_ready = R_SUCCEEDED(romfsInit());
@@ -2658,11 +2660,15 @@ int main(int argc, char **argv) {
     free(app.favorites);
     if (romfs_ready) romfsExit();
     if (app.update_ready) {
-        if (apply_update(app.update_target)) {
-            if (envHasNextLoad()) envSetNextLoad(app.update_target, app.update_target);
-        } else {
+        bool installed = apply_update(app.update_target, app.staged_update_sha);
+        char arguments[sizeof(app.update_target) + 2];
+        snprintf(arguments, sizeof(arguments), "\"%s\"", app.update_target);
+        if (!installed || !envHasNextLoad() || R_FAILED(envSetNextLoad(app.update_target, arguments))) {
             consoleInit(NULL);
-            printf("Could not apply NXLoad update. The previous NRO or its .bak and the new .new file are on the SD card.\nPress + to exit.\n");
+            puts(tr(installed ? "Оновлення встановлено. Відкрий цей файл у Homebrew Menu:" :
+                               "Не вдалося встановити оновлення NXLoad. Перевір файл і його резервну копію:"));
+            puts(app.update_target);
+            puts(tr("Натисни +, щоб вийти."));
             while (appletMainLoop()) {
                 padUpdate(&pad);
                 if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;

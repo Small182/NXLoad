@@ -13,6 +13,8 @@
 #include <switch.h>
 #include <unistd.h>
 
+#include "language.h"
+
 #ifndef NXLOAD_BUILD_SHA
 #define NXLOAD_BUILD_SHA "unknown"
 #endif
@@ -371,6 +373,37 @@ done:
     free(r.json);
 }
 
+// Check the embedded build SHA in the executable image, excluding bundled ROMFS data.
+static bool nro_has_build(const char *path, const char *sha) {
+    if (strlen(sha) != 40 || strspn(sha, "0123456789abcdef") != 40) return false;
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    unsigned char header[28], buffer[4096 + 40];
+    bool found = false;
+    if (fread(header, 1, sizeof(header), file) == sizeof(header) &&
+        !memcmp(header + 16, "NRO0", 4)) {
+        uint32_t limit = 0;
+        for (unsigned i = 0; i < 4; ++i) limit |= (uint32_t)header[24 + i] << (8 * i);
+        if (limit >= sizeof(header) && limit <= ZIP_LIMIT) {
+            size_t remaining = limit - sizeof(header), carry = 0;
+            while (remaining) {
+                size_t size = remaining < 4096 ? remaining : 4096;
+                if (fread(buffer + carry, 1, size, file) != size) break;
+                size_t available = size + carry;
+                if (memmem(buffer, available, sha, 41)) {
+                    found = true;
+                    break;
+                }
+                carry = available < 40 ? available : 40;
+                memmove(buffer, buffer + available - carry, carry);
+                remaining -= size;
+            }
+        }
+    }
+    fclose(file);
+    return found;
+}
+
 const char *stage_update(FichierJob *job, const char *target, const UpdateBuild *build) {
     char token[512], stage[320], zip[] = NXLOAD_APP_DIR "/.update-XXXXXX";
     if (!read_token(token)) return "Додай токен GitHub у switch/nxload/github-token.txt";
@@ -403,6 +436,11 @@ const char *stage_update(FichierJob *job, const char *target, const UpdateBuild 
         update_error = "Не вдалося підготувати NXLoad.nro. Перевір місце та відсутність файлу .new.";
         goto done;
     }
+    if (!nro_has_build(stage, build->sha)) {
+        unlink(stage);
+        update_error = tr("Файл NXLoad не відповідає вибраній збірці");
+        goto done;
+    }
     update_error = NULL;
 
 done:
@@ -414,14 +452,17 @@ done:
     return update_error;
 }
 
-bool apply_update(const char *target) {
+bool apply_update(const char *target, const char *sha) {
     char stage[320], backup[320];
     if (snprintf(stage, sizeof(stage), "%s.new", target) >= (int)sizeof(stage) ||
         snprintf(backup, sizeof(backup), "%s.bak", target) >= (int)sizeof(backup)) return false;
-    if (access(target, R_OK) || access(stage, R_OK)) return false;
+    if (access(target, R_OK) || !nro_has_build(stage, sha)) return false;
     if (!access(backup, F_OK) && unlink(backup)) return false;
     if (rename(target, backup)) return false;
-    if (!rename(stage, target)) return true;
+    if (!rename(stage, target)) {
+        if (nro_has_build(target, sha)) return true;
+        if (rename(target, stage)) return false;
+    }
     rename(backup, target);
     return false;
 }

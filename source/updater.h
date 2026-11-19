@@ -17,6 +17,6 @@ typedef struct {
 bool update_configured(void);
 void check_update(UpdateCheck *check);
 const char *stage_update(FichierJob *job, const char *target, const UpdateBuild *build);
-bool apply_update(const char *target);
+bool apply_update(const char *target, const char *sha);
 
 #endif

@@ -73,13 +73,16 @@ typedef enum {
 #define SETTINGS_VISIBLE 10
 #define TOP_Y 21
 #define TOP_HEIGHT 53
-#define DOWNLOADS_X 1108
-#define HEADER_ACTION_X 976
-#define HEADER_ACTION_WIDTH (DOWNLOADS_X - HEADER_ACTION_X - 8)
-#define COMPACT_BACK_X 1055
-#define COMPACT_BACK_WIDTH 112
-#define SETTINGS_X 1175
 #define TOP_END 1240
+#define BATTERY_WIDTH 36
+#define SETTINGS_END (TOP_END - BATTERY_WIDTH)
+#define SETTINGS_X (SETTINGS_END - 65)
+#define DOWNLOADS_X (SETTINGS_X - 67)
+#define HEADER_ACTION_X (DOWNLOADS_X - 132)
+#define HEADER_ACTION_WIDTH (DOWNLOADS_X - HEADER_ACTION_X - 8)
+#define COMPACT_BACK_X (SETTINGS_X - 120)
+#define COMPACT_BACK_WIDTH 112
+#define SD_STATUS_WIDTH 172
 #define DOWNLOADS_DIM_X 1000
 typedef enum { GAME_OVERVIEW, GAME_MEDIA, GAME_FILES } GameTab;
 typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
@@ -155,6 +158,9 @@ typedef struct {
     size_t settings_row;
     Settings settings;
     uint64_t background_check_at;
+    uint64_t header_status_at;
+    int battery_percent;
+    char sd_status[48];
     CatalogIndex catalogs[CATALOG_SOURCE_COUNT];
     CatalogEntry entries[MERGED_CAPACITY];
     size_t entry_count;
@@ -335,6 +341,27 @@ static void icon_circle(int x, int y, int radius, int thickness, SDL_Color color
     }
 }
 
+static void update_header_status(uint64_t now, bool battery_service) {
+    if (now < app.header_status_at) return;
+    app.header_status_at = now + 5000;
+
+    u32 charge = 0;
+    app.battery_percent = battery_service && R_SUCCEEDED(psmGetBatteryChargePercentage(&charge)) &&
+                          charge <= 100 ? (int)charge : -1;
+
+    FsFileSystem *sd = fsdevGetDeviceFileSystem("sdmc");
+    s64 available = 0, capacity = 0;
+    const uint64_t gigabyte = UINT64_C(1000000000);
+    if (sd && R_SUCCEEDED(fsFsGetFreeSpace(sd, "/", &available)) &&
+        R_SUCCEEDED(fsFsGetTotalSpace(sd, "/", &capacity)) &&
+        capacity > 0 && available >= 0 && available <= capacity) {
+        snprintf(app.sd_status, sizeof(app.sd_status), "SD: %" PRIu64 "/%" PRIu64 "Gb",
+                 (uint64_t)available / gigabyte, ((uint64_t)capacity + gigabyte / 2) / gigabyte);
+    } else {
+        strcpy(app.sd_status, "SD: —");
+    }
+}
+
 static void draw_header(void) {
     const bool focused = !app.settings_open;
     const bool downloads = app.screen == DOWNLOADS;
@@ -347,9 +374,10 @@ static void draw_header(void) {
     if (focused && app.top_focus == TOP_DOWNLOADS)
         rect(DOWNLOADS_X, TOP_Y, 57, TOP_HEIGHT, selected);
     if ((focused && app.top_focus == TOP_SETTINGS) || app.settings_open)
-        rect(SETTINGS_X, TOP_Y, TOP_END - SETTINGS_X, TOP_HEIGHT, selected);
+        rect(SETTINGS_X, TOP_Y, SETTINGS_END - SETTINGS_X, TOP_HEIGHT, selected);
 
     if (library && !app.settings_open) {
+        right_text(app.normal, app.sd_status, HEADER_ACTION_X - SD_STATUS_WIDTH - 16, 32, SD_STATUS_WIDTH, gray);
         icon_circle(HEADER_ACTION_X + 17, 42, 8, 2, white);
         for (int i = 0; i < 3; ++i)
             SDL_RenderDrawLine(app.renderer, HEADER_ACTION_X + 22 + i, 47, HEADER_ACTION_X + 28 + i, 53);
@@ -377,6 +405,15 @@ static void draw_header(void) {
     for (size_t i = 0; i < sizeof(teeth) / sizeof(teeth[0]); ++i)
         rect(gear_x + teeth[i].x - 2, gear_y + teeth[i].y - 2, 5, 5, white);
     if (app.update_ready) icon_circle(gear_x + 16, gear_y - 14, 4, 4, blue);
+
+    if (app.battery_percent >= 0) {
+        const int x = SETTINGS_END + (BATTERY_WIDTH - 16) / 2, y = 34;
+        const int fill = (app.battery_percent * 20 + 99) / 100;
+        rect(x + 5, y - 4, 6, 4, white);
+        rect(x, y, 16, 28, white);
+        rect(x + 2, y + 2, 12, 24, background);
+        rect(x + 4, y + 24 - fill, 8, fill, white);
+    }
 }
 
 static void row(size_t i, size_t cursor, int x, int y, int width, const char *label) {
@@ -1291,6 +1328,7 @@ static void finish_jobs(void) {
         threadClose(&app.download_thread);
         app.download_busy = false;
         app.download_finished = true;
+        app.header_status_at = 0;
         if (app.download.update_staged) {
             app.update_ready = true;
             strcpy(app.staged_update_sha, app.active_transfer.update.sha);
@@ -1547,6 +1585,7 @@ static void delete_saved_file(void) {
     } else {
         app.notice[0] = 0;
         app.deleted_until = SDL_GetTicks64() + 3000;
+        app.header_status_at = 0;
         for (size_t i = app.queue_count; i > 0; --i)
             if ((app.queue[i - 1].unpack || app.queue[i - 1].install_local) &&
                 !strcmp(path, app.queue[i - 1].url)) remove_queued(i - 1);
@@ -1919,7 +1958,7 @@ static void touch_tap(int x, int y) {
     }
     const bool downloads = app.screen == DOWNLOADS;
     const bool back_hit = x >= COMPACT_BACK_X && x < COMPACT_BACK_X + COMPACT_BACK_WIDTH;
-    const bool settings_hit = x >= SETTINGS_X && x < TOP_END;
+    const bool settings_hit = x >= SETTINGS_X && x < SETTINGS_END;
     if (app.settings_open) {
         if (y >= TOP_Y && y < TOP_Y + TOP_HEIGHT &&
             (back_hit || settings_hit)) {
@@ -3125,6 +3164,7 @@ int main(int argc, char **argv) {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
     hidInitializeTouchScreen();
+    bool battery_service = ok && R_SUCCEEDED(psmInitialize());
     if (ok) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
         app.settings = load_settings();
@@ -3137,6 +3177,7 @@ int main(int argc, char **argv) {
         AppletHookCookie lifecycle_hook;
         appletHook(&lifecycle_hook, app_lifecycle_hook, NULL);
         keep_console_awake(appletGetFocusState() == AppletFocusState_InFocus);
+        update_header_status(SDL_GetTicks64(), battery_service);
         uint64_t next_frame = 0, next_scroll = 0;
         u64 held = 0;
         while (appletMainLoop() && !app.close) {
@@ -3162,6 +3203,7 @@ int main(int argc, char **argv) {
             held = vertical;
             input(buttons);
             bool touch_changed = poll_touch(buttons != 0);
+            update_header_status(now, battery_service);
             request_game_files();
             pump_file_sizes();
             pump_index();
@@ -3250,6 +3292,7 @@ int main(int argc, char **argv) {
     IMG_Quit();
     TTF_Quit();
     SDL_Quit();
+    if (battery_service) psmExit();
     if (R_SUCCEEDED(font_service)) plExit();
     if (curl_ready) curl_global_cleanup();
     nx_tls_threading_exit();

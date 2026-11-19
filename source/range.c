@@ -18,6 +18,7 @@
 #define RANGE_WRITE_BUFFER (1024 * 1024)
 #define RANGE_RECEIVE_BUFFER (256 * 1024)
 #define MAX_CONNECTIONS 4
+#define MAX_RANGE_RETRIES 2
 #define WRITE_QUEUE_SIZE 8
 
 typedef struct {
@@ -51,7 +52,8 @@ typedef struct {
     FichierJob *job;
     const RangeInfo *info;
     RangeResponse response;
-    uint64_t first, last, received, written;
+    uint64_t first, last, request_first, received, written;
+    unsigned retries;
     unsigned char *buffer;
     size_t buffered;
 } RangePart;
@@ -285,7 +287,7 @@ static size_t part_body(char *data, size_t size, size_t count, void *arg) {
     RangePart *part = arg;
     size_t total = size * count;
     if (atomic_load(&part->job->cancelled) ||
-        !has_range(&part->response, part->first, part->last) ||
+        !has_range(&part->response, part->request_first, part->last) ||
         part->response.total != part->info->length ||
         (part->response.has_etag && strcmp(part->response.etag, part->info->etag)) ||
         total > part->last - part->first + 1 - part->received) return 0;
@@ -303,6 +305,17 @@ static size_t part_body(char *data, size_t size, size_t count, void *arg) {
     return total;
 }
 
+static bool request_remaining(CURLM *multi, RangePart *part) {
+    part->request_first = part->first + part->received;
+    part->write_failed = false;
+    memset(&part->response, 0, sizeof(part->response));
+    char range[48];
+    snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64, part->request_first, part->last);
+    if (curl_easy_setopt(part->curl, CURLOPT_RANGE, range) != CURLE_OK) return false;
+    part->active = curl_multi_add_handle(multi, part->curl) == CURLM_OK;
+    return part->active;
+}
+
 static bool schedule_part(CURLM *multi, RangePart *part, uint64_t *next, uint64_t block_size) {
     part->first = *next;
     uint64_t length = part->info->length - *next;
@@ -311,13 +324,14 @@ static bool schedule_part(CURLM *multi, RangePart *part, uint64_t *next, uint64_
     part->last = *next - 1;
     part->received = part->written = 0;
     part->buffered = 0;
-    part->write_failed = false;
-    memset(&part->response, 0, sizeof(part->response));
-    char range[48];
-    snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64, part->first, part->last);
-    if (curl_easy_setopt(part->curl, CURLOPT_RANGE, range) != CURLE_OK) return false;
-    part->active = curl_multi_add_handle(multi, part->curl) == CURLM_OK;
-    return part->active;
+    part->retries = 0;
+    return request_remaining(multi, part);
+}
+
+static bool retryable_range_error(CURLcode code) {
+    return code == CURLE_PARTIAL_FILE || code == CURLE_RECV_ERROR ||
+        code == CURLE_SEND_ERROR || code == CURLE_OPERATION_TIMEDOUT ||
+        code == CURLE_COULDNT_CONNECT || code == CURLE_GOT_NOTHING;
 }
 
 static uint64_t milliseconds(void) {
@@ -398,7 +412,16 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
                 result = RANGE_RATE_LIMIT;
                 goto done;
             }
-            if (code != CURLE_OK || part->received != part->last - part->first + 1) goto done;
+            uint64_t length = part->last - part->first + 1;
+            if (code != CURLE_OK || part->received != length) {
+                if (atomic_load(&job->cancelled) || part->received == length ||
+                    part->retries >= MAX_RANGE_RETRIES || !retryable_range_error(code)) goto done;
+                ++part->retries;
+                if (!request_remaining(multi, part)) goto done;
+                ++active;
+                rescheduled = true;
+                continue;
+            }
             if (!flush_part(part)) {
                 result = RANGE_SD_ERROR;
                 goto done;
@@ -423,6 +446,8 @@ done:
     curl_slist_free_all(headers);
     if (multi) curl_multi_cleanup(multi);
     if (!finish_writer(&writer, result == RANGE_OK)) result = RANGE_SD_ERROR;
+    if (result == RANGE_RETRY_SINGLE && atomic_load(&job->received))
+        result = RANGE_INTERRUPTED;
     if (result == RANGE_OK) {
         uint64_t ended = milliseconds();
         if (ended > started) job->avg_speed = (uint64_t)(info->length * 1000.0 / (ended - started));

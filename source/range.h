@@ -19,6 +19,7 @@ typedef struct {
 typedef enum {
     RANGE_OK,
     RANGE_RETRY_SINGLE,
+    RANGE_INTERRUPTED,
     RANGE_RATE_LIMIT,
     RANGE_SD_ERROR
 } RangeResult;

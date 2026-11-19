@@ -314,6 +314,7 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
     if (result == RANGE_OK && closed && !atomic_load(&job->cancelled)) {
         if (!rename(t->partial, job->path)) {
             job->result = "Download saved";
+            job->tls_detail[0] = 0;
             return true;
         }
         job->result = "Could not finalize file on SD";
@@ -329,6 +330,10 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
     if (result == RANGE_RATE_LIMIT) {
         job->result = job->dlarchive ? "DLArchive обмежив кількість запитів" :
                                         "Файловий сервер обмежив кількість запитів";
+        return true;
+    }
+    if (result == RANGE_INTERRUPTED) {
+        job->result = "Завантаження перервано. Спробуй ще раз.";
         return true;
     }
     atomic_store(&job->received, 0);

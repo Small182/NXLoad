@@ -99,6 +99,7 @@ static const struct {
     {"Забагато перенаправлень картки ROMsHQ", "Too many ROMsHQ page redirects"},
     {"Завантаження", "Downloads"},
     {"Завантаження оновлення NXLoad…", "Downloading the NXLoad update…"},
+    {"Завантаження перервано. Спробуй ще раз.", "Download interrupted. Try again."},
     {"Завантаження скриншота…", "Loading screenshot…"},
     {"Завантажити", "Download"},
     {"Завантажити й встановити", "Download and install"},

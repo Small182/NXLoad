@@ -78,6 +78,12 @@ static bool entry_name(const char *path, char *name, size_t capacity) {
     return stem != 0;
 }
 
+static void entry_detail(FichierJob *job, const char *reason, const char *path) {
+    snprintf(job->tls_detail, sizeof(job->tls_detail), "%s: %s", reason, path);
+    for (char *c = job->tls_detail; *c; ++c)
+        if ((unsigned char)*c < 32 || *c == 127) *c = '?';
+}
+
 static bool unused_path(const char *path) {
     struct stat entry;
     return lstat(path, &entry) != 0 && errno == ENOENT;
@@ -131,6 +137,7 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
 
 const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
                        UnpackedPackages *packages) {
+    job->tls_detail[0] = 0;
     atomic_store(&job->unpacking, true);
     atomic_store(&job->received, 0);
     atomic_store(&job->total, 0);
@@ -155,9 +162,18 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
            (status = archive_read_next_header(reader, &entry)) == ARCHIVE_OK) {
         const char *path_in_archive = archive_entry_pathname(entry);
         if (!path_in_archive || !package_name(path_in_archive)) continue;
-        if (archive_entry_filetype(entry) != AE_IFREG ||
-            archive_entry_symlink(entry) || archive_entry_hardlink(entry)) {
-            error = "Неприпустимий шлях пакета в RAR";
+        unsigned type = archive_entry_filetype(entry);
+        if (archive_entry_symlink(entry) || archive_entry_hardlink(entry)) {
+            error = "У RAR пакет є посиланням";
+            entry_detail(job, "RAR LINK", path_in_archive);
+            break;
+        }
+        if (type == AE_IFDIR) continue;
+        if (type != AE_IFREG) {
+            error = "Непідтримуваний тип пакета в RAR";
+            char reason[32];
+            snprintf(reason, sizeof(reason), "RAR TYPE %o", type);
+            entry_detail(job, reason, path_in_archive);
             break;
         }
         if (archive_entry_is_encrypted(entry) > 0) {
@@ -177,6 +193,7 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
         ExtractedFile *output = &outputs[count];
         if (!entry_name(path_in_archive, output->name, sizeof(output->name))) {
             error = "Неприпустимий шлях пакета в RAR";
+            entry_detail(job, "RAR PATH", path_in_archive);
             break;
         }
         int size = snprintf(output->destination, sizeof(output->destination), "%s/%s", directory, output->name);
@@ -211,7 +228,13 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
     }
 
 done:
-    if (reader) archive_read_free(reader);
+    if (reader) {
+        if (error && !job->tls_detail[0]) {
+            const char *detail = archive_error_string(reader);
+            if (detail && *detail) entry_detail(job, "libarchive", detail);
+        }
+        archive_read_free(reader);
+    }
     for (size_t i = 0; i < count; ++i) {
         ExtractedFile *output = &outputs[i];
         if (output->published) {

@@ -2412,7 +2412,7 @@ static void draw_downloads(void) {
                      seconds / 3600, seconds / 60 % 60, seconds % 60);
             right_text(app.small, eta, 889, 249, 325, blue);
         }
-        if (app.download_finished && !stage)
+        if (app.download_finished && stage != 2)
             text(app.small, app.download.tls_detail, 66, 270, 1148, gray);
     }
     rect(650, 298, 1, 288, selected);

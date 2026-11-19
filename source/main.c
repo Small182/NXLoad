@@ -69,6 +69,8 @@ typedef enum {
 #define TOP_HEIGHT 53
 #define SEARCH_X 929
 #define DOWNLOADS_X 1108
+#define DOWNLOADS_BACK_X 1055
+#define DOWNLOADS_BACK_WIDTH 112
 #define SETTINGS_X 1175
 #define TOP_END 1240
 #define DOWNLOADS_DIM_X 1000
@@ -307,8 +309,10 @@ static void icon_circle(int x, int y, int radius, int thickness, SDL_Color color
 
 static void draw_header(void) {
     const bool focused = !app.settings_open;
-    if (focused && app.top_focus == TOP_SEARCH) rect(SEARCH_X, TOP_Y,
-        app.screen == DOWNLOADS ? 228 : 163, TOP_HEIGHT, selected);
+    const bool downloads = app.screen == DOWNLOADS;
+    if (focused && app.top_focus == TOP_SEARCH)
+        rect(downloads ? DOWNLOADS_BACK_X : SEARCH_X, TOP_Y,
+             downloads ? DOWNLOADS_BACK_WIDTH : 163, TOP_HEIGHT, selected);
     if (focused && app.top_focus == TOP_DOWNLOADS)
         rect(DOWNLOADS_X, TOP_Y, 57, TOP_HEIGHT, selected);
     if ((focused && app.top_focus == TOP_SETTINGS) || app.settings_open)
@@ -319,10 +323,12 @@ static void draw_header(void) {
         for (int i = 0; i < 3; ++i)
             SDL_RenderDrawLine(app.renderer, SEARCH_X + 24 + i, 47, SEARCH_X + 30 + i, 53);
         text(app.normal, "Пошук", SEARCH_X + 44, 32, 105, white);
+    } else if (downloads) {
+        right_text(app.normal, "‹ Назад", DOWNLOADS_BACK_X + 8, 32, DOWNLOADS_BACK_WIDTH - 16, white);
     } else {
         text(app.normal, "‹ Назад", SEARCH_X + 10, 32, 150, white);
     }
-    if (app.screen != DOWNLOADS) {
+    if (!downloads) {
         const int arrow_x = DOWNLOADS_X + 28, arrow_y = 34;
         bool blink = app.download_busy && !app.active_transfer.app_update &&
                      SDL_GetTicks64() % 1600 < 800;
@@ -1634,9 +1640,12 @@ static void touch_tap(int x, int y) {
         }
         return;
     }
+    const bool downloads = app.screen == DOWNLOADS;
+    const bool back_hit = x >= DOWNLOADS_BACK_X && x < DOWNLOADS_BACK_X + DOWNLOADS_BACK_WIDTH;
+    const bool settings_hit = x >= SETTINGS_X && x < TOP_END;
     if (app.settings_open) {
         if (y >= TOP_Y && y < TOP_Y + TOP_HEIGHT &&
-            x >= SEARCH_X && x < TOP_END) {
+            (downloads ? back_hit || settings_hit : x >= SEARCH_X && x < TOP_END)) {
             toggle_settings();
         } else if (x >= 180 && x < 1100 && y >= SETTINGS_Y) {
             size_t visible = (size_t)(y - SETTINGS_Y) / SETTINGS_STEP;
@@ -1649,9 +1658,10 @@ static void touch_tap(int x, int y) {
         return;
     }
     if (y >= TOP_Y && y < TOP_Y + TOP_HEIGHT) {
-        if (x >= SETTINGS_X && x < TOP_END) toggle_settings();
-        else if (x >= SEARCH_X && x < SETTINGS_X && app.screen == DOWNLOADS) input(HidNpadButton_B);
-        else if (x >= DOWNLOADS_X && x < SETTINGS_X) open_downloads();
+        if (settings_hit) toggle_settings();
+        else if (downloads) {
+            if (back_hit) input(HidNpadButton_B);
+        } else if (x >= DOWNLOADS_X && x < SETTINGS_X) open_downloads();
         else if (x >= SEARCH_X && x < DOWNLOADS_X)
             input(app.screen == LIBRARY ? HidNpadButton_X : HidNpadButton_B);
         return;

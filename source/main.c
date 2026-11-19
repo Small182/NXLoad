@@ -55,6 +55,7 @@
 #define UPDATE_NOTES_Y 211
 #define UPDATE_NOTES_LINE 23
 #define UPDATE_NOTES_ROWS 15
+#define UPDATE_SPINNER_FRAME_MS 75
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 typedef enum { BACKLIGHT_UNCHANGED, BACKLIGHT_APPLET, BACKLIGHT_LBL } BacklightControl;
@@ -482,6 +483,11 @@ static bool network_download_active(void) {
 
 static bool update_in_progress(void) {
     return app.update_ready || (app.download_busy && app.active_transfer.app_update);
+}
+
+static bool update_waiting_for_install(void) {
+    return app.update_ready || (app.download_busy && app.active_transfer.app_update &&
+                               atomic_load(&app.download.update_received));
 }
 
 static void download_worker(void *arg) {
@@ -998,8 +1004,10 @@ static bool cover_visible(const CoverJob *job) {
     return false;
 }
 
+static void wait_for_thread(Thread *thread);
+
 static void finish_cover(CoverJob *job) {
-    threadWaitForExit(&job->thread);
+    wait_for_thread(&job->thread);
     threadClose(&job->thread);
     job->busy = false;
     if (!atomic_load(&job->cancel)) {
@@ -3015,12 +3023,44 @@ static void draw_trailer(void) {
     }
 }
 
+static void draw_update_spinner(int x, int y) {
+    static const SDL_FPoint directions[] = {
+        {0, -1}, {0.5f, -0.866f}, {0.866f, -0.5f}, {1, 0}, {0.866f, 0.5f}, {0.5f, 0.866f},
+        {0, 1}, {-0.5f, 0.866f}, {-0.866f, 0.5f}, {-1, 0}, {-0.866f, -0.5f}, {-0.5f, -0.866f},
+    };
+    static const int triangles[] = {0, 1, 2, 0, 2, 3};
+    const size_t segments = sizeof(directions) / sizeof(*directions);
+    const size_t head = SDL_GetTicks64() / UPDATE_SPINNER_FRAME_MS % segments;
+    for (size_t i = 0; i < segments; ++i) {
+        unsigned age = (unsigned)((head + segments - i) % segments);
+        unsigned bright = 100 - 6 * age;
+        SDL_Color color = {
+            (white.r * bright + panel.r * (100 - bright)) / 100,
+            (white.g * bright + panel.g * (100 - bright)) / 100,
+            (white.b * bright + panel.b * (100 - bright)) / 100, 255,
+        };
+        float dx = directions[i].x, dy = directions[i].y;
+        float inner_x = x + 24 * dx, inner_y = y + 24 * dy;
+        float outer_x = x + 37 * dx, outer_y = y + 37 * dy;
+        SDL_Vertex spoke[] = {
+            {.position = {inner_x - 3 * dy, inner_y + 3 * dx}, .color = color},
+            {.position = {outer_x - 3 * dy, outer_y + 3 * dx}, .color = color},
+            {.position = {outer_x + 3 * dy, outer_y - 3 * dx}, .color = color},
+            {.position = {inner_x + 3 * dy, inner_y - 3 * dx}, .color = color},
+        };
+        SDL_RenderGeometry(app.renderer, NULL, spoke, 4, triangles, 6);
+        icon_circle((int)(inner_x + 0.5f), (int)(inner_y + 0.5f), 3, 3, color);
+        icon_circle((int)(outer_x + 0.5f), (int)(outer_y + 0.5f), 3, 3, color);
+    }
+}
+
 static void draw_update_progress(void) {
     rect(0, 0, 1280, 720, background);
     rect(190, 216, 900, 268, panel);
     text(app.large, "Оновлення NXLoad", 224, 245, 828, white);
-    if (app.update_ready || atomic_load(&app.download.update_received)) {
-        text(app.normal, "Очікуйте встановлення", 224, 323, 828, blue);
+    if (update_waiting_for_install()) {
+        centered_text(app.normal, "Очікуйте встановлення", 224, 323, 828, blue);
+        draw_update_spinner(640, 410);
         return;
     }
     text(app.normal, "Завантаження оновлення NXLoad…", 224, 323, 828, gray);
@@ -3115,6 +3155,20 @@ static void draw(void) {
         text(app.normal, "B  Скасувати", 656, 428, 390, gray);
     }
     SDL_RenderPresent(app.renderer);
+}
+
+static void wait_for_thread(Thread *thread) {
+    if (app.close && app.update_ready) {
+        while (waitSingle(waiterForThread(thread), UPDATE_SPINNER_FRAME_MS * UINT64_C(1000000)) ==
+               KERNELRESULT(TimedOut))
+            draw();
+    }
+    threadWaitForExit(thread);
+}
+
+static void apply_update_worker(void *arg) {
+    bool *installed = arg;
+    *installed = apply_update(app.update_target, app.staged_update_sha);
 }
 
 static TTF_Font *font_open(const PlFontData *font, int points) {
@@ -3213,7 +3267,7 @@ int main(int argc, char **argv) {
             yield_unpack_for_game_requests();
             if (app.trailer_open || buttons || touch_changed || cover_finished || now >= next_frame) {
                 draw();
-                next_frame = now + 150;
+                next_frame = now + (update_waiting_for_install() ? UPDATE_SPINNER_FRAME_MS : 150);
             }
             uint64_t elapsed = SDL_GetTicks64() - now;
             if (elapsed < 16) SDL_Delay((uint32_t)(16 - elapsed));
@@ -3239,19 +3293,19 @@ int main(int argc, char **argv) {
     trailer_shutdown();
     if (app.size_job.busy) {
         atomic_store(&app.size_job.cancel, true);
-        threadWaitForExit(&app.size_job.thread);
+        wait_for_thread(&app.size_job.thread);
         threadClose(&app.size_job.thread);
     }
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source)
         if (app.catalog_busy[source]) atomic_store(&app.pending[source].cancel, true);
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) {
         if (!app.catalog_busy[source]) continue;
-        threadWaitForExit(&app.catalog_thread[source]);
+        wait_for_thread(&app.catalog_thread[source]);
         threadClose(&app.catalog_thread[source]);
     }
     if (app.download_busy) {
         atomic_store(&app.download.cancelled, true);
-        threadWaitForExit(&app.download_thread);
+        wait_for_thread(&app.download_thread);
         threadClose(&app.download_thread);
     }
     for (size_t i = 0; i < COVER_WORKERS; ++i)
@@ -3262,23 +3316,32 @@ int main(int argc, char **argv) {
         if (job->connection) curl_easy_cleanup(job->connection);
     }
     if (app.update_checking) {
-        threadWaitForExit(&app.update_thread);
+        wait_for_thread(&app.update_thread);
         threadClose(&app.update_thread);
     }
     if (app.index_busy) {
-        threadWaitForExit(&app.index_thread);
+        wait_for_thread(&app.index_thread);
         threadClose(&app.index_thread);
     }
     if (app.gallery_busy) {
-        threadWaitForExit(&app.gallery_thread);
+        wait_for_thread(&app.gallery_thread);
         threadClose(&app.gallery_thread);
     }
     if (app.trailer_busy) {
-        threadWaitForExit(&app.trailer_thread);
+        wait_for_thread(&app.trailer_thread);
         threadClose(&app.trailer_thread);
     }
     if (romfs_ready) romfsExit();
-    bool update_installed = app.update_ready && apply_update(app.update_target, app.staged_update_sha);
+    bool update_installed = false;
+    if (app.update_ready) {
+        Thread install_thread;
+        if (start_worker(&install_thread, apply_update_worker, &update_installed)) {
+            wait_for_thread(&install_thread);
+            threadClose(&install_thread);
+        } else {
+            apply_update_worker(&update_installed);
+        }
+    }
     keep_console_awake(false);
     for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
     for (size_t i = 0; i < TEXT_SLOTS; ++i)

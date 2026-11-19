@@ -52,6 +52,7 @@
 #define DOWNLOAD_QUEUE_LIMIT 24
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
+typedef enum { BACKLIGHT_UNCHANGED, BACKLIGHT_APPLET, BACKLIGHT_LBL } BacklightControl;
 typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
 typedef enum {
     SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG,
@@ -129,6 +130,7 @@ typedef struct {
     size_t game_count, genre_count, game_index, file_index, saved_count, saved_index;
     int grid_scroll, file_scroll;
     bool favorites_open, dimmed;
+    BacklightControl backlight;
     char (*favorites)[CATALOG_TEXT];
     size_t favorites_count;
     uint64_t deleted_until, prefetch_at;
@@ -1778,14 +1780,53 @@ static bool drag_scroll(DragArea area, int delta, int *remainder) {
     return true;
 }
 
+static void darken_download_screen(void) {
+    app.dimmed = true;
+    if (appletGetOperationMode() != AppletOperationMode_Handheld ||
+        appletGetFocusState() != AppletFocusState_InFocus) return;
+    if (R_SUCCEEDED(appletSetLcdBacklightOffEnabled(true))) {
+        app.backlight = BACKLIGHT_APPLET;
+        return;
+    }
+    if (R_FAILED(lblInitialize())) return;
+    LblBacklightSwitchStatus status;
+    if (R_SUCCEEDED(lblGetBacklightSwitchStatus(&status)) &&
+        (status == LblBacklightSwitchStatus_Enabled || status == LblBacklightSwitchStatus_Enabling) &&
+        R_SUCCEEDED(lblSwitchBacklightOff(0))) {
+        app.backlight = BACKLIGHT_LBL;
+    } else {
+        lblExit();
+    }
+}
+
+static bool wake_download_screen(void) {
+    if (app.backlight == BACKLIGHT_APPLET && R_FAILED(appletSetLcdBacklightOffEnabled(false)))
+        return false;
+    if (app.backlight == BACKLIGHT_LBL) {
+        if (R_FAILED(lblSwitchBacklightOn(0))) return false;
+        lblExit();
+    }
+    app.backlight = BACKLIGHT_UNCHANGED;
+    app.dimmed = false;
+    return true;
+}
+
+static void download_screen_hook(AppletHookType hook, void *unused) {
+    (void)unused;
+    if (app.dimmed && (hook == AppletHookType_OnExitRequest ||
+                      hook == AppletHookType_OnOperationMode ||
+                      (hook == AppletHookType_OnFocusState && appletGetFocusState() != AppletFocusState_InFocus)))
+        wake_download_screen();
+}
+
 static bool poll_touch(bool controller_input) {
     static int start_x, start_y, x, y, remainder;
     static bool touching, cancelled, dragged;
     static DragArea area;
     HidTouchScreenState state;
     if (!hidGetTouchScreenStates(&state, 1)) return false;
-    if (app.dimmed && state.count && !controller_input) {
-        app.dimmed = false;
+    if (app.dimmed && state.count && !controller_input && !cancelled) {
+        wake_download_screen();
         touching = dragged = false;
         cancelled = true;
         return true;
@@ -1825,7 +1866,7 @@ static bool poll_touch(bool controller_input) {
 static void input(u64 buttons) {
     if (!buttons) return;
     if (app.dimmed) {
-        if (buttons & HidNpadButton_Minus) app.dimmed = false;
+        if (buttons & HidNpadButton_Minus) wake_download_screen();
         return;
     }
     if (update_dialog_visible()) {
@@ -1872,7 +1913,7 @@ static void input(u64 buttons) {
         return;
     }
     if (!app.filters_open && (buttons & HidNpadButton_Minus)) {
-        if (app.screen == DOWNLOADS) app.dimmed = true;
+        if (app.screen == DOWNLOADS) darken_download_screen();
         else toggle_settings();
         return;
     }
@@ -1905,7 +1946,6 @@ static void input(u64 buttons) {
     }
     if (app.screen == DOWNLOADS) {
         if (buttons & HidNpadButton_B) {
-            app.dimmed = false;
             app.top_focus = TOP_NONE;
             app.screen = app.previous;
             return;
@@ -2580,6 +2620,8 @@ int main(int argc, char **argv) {
         load_catalog_metadata();
         open_catalogs();
         start_update_check(false);
+        AppletHookCookie screen_hook;
+        appletHook(&screen_hook, download_screen_hook, NULL);
         uint64_t next_frame = 0, next_scroll = 0;
         u64 held = 0;
         while (appletMainLoop() && !app.close) {
@@ -2612,6 +2654,9 @@ int main(int argc, char **argv) {
             uint64_t elapsed = SDL_GetTicks64() - now;
             if (elapsed < 16) SDL_Delay((uint32_t)(16 - elapsed));
         }
+        wake_download_screen();
+        appletUnhook(&screen_hook);
+        if (app.backlight == BACKLIGHT_LBL) lblExit();
     } else {
         SDL_Quit();
         consoleInit(NULL);

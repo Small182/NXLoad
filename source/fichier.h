@@ -14,6 +14,7 @@ typedef struct {
     atomic_bool cancelled;
     atomic_bool unpacking;
     atomic_bool installing;
+    atomic_bool yield_for_game_requests;
     atomic_uint_fast64_t received;
     atomic_uint_fast64_t total;
     atomic_uint streams;

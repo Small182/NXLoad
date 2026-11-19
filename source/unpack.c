@@ -129,6 +129,9 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
         }
         written += (uint64_t)bytes;
         atomic_fetch_add(&job->received, (uint64_t)bytes);
+#ifdef __SWITCH__
+        if (atomic_load(&job->yield_for_game_requests)) svcSleepThread(1000000);
+#endif
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
     if (!error && written != size) error = "Пакет в архіві неповний";

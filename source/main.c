@@ -80,6 +80,8 @@ typedef enum {
 typedef enum { GAME_OVERVIEW, GAME_MEDIA, GAME_FILES } GameTab;
 typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
 
+enum { WORKER_PRIORITY = 0x2c, STORAGE_WORKER_PRIORITY = 0x30 };
+
 static const char *const sort_names[] = {"За рейтингом", "За алфавітом", "За датою виходу"};
 static const char *const genre_names[] = {
     "Усі жанри", "Екшн", "Пригоди", "Аркада", "Настільні", "Освітні", "Файтинг",
@@ -422,6 +424,17 @@ static void gallery_worker(void *arg) { load_game_gallery(arg); }
 static void trailer_worker(void *arg) { load_game_trailers(arg); }
 static void index_worker(void *arg) { catalog_build_index(arg); }
 static void update_check_worker(void *arg) { check_update(arg); }
+
+static unsigned transfer_stage(void) {
+    if (atomic_load(&app.download.installing)) return 2;
+    if (atomic_load(&app.download.unpacking)) return 1;
+    return 0;
+}
+
+static bool network_download_active(void) {
+    return app.download_busy && transfer_stage() == 0;
+}
+
 static void download_worker(void *arg) {
     FichierJob *job = arg;
     const char *path = job->url;
@@ -436,6 +449,9 @@ static void download_worker(void *arg) {
         if (atomic_load(&job->cancelled) || strcmp(job->result, "Download saved")) return;
         path = job->path;
     }
+    // Archive and installation I/O share the console with the active game card.
+    svcSetThreadPriority(threadGetCurHandle(), STORAGE_WORKER_PRIORITY);
+    fsSetPriority(FsPriority_Low);
     bool archive_delete_failed = false, nsp_delete_failed = false;
     if (job->local_unpack || archive_name(path) || archive_signature(path)) {
         UnpackedPackages packages = {0};
@@ -486,7 +502,7 @@ static void download_worker(void *arg) {
 }
 
 static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
-    Result rc = threadCreate(thread, function, arg, NULL, 128 * 1024, 0x2c, -2);
+    Result rc = threadCreate(thread, function, arg, NULL, 128 * 1024, WORKER_PRIORITY, -2);
     if (R_FAILED(rc)) return false;
     rc = threadStart(thread);
     if (R_FAILED(rc)) threadClose(thread);
@@ -744,7 +760,7 @@ static void pump_file_sizes(void) {
             }
         }
     }
-    if (app.screen != GAME || app.game_tab != GAME_FILES || app.download_busy) return;
+    if (app.screen != GAME || app.game_tab != GAME_FILES || network_download_active()) return;
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) {
         if (!app.settings.source_enabled[source]) continue;
         GameDetails *details = &app.details[source];
@@ -941,7 +957,7 @@ static const char *next_cover(bool *screenshot) {
         *screenshot = true;
         size_t shots[] = {app.screenshot_index, app.screenshot_index + 1,
                           app.screenshot_index ? app.screenshot_index - 1 : SIZE_MAX};
-        size_t limit = app.download_busy ? 1 : sizeof(shots) / sizeof(*shots);
+        size_t limit = network_download_active() ? 1 : sizeof(shots) / sizeof(*shots);
         for (size_t i = 0; i < limit; ++i) {
             if (shots[i] >= app.gallery.count) continue;
             const char *image = app.gallery.screenshots[shots[i]];
@@ -999,6 +1015,16 @@ static bool pump_covers(void) {
     return finished;
 }
 
+static void yield_unpack_for_game_requests(void) {
+    if (!app.download_busy || !atomic_load(&app.download.unpacking)) return;
+    bool pending = app.gallery_busy || app.trailer_busy || app.size_job.busy;
+    for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source)
+        pending |= app.catalog_busy[source];
+    for (size_t i = 0; i < COVER_WORKERS; ++i)
+        pending |= app.cover_jobs[i].busy && app.cover_jobs[i].screenshot;
+    atomic_store(&app.download.yield_for_game_requests, app.screen == GAME && pending);
+}
+
 static void update_description(void) {
     SDL_DestroyTexture(app.description);
     app.description = NULL;
@@ -1035,6 +1061,7 @@ static void pump_gallery(void) {
                app.details[CATALOG_NSROMS].title : app.details[CATALOG_ROMSHQ].title);
         strcpy(job->catalog_title, app.active_game.title);
         strcpy(job->fallback_hashes, app.metadata.fallback_hashes);
+        job->prefer_titledb = app.download_busy && transfer_stage() != 0;
         app.gallery_requested = true;
         app.gallery_busy = start_worker(&app.gallery_thread, gallery_worker, job);
         if (!app.gallery_busy)
@@ -1172,12 +1199,6 @@ static void pump_index(void) {
 
 static void launch_next_transfer(void);
 
-static unsigned transfer_stage(void) {
-    if (atomic_load(&app.download.installing)) return 2;
-    if (atomic_load(&app.download.unpacking)) return 1;
-    return 0;
-}
-
 static void finish_jobs(void) {
     if (app.update_checking && R_SUCCEEDED(waitSingle(waiterForThread(&app.update_thread), 0))) {
         threadWaitForExit(&app.update_thread);
@@ -1270,6 +1291,7 @@ static void launch_next_transfer(void) {
     atomic_init(&job->cancelled, false);
     atomic_init(&job->unpacking, false);
     atomic_init(&job->installing, false);
+    atomic_init(&job->yield_for_game_requests, false);
     atomic_init(&job->received, 0);
     atomic_init(&job->total, 0);
     atomic_init(&job->streams, 0);
@@ -2897,6 +2919,7 @@ int main(int argc, char **argv) {
             pump_gallery();
             pump_trailers();
             bool cover_finished = pump_covers();
+            yield_unpack_for_game_requests();
             if (app.trailer_open || buttons || touch_changed || cover_finished || now >= next_frame) {
                 draw();
                 next_frame = now + 150;

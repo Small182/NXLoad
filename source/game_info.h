@@ -31,6 +31,7 @@ typedef struct {
     char heading[CATALOG_TEXT];
     char catalog_title[CATALOG_TEXT];
     char fallback_hashes[GALLERY_HASHES];
+    bool prefer_titledb;
     GameGallery result;
     atomic_bool cancel;
 } GalleryJob;

@@ -491,6 +491,10 @@ void load_game_gallery(GalleryJob *job) {
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
     if (bundled_gallery(key, &job->result)) return;
+    if (job->prefer_titledb) {
+        titledb_gallery(job);
+        if (job->result.count) return;
+    }
     CatalogFetchStatus status = {0};
     if (job->nintendo_life[0] && !atomic_load(&job->cancel)) {
         char url[CATALOG_URL];

@@ -35,6 +35,7 @@ typedef struct {
     bool local_unpack;
     bool local_install;
     bool install_after_download;
+    bool homebrew_port;
     bool app_update, update_staged;
     bool delete_rar, delete_nsp;
     const char *dlarchive_id;

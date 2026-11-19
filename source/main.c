@@ -107,7 +107,7 @@ typedef struct {
 typedef struct {
     char name[CATALOG_TEXT], url[2048], id[DLARCHIVE_ID_CAPACITY];
     GameFileSource source;
-    bool unpack, install_local, install_after_download, app_update;
+    bool unpack, install_local, install_after_download, app_update, homebrew_port;
     UpdateBuild update;
 } DownloadRequest;
 
@@ -452,24 +452,25 @@ static void download_worker(void *arg) {
     if (!job->local_unpack && !job->local_install) {
         fichier_download(job);
         if (atomic_load(&job->cancelled) || strcmp(job->result, "Download saved")) return;
+        if (job->homebrew_port && !job->install_after_download) return;
         path = job->path;
     }
     // Archive and installation I/O share the console with the active game card.
     svcSetThreadPriority(threadGetCurHandle(), STORAGE_WORKER_PRIORITY);
     fsSetPriority(FsPriority_Low);
-    bool archive_delete_failed = false, nsp_delete_failed = false;
+    bool archive_delete_failed = false, nsp_delete_failed = false, port_files_copied = false;
     if (job->local_unpack || archive_name(path) || archive_signature(path)) {
         UnpackedPackages packages = {0};
-        const char *error = unpack_archive(job, path, NXLOAD_DOWNLOAD_DIR,
-                                      job->install_after_download ? &packages : NULL);
+        const char *error = unpack_archive(job, path, NXLOAD_DOWNLOAD_DIR, &packages);
         if (error) {
             job->result = error;
             return;
         }
         if (!job->install_after_download) {
-            archive_delete_failed = job->delete_rar && unlink(path) != 0;
+            bool delete_archive = job->delete_rar && !packages.has_port_files;
+            archive_delete_failed = delete_archive && unlink(path) != 0;
             job->result = archive_delete_failed ? "Розпаковано · не вдалося видалити архів" :
-                          job->delete_rar ? "Архів розпаковано й видалено" : "Архів розпаковано й збережено";
+                          delete_archive ? "Архів розпаковано й видалено" : "Архів розпаковано й збережено";
             return;
         }
         for (size_t i = 0; i < packages.count; ++i) {
@@ -487,6 +488,7 @@ static void download_worker(void *arg) {
             if (job->delete_nsp && unlink(packages.paths[i])) nsp_delete_failed = true;
         }
         archive_delete_failed = job->delete_rar && unlink(path) != 0;
+        port_files_copied = packages.has_port_files;
     } else if (job->install_after_download || job->local_install) {
         if (!nsp_name(path) && !nsp_signature(path)) {
             job->result = "Файл збережено. NXLoad встановлює NSP. Інші формати можна відкрити в DBI.";
@@ -503,6 +505,7 @@ static void download_worker(void *arg) {
     }
     job->result = archive_delete_failed || nsp_delete_failed ?
         "Встановлено на microSD · не всі файли вдалося видалити" :
+        port_files_copied ? "Порт встановлено · файли додано до папки switch" :
         job->delete_nsp ? "Встановлено на microSD · NSP видалено" : "Встановлено на microSD · NSP збережено";
 }
 
@@ -1317,6 +1320,7 @@ static void launch_next_transfer(void) {
     job->local_unpack = request->unpack;
     job->local_install = request->install_local;
     job->install_after_download = request->install_after_download;
+    job->homebrew_port = request->homebrew_port;
     job->app_update = request->app_update;
     job->delete_rar = app.settings.delete_rar;
     job->delete_nsp = app.settings.delete_nsp;
@@ -1363,7 +1367,10 @@ static void choose_transfer(const DownloadRequest *request) {
 }
 
 static void select_file_action(const GameFile *file) {
-    DownloadRequest request = {.source = file->source};
+    DownloadRequest request = {
+        .source = file->source,
+        .homebrew_port = romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS])
+    };
     const char *title = app.active_metadata ? app.active_metadata->title : app.active_game.title;
     snprintf(request.name, sizeof(request.name), "%.120s · %.64s", title, tr(file->title));
     strcpy(request.id, file->id);

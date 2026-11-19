@@ -278,7 +278,7 @@ static const struct {
     {"← / →  Списки    A  Встановити / розпакувати", "← / →  Lists    A  Install / Extract"},
     {"↑ / ↓  Читати опис", "↑ / ↓  Scroll description"},
     {"↓ + Встановити · %.145s", "↓ + Install · %.145s"},
-    {"−  Чорний екран", "−  Black screen"},
+    {"−  Затемнити екран", "−  Dim screen"},
 };
 
 void set_english(bool enabled) {

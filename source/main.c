@@ -70,6 +70,7 @@ typedef enum {
 #define DOWNLOADS_X 1108
 #define SETTINGS_X 1175
 #define TOP_END 1240
+#define DOWNLOADS_DIM_X 1000
 typedef enum { GAME_OVERVIEW, GAME_SCREENSHOTS, GAME_FILES } GameTab;
 typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
 
@@ -1709,7 +1710,7 @@ static void touch_tap(int x, int y) {
         }
     } else if (y >= 657 && y < 698) {
         app.top_focus = TOP_NONE;
-        if (x >= 1060) input(HidNpadButton_Minus);
+        if (x >= DOWNLOADS_DIM_X) input(HidNpadButton_Minus);
         else if (x >= 880) input(HidNpadButton_B);
         else if (x >= 685) input(HidNpadButton_Y);
         else if (x >= 455) input(HidNpadButton_X);
@@ -2486,8 +2487,8 @@ static void draw(void) {
         text(app.small, "← / →  Списки    A  Встановити / розпакувати", 40, 665, 410, gray);
         text(app.small, app.queue_focus ? "X  Прибрати з черги" : "X  Видалити файл", 455, 665, 225, gray);
         if (app.download_busy) text(app.small, "Y  Скасувати", 685, 665, 190, gray);
-        text(app.small, "B  Назад", 880, 665, 175, gray);
-        text(app.small, "−  Чорний екран", 1060, 665, 180, gray);
+        text(app.small, "B  Назад", 880, 665, DOWNLOADS_DIM_X - 880, gray);
+        text(app.small, "−  Затемнити екран", DOWNLOADS_DIM_X, 665, TOP_END - DOWNLOADS_DIM_X, gray);
     }
     if (app.filters_open) draw_filters();
     if (update_dialog_visible()) draw_update_dialog();

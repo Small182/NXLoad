@@ -487,7 +487,9 @@ static PackageEntry *match_content(Package *pkg, const NcmContentInfo *info) {
 
 const char *install_package(FichierJob *job, const char *path, InstallFormat format) {
     const char *filename = strrchr(path, '/');
-    snprintf(job->tls_detail, sizeof(job->tls_detail), "%.127s", filename ? filename + 1 : path);
+    filename = filename ? filename + 1 : path;
+    snprintf(job->tls_detail, sizeof(job->tls_detail), "%.127s", filename);
+    if (format == INSTALL_XCI) snprintf(job->dbi_file, sizeof(job->dbi_file), "%s", filename);
     Package pkg = {.file = fopen(path, "rb")};
     if (!pkg.file) return "Не вдалося відкрити збережений пакет";
     InstallMeta meta = {0};
@@ -496,7 +498,7 @@ const char *install_package(FichierJob *job, const char *path, InstallFormat for
     Service manager = {0}, es = {0};
     FsRightsId required = {0};
     bool ncm_ready = false, ns_ready = false, meta_written = false, imported = false;
-    bool clean = true;
+    bool clean = true, installed = false;
     unsigned char *cnmt = NULL, *buffer = NULL;
     const char *error = format == INSTALL_XCI ? "Не вдалося прочитати розділ secure або метадані XCI" :
                          "Некоректний або непідтримуваний пакет NSP";
@@ -546,7 +548,6 @@ const char *install_package(FichierJob *job, const char *path, InstallFormat for
             "Невідомий формат CNMT. Підтримуються базова гра, оновлення та DLC.";
         goto done;
     }
-    bool installed = false;
     rc = ncmContentMetaDatabaseHas(&db, &installed, &meta.key);
     if (R_FAILED(rc)) { error = service_error(job, "Не вдалося перевірити встановлені версії", rc); goto done; }
     if (installed) { error = "Ця версія вже встановлена на microSD"; goto done; }
@@ -626,5 +627,6 @@ done:
     free(meta.data);
     free(cnmt);
     free(buffer);
+    if ((!error && clean) || installed || atomic_load(&job->cancelled)) job->dbi_file[0] = 0;
     return clean ? error : "Встановлення перерване. Система не підтвердила очищення всіх записів.";
 }

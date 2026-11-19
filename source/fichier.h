@@ -27,6 +27,7 @@ typedef struct {
     uint64_t avg_speed;
     char tls_detail[128];
     char install_error[192];
+    char dbi_file[FICHIER_INPUT_CAPACITY];
     char path[256];
     const char *url;
     bool megaup;

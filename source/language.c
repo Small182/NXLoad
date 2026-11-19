@@ -145,6 +145,7 @@ static const struct {
     {"Не вдалося визначити вільне місце", "Could not determine available space"},
     {"Не вдалося встановити захищене з’єднання", "Could not establish a secure connection"},
     {"Не вдалося встановити оновлення NXLoad. Перевір файл і його резервну копію:", "Could not install the NXLoad update. Check this file and its backup:"},
+    {"Не вдалося відкрити DBI", "Could not open DBI"},
     {"Не вдалося відкрити архів", "Could not open the archive"},
     {"Не вдалося відкрити великий пакет на microSD", "Could not open the large package on the microSD card"},
     {"Не вдалося відкрити збережений пакет", "Could not open the saved package"},

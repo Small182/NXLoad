@@ -203,6 +203,8 @@ typedef struct {
     struct { uint16_t offset, length; } update_lines[UPDATE_DETAILS_BYTES];
     int update_line_count, update_details_scroll;
     char query[96], notice[192], delete_file[sizeof(((SavedFile *)0)->file)];
+    char installer_file[sizeof(((SavedFile *)0)->file)];
+    const char *installer_error;
     DownloadRequest active_transfer, draft_transfer, queue[DOWNLOAD_QUEUE_LIMIT];
     size_t queue_count, queue_index;
     bool queue_focus;
@@ -1293,6 +1295,13 @@ static void pump_index(void) {
 
 static void launch_next_transfer(void);
 
+static void offer_installer(const char *filename) {
+    if (app.confirm_install) return;
+    snprintf(app.installer_file, sizeof(app.installer_file), "%s", filename);
+    app.installer_error = NULL;
+    app.confirm_install = true;
+}
+
 static void finish_jobs(void) {
     if (app.update_checking && R_SUCCEEDED(waitSingle(waiterForThread(&app.update_thread), 0))) {
         threadWaitForExit(&app.update_thread);
@@ -1346,6 +1355,8 @@ static void finish_jobs(void) {
         }
         if (app.active_transfer.app_update)
             snprintf(app.update_notice, sizeof(app.update_notice), "%s", tr(app.download.result));
+        if (app.download.dbi_file[0] && !atomic_load(&app.download.cancelled))
+            offer_installer(app.download.dbi_file);
         refresh_saved();
         if (app.queue_count && !app.active_transfer.app_update)
             snprintf(app.notice, sizeof(app.notice), tr("Попереднє: %.170s"), tr(app.download.result));
@@ -1610,19 +1621,20 @@ static void delete_saved_file(void) {
 }
 
 static void open_installer(void) {
+    if (app.download_busy || app.queue_count) return;
     const char *paths[] = {
         "sdmc:/switch/DBI/DBI.nro", "sdmc:/switch/DBI.nro",
         "sdmc:/switch/DBI/dbi.nro", "sdmc:/switch/dbi.nro"
     };
-    app.confirm_install = false;
+    app.installer_error = "DBI не знайдено. Потрібен DBI.nro в папці switch/DBI/.";
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
-        if (!access(paths[i], R_OK) && envHasNextLoad() &&
-            R_SUCCEEDED(envSetNextLoad(paths[i], paths[i]))) {
+        if (access(paths[i], R_OK)) continue;
+        app.installer_error = "Не вдалося відкрити DBI";
+        if (envHasNextLoad() && R_SUCCEEDED(envSetNextLoad(paths[i], paths[i]))) {
             app.close = true;
             return;
         }
     }
-    strcpy(app.notice, "DBI не знайдено. Потрібен DBI.nro в папці switch/DBI/.");
 }
 
 static bool guess_romshq_page(Game *game, const char *title) {
@@ -1922,6 +1934,11 @@ static void touch_swipe(int y, int dx, int dy) {
 }
 
 static void touch_tap(int x, int y) {
+    if (app.confirm_install) {
+        if (x >= 224 && x < 1050 && y >= 417 && y < 490)
+            input(x < 640 ? HidNpadButton_A : HidNpadButton_B);
+        return;
+    }
     if (app.trailer_open) {
         if (x < 175 && y < 90) close_trailer();
         else if (y >= 652 && x > 1010 && app.trailers.count > 1) step_trailer(x >= 1140);
@@ -1944,6 +1961,11 @@ static void touch_tap(int x, int y) {
         }
         return;
     }
+    if (app.delete_file[0]) {
+        if (x >= 224 && x < 1050 && y >= 417 && y < 490)
+            input(x < 640 ? HidNpadButton_A : HidNpadButton_B);
+        return;
+    }
     if (app.choose_download) {
         if (x >= 225 && x < 1055 && ((y >= 324 && y < 366) || (y >= 384 && y < 426))) {
             app.download_choice = y >= 384;
@@ -1951,11 +1973,6 @@ static void touch_tap(int x, int y) {
         } else if (x >= 225 && x < 1055 && y >= 446 && y < 493) {
             input(HidNpadButton_B);
         }
-        return;
-    }
-    if (app.delete_file[0] || app.confirm_install) {
-        if (x >= 224 && x < 1050 && y >= 417 && y < 490)
-            input(x < 640 ? HidNpadButton_A : HidNpadButton_B);
         return;
     }
     if (app.filters_open) {
@@ -2251,6 +2268,11 @@ static void input(u64 buttons) {
         if (buttons & HidNpadButton_Minus) wake_download_screen();
         return;
     }
+    if (app.confirm_install) {
+        if (buttons & HidNpadButton_B) app.confirm_install = false;
+        else if (buttons & HidNpadButton_A) open_installer();
+        return;
+    }
     if (update_dialog_visible()) {
         if (app.update_details_open) {
             if (buttons & (HidNpadButton_B | HidNpadButton_X)) app.update_details_open = false;
@@ -2292,11 +2314,6 @@ static void input(u64 buttons) {
     if (app.delete_file[0]) {
         if (buttons & HidNpadButton_A) delete_saved_file();
         if (buttons & HidNpadButton_B) app.delete_file[0] = 0;
-        return;
-    }
-    if (app.confirm_install) {
-        if (buttons & HidNpadButton_A) open_installer();
-        if (buttons & HidNpadButton_B) app.confirm_install = false;
         return;
     }
     if (buttons & HidNpadButton_Plus) { app.close = true; return; }
@@ -2362,7 +2379,7 @@ static void input(u64 buttons) {
         else app.saved_index = move(app.saved_index, app.saved_count, buttons);
         if ((buttons & HidNpadButton_ZL) && !app.queue_focus && app.saved_count &&
             !app.download_busy && !app.queue_count) {
-            app.confirm_install = true;
+            offer_installer(app.saved[app.saved_index].file);
             return;
         }
         if (buttons & HidNpadButton_X) {
@@ -2375,7 +2392,7 @@ static void input(u64 buttons) {
             const char *selected_file = app.saved[app.saved_index].file;
             if (saved_archive(selected_file)) start_saved(selected_file, true);
             else if (saved_installable(selected_file)) start_saved(selected_file, false);
-            else if (!app.download_busy && !app.queue_count) app.confirm_install = true;
+            else if (!app.download_busy && !app.queue_count) offer_installer(selected_file);
             else strcpy(app.notice, "DBI можна відкрити після завершення черги");
         }
         return;
@@ -3079,6 +3096,20 @@ static void draw_update_progress(void) {
     text(app.small, line, 224, 405, 828, gray);
 }
 
+static void draw_installer_dialog(void) {
+    bool busy = app.download_busy || app.queue_count;
+    rect(190, 200, 900, 305, selected);
+    text(app.large, "Відкрити встановлювач DBI?", 224, 230, 828, white);
+    text(app.normal, app.installer_file, 224, 298, 828, white);
+    char guide[148];
+    snprintf(guide, sizeof(guide), "%s%s", tr("У DBI відкрий Browse SD Card → "), NXLOAD_DOWNLOAD_RELATIVE);
+    const char *hint = busy ? "DBI можна відкрити після завершення черги" :
+                       app.installer_error ? app.installer_error : guide;
+    text(app.small, hint, 224, 355, 828, gray);
+    text(app.normal, "A  Відкрити DBI", 224, 428, 396, busy ? gray : blue);
+    text(app.normal, "B  Назад", 656, 428, 390, gray);
+}
+
 static void draw(void) {
     if (update_in_progress()) {
         draw_update_progress();
@@ -3087,6 +3118,7 @@ static void draw(void) {
     }
     if (app.trailer_open) {
         draw_trailer();
+        if (app.confirm_install) draw_installer_dialog();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -3099,6 +3131,7 @@ static void draw(void) {
     if (app.fullscreen_shot) {
         rect(0, 0, 1280, 720, (SDL_Color){0, 0, 0, 255});
         draw_game_screenshots();
+        if (app.confirm_install) draw_installer_dialog();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -3108,7 +3141,8 @@ static void draw(void) {
     draw_header();
     if (app.settings_open) {
         draw_settings();
-        if (update_dialog_visible()) draw_update_dialog();
+        if (app.confirm_install) draw_installer_dialog();
+        else if (update_dialog_visible()) draw_update_dialog();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -3134,22 +3168,15 @@ static void draw(void) {
     }
     if (app.filters_open) draw_filters();
     if (update_dialog_visible()) draw_update_dialog();
-    if (app.choose_download) {
+    if (app.confirm_install) {
+        draw_installer_dialog();
+    } else if (app.choose_download) {
         rect(190, 200, 900, 305, panel);
         text(app.large, "Дія з файлом", 224, 230, 828, white);
         text(app.small, app.draft_transfer.name, 224, 284, 828, gray);
         row(0, app.download_choice, 225, 324, 828, app.draft_transfer.unpack ? "Розпакувати" : "Завантажити");
         row(1, app.download_choice, 225, 384, 828, app.draft_transfer.unpack ? "Розпакувати й встановити" : "Завантажити й встановити");
         text(app.small, "A  Обрати     B  Назад", 224, 454, 828, gray);
-    } else if (app.confirm_install) {
-        rect(190, 200, 900, 305, selected);
-        text(app.large, "Відкрити встановлювач DBI?", 224, 230, 828, white);
-        text(app.normal, app.saved[app.saved_index].file, 224, 298, 828, white);
-        char dbi_guide[148];
-        snprintf(dbi_guide, sizeof(dbi_guide), "%s%s", tr("У DBI відкрий Browse SD Card → "), NXLOAD_DOWNLOAD_RELATIVE);
-        text(app.small, dbi_guide, 224, 355, 828, gray);
-        text(app.normal, "A  Відкрити DBI", 224, 428, 396, blue);
-        text(app.normal, "B  Назад", 656, 428, 390, gray);
     } else if (app.delete_file[0]) {
         rect(190, 200, 900, 305, selected);
         text(app.large, "Видалити файл?", 224, 230, 828, white);

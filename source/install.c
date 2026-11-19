@@ -12,6 +12,7 @@
 #define HEADER_LIMIT (1024 * 1024)
 #define CNMT_LIMIT (16 * 1024 * 1024)
 #define COPY_BUFFER (256 * 1024)
+#define CARD_KEY_AREA_SIZE 0x1000
 
 typedef struct {
     uint64_t offset, size;
@@ -27,7 +28,13 @@ typedef struct {
     PackageEntry *entries;
     size_t count;
     PackageEntry *meta;
+    bool multiple_meta;
 } Package;
+
+typedef struct {
+    uint64_t records_start, names_start, data_start, data_size;
+    size_t count, stride, names_size;
+} PackageFs;
 
 typedef struct {
     u64 id;
@@ -53,17 +60,6 @@ static bool ends_with(const char *name, const char *suffix) {
     return n >= s && !strcasecmp(name + n - s, suffix);
 }
 
-bool nsp_name(const char *path) { return ends_with(path, ".nsp"); }
-
-bool nsp_signature(const char *path) {
-    FILE *file = fopen(path, "rb");
-    if (!file) return false;
-    unsigned char magic[4];
-    bool nsp = fread(magic, 1, sizeof(magic), file) == sizeof(magic) && !memcmp(magic, "PFS0", 4);
-    fclose(file);
-    return nsp;
-}
-
 static uint32_t u32le(const unsigned char *data) {
     return (uint32_t)data[0] | (uint32_t)data[1] << 8 |
            (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
@@ -75,6 +71,26 @@ static uint64_t u64le(const unsigned char *data) {
 
 static bool read_at(FILE *file, uint64_t offset, void *out, size_t size) {
     return !fseeko(file, (off_t)offset, SEEK_SET) && fread(out, 1, size, file) == size;
+}
+
+static bool card_header(FILE *file, unsigned char header[64], uint64_t *base) {
+    for (*base = 0; *base <= CARD_KEY_AREA_SIZE; *base += CARD_KEY_AREA_SIZE)
+        if (read_at(file, *base + 0x100, header, 64) && !memcmp(header, "HEAD", 4)) return true;
+    return false;
+}
+
+InstallFormat install_format(const char *path) {
+    if (ends_with(path, ".nsp")) return INSTALL_NSP;
+    if (ends_with(path, ".xci")) return INSTALL_XCI;
+    if (ends_with(path, ".nsz") || ends_with(path, ".xcz")) return INSTALL_UNKNOWN;
+    FILE *file = fopen(path, "rb");
+    if (!file) return INSTALL_UNKNOWN;
+    unsigned char header[64];
+    uint64_t base;
+    InstallFormat format = read_at(file, 0, header, 4) && !memcmp(header, "PFS0", 4) ? INSTALL_NSP :
+                           card_header(file, header, &base) ? INSTALL_XCI : INSTALL_UNKNOWN;
+    fclose(file);
+    return format;
 }
 
 static int hex_digit(unsigned char c) {
@@ -94,47 +110,94 @@ static bool content_id(const char *name, NcmContentId *id) {
     return true;
 }
 
-static bool read_package(Package *pkg) {
+static bool read_package_fs(FILE *file, uint64_t offset, uint64_t size, bool hfs, PackageFs *fs) {
     unsigned char header[16];
+    if (size < sizeof(header) || !read_at(file, offset, header, sizeof(header)) ||
+        memcmp(header, hfs ? "HFS0" : "PFS0", 4)) return false;
+    fs->count = u32le(header + 4);
+    fs->names_size = u32le(header + 8);
+    fs->stride = hfs ? 64 : 24;
+    if (!fs->count || fs->count > ENTRY_LIMIT || !fs->names_size || fs->names_size > HEADER_LIMIT)
+        return false;
+    size_t header_size = sizeof(header) + fs->stride * fs->count + fs->names_size;
+    if (header_size > size) return false;
+    fs->records_start = offset + sizeof(header);
+    fs->names_start = fs->records_start + fs->stride * fs->count;
+    fs->data_start = offset + header_size;
+    fs->data_size = size - header_size;
+    return true;
+}
+
+static bool read_fs_entry(FILE *file, const PackageFs *fs, const char *names, size_t i, PackageEntry *entry) {
+    unsigned char record[64];
+    if (!read_at(file, fs->records_start + fs->stride * i, record, fs->stride)) return false;
+    uint64_t offset = u64le(record), length = u64le(record + 8);
+    uint32_t name_offset = u32le(record + 16);
+    if (offset > fs->data_size || length > fs->data_size - offset || name_offset >= fs->names_size)
+        return false;
+    const char *name = names + name_offset;
+    if (!*name || !memchr(name, 0, fs->names_size - name_offset)) return false;
+    entry->offset = fs->data_start + offset;
+    entry->size = length;
+    entry->name = name;
+    return true;
+}
+
+static bool read_xci_secure(FILE *file, uint64_t file_size, PackageFs *secure) {
+    // XCI CardHeader identifies the root HFS0, which holds the secure HFS0.
+    unsigned char header[64];
+    uint64_t base;
+    if (!card_header(file, header, &base)) return false;
+    uint64_t offset = u64le(header + 0x30), header_size = u64le(header + 0x38);
+    if (offset < 0x200 || base > file_size || offset > file_size - base) return false;
+    offset += base;
+    PackageFs root;
+    if (!read_package_fs(file, offset, file_size - offset, true, &root) ||
+        root.data_start - offset != header_size) return false;
+    char *names = malloc(root.names_size);
+    if (!names) return false;
+    bool valid = read_at(file, root.names_start, names, root.names_size);
+    bool found = false;
+    for (size_t i = 0; valid && i < root.count; ++i) {
+        PackageEntry partition;
+        valid = read_fs_entry(file, &root, names, i, &partition);
+        if (!valid || strcmp(partition.name, "secure")) continue;
+        valid = !found && read_package_fs(file, partition.offset, partition.size, true, secure);
+        found = true;
+    }
+    free(names);
+    return valid && found;
+}
+
+static bool read_package(Package *pkg, InstallFormat format) {
     if (fseeko(pkg->file, 0, SEEK_END)) return false;
     off_t size = ftello(pkg->file);
-    if (size < 16 || !read_at(pkg->file, 0, header, sizeof(header)) ||
-        memcmp(header, "PFS0", 4)) return false;
-    pkg->count = u32le(header + 4);
-    size_t names_size = u32le(header + 8);
-    if (!pkg->count || pkg->count > ENTRY_LIMIT || !names_size || names_size > HEADER_LIMIT)
-        return false;
-    uint64_t names_start = 16 + 24 * pkg->count;
-    uint64_t data_start = names_start + names_size;
-    if (data_start > (uint64_t)size) return false;
-    pkg->names = malloc(names_size);
+    if (size < 0) return false;
+    PackageFs fs;
+    bool valid = format == INSTALL_XCI ? read_xci_secure(pkg->file, (uint64_t)size, &fs) :
+                 read_package_fs(pkg->file, 0, (uint64_t)size, false, &fs);
+    if (!valid) return false;
+    pkg->count = fs.count;
+    pkg->names = malloc(fs.names_size);
     pkg->entries = calloc(pkg->count, sizeof(*pkg->entries));
     if (!pkg->names || !pkg->entries ||
-        !read_at(pkg->file, names_start, pkg->names, names_size)) return false;
-    uint64_t data_size = (uint64_t)size - data_start;
+        !read_at(pkg->file, fs.names_start, pkg->names, fs.names_size)) return false;
     for (size_t i = 0; i < pkg->count; ++i) {
-        unsigned char record[24];
-        if (!read_at(pkg->file, 16 + 24 * i, record, sizeof(record))) return false;
-        uint64_t offset = u64le(record), length = u64le(record + 8);
-        uint32_t name_offset = u32le(record + 16);
-        if (offset > data_size || length > data_size - offset || name_offset >= names_size)
-            return false;
-        const char *name = pkg->names + name_offset;
-        if (!*name || !memchr(name, 0, names_size - name_offset)) return false;
         PackageEntry *e = &pkg->entries[i];
-        e->offset = data_start + offset;
-        e->size = length;
-        e->name = name;
+        if (!read_fs_entry(pkg->file, &fs, pkg->names, i, e)) return false;
         for (size_t j = 0; j < i; ++j) {
             PackageEntry *previous = &pkg->entries[j];
-            if (!strcasecmp(previous->name, name) ||
-                (length && previous->size && e->offset < previous->offset + previous->size &&
-                 previous->offset < e->offset + length)) return false;
+            if (!strcasecmp(previous->name, e->name) ||
+                (e->size && previous->size && e->offset < previous->offset + previous->size &&
+                 previous->offset < e->offset + e->size)) return false;
         }
-        if (!ends_with(name, ".nca")) continue;
-        if (!length || length >= (UINT64_C(1) << 40) || !content_id(name, &e->id)) return false;
-        if (ends_with(name, ".cnmt.nca")) {
-            if (pkg->meta) return false;
+        if (!ends_with(e->name, ".nca")) continue;
+        if (!e->size || e->size >= (UINT64_C(1) << 40) || !content_id(e->name, &e->id)) return false;
+        if (ends_with(e->name, ".cnmt.nca")) {
+            if (pkg->meta) {
+                pkg->multiple_meta = true;
+                return false;
+            }
             pkg->meta = e;
         }
     }
@@ -182,14 +245,14 @@ static const char *write_content(NcmContentStorage *sd, FILE *file, PackageEntry
         if (R_FAILED(rc)) return service_error(job, "Не вдалося виділити місце для NCA", rc);
         entry->pending = true;
     }
-    if (fseeko(file, (off_t)entry->offset, SEEK_SET)) return "Не вдалося прочитати NSP";
+    if (fseeko(file, (off_t)entry->offset, SEEK_SET)) return "Не вдалося прочитати пакет";
     Sha256Context sha;
     sha256ContextCreate(&sha);
     for (uint64_t position = 0; position < entry->size;) {
         if (atomic_load(&job->cancelled)) return "Встановлення скасовано";
         size_t length = entry->size - position < COPY_BUFFER ?
             (size_t)(entry->size - position) : COPY_BUFFER;
-        if (fread(buffer, 1, length, file) != length) return "Пакет NSP неповний";
+        if (fread(buffer, 1, length, file) != length) return "Пакет неповний";
         sha256ContextUpdate(&sha, buffer, length);
         if (entry->pending) {
             Result rc = ncmContentStorageWritePlaceHolder(sd, &entry->placeholder, position, buffer, length);
@@ -288,7 +351,8 @@ static bool parse_cnmt(Package *pkg, const unsigned char *data, size_t size,
     const unsigned char *extra = data + sizeof(h);
     meta->key = (NcmContentMetaKey){.id = h.id, .version = h.version, .type = h.type};
     meta->application_id = h.type == NcmContentMetaType_Application ? h.id : u64le(extra);
-    if ((meta->application_id >> 48) != 0x0100) return false;
+    if (meta->application_id < UINT64_C(0x0100000000010000) ||
+        meta->application_id > UINT64_C(0x01ffffffffffffff)) return false;
     if (h.type == NcmContentMetaType_Patch && h.id != (meta->application_id | UINT64_C(0x800)))
         return false;
     if (h.type == NcmContentMetaType_AddOnContent &&
@@ -421,9 +485,11 @@ static PackageEntry *match_content(Package *pkg, const NcmContentInfo *info) {
     return e && e->size == bytes ? e : NULL;
 }
 
-const char *install_nsp(FichierJob *job, const char *path) {
+const char *install_package(FichierJob *job, const char *path, InstallFormat format) {
+    const char *filename = strrchr(path, '/');
+    snprintf(job->tls_detail, sizeof(job->tls_detail), "%.127s", filename ? filename + 1 : path);
     Package pkg = {.file = fopen(path, "rb")};
-    if (!pkg.file) return "Не вдалося відкрити збережений NSP";
+    if (!pkg.file) return "Не вдалося відкрити збережений пакет";
     InstallMeta meta = {0};
     NcmContentStorage sd = {0};
     NcmContentMetaDatabase db = {0};
@@ -432,13 +498,17 @@ const char *install_nsp(FichierJob *job, const char *path) {
     bool ncm_ready = false, ns_ready = false, meta_written = false, imported = false;
     bool clean = true;
     unsigned char *cnmt = NULL, *buffer = NULL;
-    const char *error = "Некоректний або непідтримуваний пакет NSP";
+    const char *error = format == INSTALL_XCI ? "Не вдалося прочитати розділ secure або метадані XCI" :
+                         "Некоректний або непідтримуваний пакет NSP";
     atomic_store(&job->received, 0);
     atomic_store(&job->total, 0);
     atomic_store(&job->streams, 0);
     atomic_store(&job->unpacking, false);
     atomic_store(&job->installing, true);
-    if (!read_package(&pkg)) goto done;
+    if (!read_package(&pkg, format)) {
+        if (pkg.multiple_meta) error = "Пакет містить кілька наборів метаданих. Встанови його через DBI.";
+        goto done;
+    }
     buffer = malloc(COPY_BUFFER);
     if (!buffer) { error = "Бракує пам’яті для встановлення"; goto done; }
     if (atomic_load(&job->cancelled)) { error = "Встановлення скасовано"; goto done; }
@@ -486,7 +556,7 @@ const char *install_nsp(FichierJob *job, const char *path) {
         if (meta.key.type == NcmContentMetaType_Patch &&
             infos[i].info.content_type == NcmContentType_DeltaFragment) continue;
         PackageEntry *e = match_content(&pkg, &infos[i].info);
-        if (!e || e->selected) { error = "У NSP бракує NCA або пакет містить дублікати"; goto done; }
+        if (!e || e->selected) { error = "У пакеті бракує NCA або є дублікати"; goto done; }
         e->selected = true;
         error = prepare_entry(&sd, e, job);
         if (error) goto done;

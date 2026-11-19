@@ -218,10 +218,10 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
 const char *unpack_archive(FichierJob *job, const char *path, const char *directory,
                        UnpackedPackages *packages) {
     job->tls_detail[0] = 0;
-    atomic_store(&job->unpacking, true);
     atomic_store(&job->received, 0);
     atomic_store(&job->total, 0);
     atomic_store(&job->streams, 0);
+    atomic_store(&job->unpacking, true);
     struct archive *reader = archive_read_new();
     ExtractedFile *outputs = calloc(ARCHIVE_PACKAGE_LIMIT, sizeof(*outputs));
     ExtractedFile *assets = NULL;
@@ -230,6 +230,8 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
     size_t count = 0, asset_count = 0, asset_capacity = 0;
     bool inspect_port = job->homebrew_port || job->local_unpack;
     bool has_port_files = false;
+    char staging[OUTPUT_PATH];
+    bool staged = false;
     if (!reader || !outputs || !buffer) goto done;
     if (archive_read_support_format_rar(reader) != ARCHIVE_OK ||
         archive_read_support_format_rar5(reader) != ARCHIVE_OK ||
@@ -238,6 +240,12 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
         error = "Не вдалося відкрити архів";
         goto done;
     }
+    int length = snprintf(staging, sizeof(staging), "%s/.unpack-XXXXXX", directory);
+    if (length <= 0 || (size_t)length >= sizeof(staging) || !mkdtemp(staging)) {
+        error = nxload_storage_error(errno, "Не вдалося створити тимчасову папку розпакування");
+        goto done;
+    }
+    staged = true;
 
     struct archive_entry *entry;
     int status = ARCHIVE_OK;
@@ -247,11 +255,18 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
         const char *path_in_archive = archive_entry_pathname(entry);
         unsigned type = archive_entry_filetype(entry);
         const char *relative = inspect_port ? port_path(path_in_archive) : NULL;
-        bool asset = relative && *relative && type != AE_IFDIR;
+        const char *base = path_in_archive;
+        if (base) {
+            for (const char *part = base; *part; ++part)
+                if (*part == '/' || *part == '\\') base = part + 1;
+            if (!strncmp(base, "._", 2) || !strcmp(base, ".DS_Store")) continue;
+        }
+        bool package = base && package_name(base);
+        bool asset = relative && *relative && type != AE_IFDIR && !package;
         if (asset) {
             has_port_files = true;
             if (!job->install_after_download) continue;
-        } else if (!path_in_archive || !package_name(path_in_archive)) continue;
+        } else if (!package) continue;
         if (archive_entry_symlink(entry) || archive_entry_hardlink(entry)) {
             error = "В архіві пакет є посиланням";
             entry_detail(job, "ARCHIVE LINK", path_in_archive);
@@ -273,8 +288,8 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
             error = "Забагато пакетів в одному архіві";
             break;
         }
-        la_int64_t length = archive_entry_size(entry);
-        if (length < 0 || (!asset && !length)) {
+        la_int64_t entry_size = archive_entry_size(entry);
+        if (!archive_entry_size_is_set(entry) || entry_size < 0 || (!asset && !entry_size)) {
             error = "В архіві некоректний розмір пакета";
             break;
         }
@@ -315,15 +330,15 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
             if (error) break;
         }
 
-        size = snprintf(output->temporary, sizeof(output->temporary), "%s/.nxload-XXXXXX", directory);
+        size = snprintf(output->temporary, sizeof(output->temporary), "%s/file-XXXXXX", staging);
         if (size <= 0 || (size_t)size >= sizeof(output->temporary)) {
             error = "Шлях до microSD задовгий";
             break;
         }
         if (asset) ++asset_count;
         else ++count;
-        atomic_fetch_add(&job->total, (uint64_t)length);
-        error = write_entry(reader, job, output, (uint64_t)length, buffer);
+        error = write_entry(reader, job, output, (uint64_t)entry_size, buffer);
+        if (error && !archive_error_string(reader)) entry_detail(job, "ARCHIVE", path_in_archive);
         if (error) break;
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
@@ -331,12 +346,13 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
     if (!error && !count) error = "В архіві немає пакета NSP, XCI, NSZ або XCZ";
     for (size_t i = 0; !error && asset_count && i < count; ++i) {
         const char *ext = strrchr(outputs[i].name, '.');
-        if (!ext || strcasecmp(ext, ".nsp")) error = "Для встановлення порту потрібен пакет NSP";
+        if (strcasecmp(ext, ".nsp") && strcasecmp(ext, ".xci"))
+            error = "Для встановлення порту потрібен пакет NSP або XCI";
     }
     for (size_t i = 0; !error && i < count; ++i) {
         ExtractedFile *output = &outputs[i];
         if (!unused_path(output->destination)) {
-            if (has_port_files && same_output(output, buffer, &job->cancelled)) continue;
+            if (inspect_port && same_output(output, buffer, &job->cancelled)) continue;
             error = "Пакет із такою назвою вже є або шлях недоступний";
         } else if (rename(output->temporary, output->destination)) {
             error = "Не вдалося додати пакет до списку";
@@ -344,6 +360,7 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
             output->published = true;
         }
     }
+    if (!error && asset_count) atomic_store(&job->copying_port_files, true);
     for (size_t i = 0; !error && i < asset_count; ++i) {
         ExtractedFile *output = &assets[i];
         if (atomic_load(&job->cancelled)) {
@@ -378,6 +395,8 @@ done:
     }
     clean_outputs(assets, asset_count, error != NULL);
     clean_outputs(outputs, count, error != NULL);
+    if (staged) rmdir(staging);
+    atomic_store(&job->copying_port_files, false);
     free(buffer);
     return error;
 }

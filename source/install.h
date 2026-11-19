@@ -3,8 +3,9 @@
 
 #include "fichier.h"
 
-bool nsp_name(const char *path);
-bool nsp_signature(const char *path);
-const char *install_nsp(FichierJob *job, const char *path);
+typedef enum { INSTALL_UNKNOWN, INSTALL_NSP, INSTALL_XCI } InstallFormat;
+
+InstallFormat install_format(const char *path);
+const char *install_package(FichierJob *job, const char *path, InstallFormat format);
 
 #endif

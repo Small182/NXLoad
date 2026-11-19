@@ -10,7 +10,7 @@
 
 **Оновлення.** За замовчуванням NXLoad перевіряє стабільні GitHub Releases без токена. Щоб отримувати збірки з комітів гілки `native-1fichier`, збережи fine-grained токен із дозволом **Actions: Read** для цього репозиторію у `switch/nxload/github-token.txt` на microSD. Після підтвердження оновлення встановлюється автоматично, коли черга завершена.
 
-**Файли.** Збірки з комітів додають до спільного каталогу ROMsNS. На вкладці «Файли» показуються доступні розміри, зокрема розміри, отримані з метаданих DLArchive.
+**Файли.** Збірки з комітів додають до спільного каталогу ROMsNS. На вкладці «Файли» показуються доступні розміри, зокрема розміри, отримані з метаданих DLArchive. Для Homebrew Ports дія «Розпакувати й встановити» переносить розпакований вміст папки `switch` на microSD і встановлює пакет. Вбудований інсталятор у збірках з комітів також читає сумісні XCI з одним набором метаданих. Для образів, які потребують адаптації під встановлення на microSD, відкрий DBI кнопкою ZL у списку збережених файлів.
 
 **Медіа.** У збірках з комітів вкладка «Медіа» показує скриншоти й пропонує трейлери, коли для гри знайдено відео в американському Nintendo Store. Натисни X або торкнися кнопки «Трейлери», щоб відкрити відео на весь екран.
 
@@ -24,7 +24,7 @@
 
 **Updates.** NXLoad checks stable GitHub Releases by default and needs no token for that channel. To get commit builds from the `native-1fichier` branch, save a fine-grained GitHub token with **Actions: Read** for this repository to `switch/nxload/github-token.txt` on the microSD card. After you confirm an update, it installs automatically when the queue finishes.
 
-**Files.** Commit builds include ROMsNS in the merged catalog. The Files tab displays available download sizes, including sizes returned by DLArchive metadata.
+**Files.** Commit builds include ROMsNS in the merged catalog. The Files tab displays available download sizes, including sizes returned by DLArchive metadata. For Homebrew Ports, “Extract and install” moves the extracted contents of the `switch` folder to the microSD card and installs the package. The built-in installer in commit builds also reads compatible XCI images with a single metadata set. For images that require adaptation for microSD installation, press ZL in the saved files list to open DBI.
 
 **Media.** In commit builds, the Media tab displays screenshots and offers trailers when the US Nintendo Store has a video for the game. Press X or tap Trailers to start full-screen playback.
 
@@ -41,6 +41,7 @@
 | [mpv](https://github.com/mpv-player/mpv) · [FFmpeg](https://ffmpeg.org/) · [devkitPro portlibs](https://github.com/devkitPro/pacman-packages/tree/master/switch) | Відтворення трейлерів у збірках з комітів. / Trailer playback in commit builds. |
 | [curl](https://curl.se/) · [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) · [Mozilla CA bundle](https://curl.se/docs/caextract.html) | HTTPS, TLS і набір кореневих сертифікатів Mozilla, який поширює curl. / HTTPS, TLS, and the Mozilla root certificates distributed by curl. |
 | [libxml2](https://gitlab.gnome.org/GNOME/libxml2) · [libarchive](https://www.libarchive.org/) · [zlib](https://zlib.net/) | Розбір HTML, розпакування RAR і ZIP, стиснені метадані. / HTML parsing, RAR and ZIP extraction, and compressed metadata. |
+| [Switchbrew](https://switchbrew.org/wiki/XCI) | Документація формату XCI. / XCI format documentation. |
 | [DBI](https://github.com/rashevskyv/dbi) (duckbill) · [GitHub Actions](https://github.com/features/actions) | DBI можна відкрити як окремий інсталятор, якщо він уже є на microSD. GitHub Actions збирає NRO. / DBI can be opened as a separate installer when already present on microSD. GitHub Actions builds the NRO. |
 | [OpenAI](https://openai.com/) | Підготовка українських перекладів описів в окремому процесі збірки. / Ukrainian game descriptions are prepared in a separate translation workflow. |
 

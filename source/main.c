@@ -465,7 +465,7 @@ static void download_worker(void *arg) {
     // Archive and installation I/O share the console with the active game card.
     svcSetThreadPriority(threadGetCurHandle(), STORAGE_WORKER_PRIORITY);
     fsSetPriority(FsPriority_Low);
-    bool archive_delete_failed = false, nsp_delete_failed = false, port_files_copied = false;
+    bool archive_delete_failed = false, nsp_delete_failed = false, port_files_copied = false, xci_saved = false;
     if (job->local_unpack || archive_name(path) || archive_signature(path)) {
         UnpackedPackages packages = {0};
         const char *error = unpack_archive(job, path, NXLOAD_DOWNLOAD_DIR, &packages);
@@ -480,40 +480,50 @@ static void download_worker(void *arg) {
                           delete_archive ? "Архів розпаковано й видалено" : "Архів розпаковано й збережено";
             return;
         }
+        InstallFormat formats[ARCHIVE_PACKAGE_LIMIT];
         for (size_t i = 0; i < packages.count; ++i) {
-            if (!nsp_name(packages.paths[i])) {
-                job->result = "Архів розпаковано. NXLoad встановлює NSP. Інші формати можна відкрити в DBI.";
+            formats[i] = install_format(packages.paths[i]);
+            if (formats[i] == INSTALL_UNKNOWN) {
+                job->result = "Архів розпаковано. Для NSZ і XCZ використовуй DBI.";
                 return;
             }
         }
         for (size_t i = 0; i < packages.count; ++i) {
-            error = install_nsp(job, packages.paths[i]);
+            xci_saved |= formats[i] == INSTALL_XCI;
+            error = install_package(job, packages.paths[i], formats[i]);
             if (error) {
                 job->result = error;
                 return;
             }
-            if (job->delete_nsp && unlink(packages.paths[i])) nsp_delete_failed = true;
+        }
+        if (job->delete_nsp) {
+            for (size_t i = 0; i < packages.count; ++i)
+                if (formats[i] == INSTALL_NSP && unlink(packages.paths[i])) nsp_delete_failed = true;
         }
         archive_delete_failed = job->delete_rar && unlink(path) != 0;
         port_files_copied = packages.has_port_files;
     } else if (job->install_after_download || job->local_install) {
-        if (!nsp_name(path) && !nsp_signature(path)) {
-            job->result = "Файл збережено. NXLoad встановлює NSP. Інші формати можна відкрити в DBI.";
+        InstallFormat format = install_format(path);
+        if (format == INSTALL_UNKNOWN) {
+            job->result = "Файл збережено. NXLoad встановлює сумісні NSP та XCI.";
             return;
         }
-        const char *error = install_nsp(job, path);
+        const char *error = install_package(job, path, format);
         if (error) {
             job->result = error;
             return;
         }
-        nsp_delete_failed = job->delete_nsp && unlink(path) != 0;
+        xci_saved = format == INSTALL_XCI;
+        nsp_delete_failed = format == INSTALL_NSP && job->delete_nsp && unlink(path) != 0;
     } else {
         return;
     }
     job->result = archive_delete_failed || nsp_delete_failed ?
         "Встановлено на microSD · не всі файли вдалося видалити" :
         port_files_copied ? "Порт встановлено · файли додано до папки switch" :
+        xci_saved ? "Встановлено на microSD · XCI збережено" :
         job->delete_nsp ? "Встановлено на microSD · NSP видалено" : "Встановлено на microSD · NSP збережено";
+    job->tls_detail[0] = 0;
 }
 
 static bool start_worker(Thread *thread, ThreadFunc function, void *arg) {
@@ -1137,13 +1147,13 @@ static bool saved_archive(const char *name) {
     return bytes > 0 && (size_t)bytes < sizeof(path) && archive_signature(path);
 }
 
-static bool saved_nsp(const char *name) {
-    if (nsp_name(name)) return true;
+static bool saved_installable(const char *name) {
     const char *ext = strrchr(name, '.');
+    if (ext && (!strcasecmp(ext, ".nsp") || !strcasecmp(ext, ".xci"))) return true;
     if (!ext || strcasecmp(ext, ".bin")) return false;
     char path[320];
     int bytes = snprintf(path, sizeof(path), NXLOAD_DOWNLOAD_DIR "/%s", name);
-    return bytes > 0 && (size_t)bytes < sizeof(path) && nsp_signature(path);
+    return bytes > 0 && (size_t)bytes < sizeof(path) && install_format(path) != INSTALL_UNKNOWN;
 }
 
 static void refresh_saved(void) {
@@ -1155,7 +1165,7 @@ static void refresh_saved(void) {
             size_t n = strlen(entry->d_name);
             const char *ext = strrchr(entry->d_name, '.');
             if (n < sizeof(app.saved[0].file) && (package_name(entry->d_name) || archive_name(entry->d_name) ||
-                (ext && !strcasecmp(ext, ".bin") && (saved_archive(entry->d_name) || saved_nsp(entry->d_name))))) {
+                (ext && !strcasecmp(ext, ".bin") && (saved_archive(entry->d_name) || saved_installable(entry->d_name))))) {
                 strcpy(app.saved[app.saved_count++].file, entry->d_name);
             }
         }
@@ -1327,6 +1337,7 @@ static void launch_next_transfer(void) {
     memset(job, 0, sizeof(*job));
     atomic_init(&job->cancelled, false);
     atomic_init(&job->unpacking, false);
+    atomic_init(&job->copying_port_files, false);
     atomic_init(&job->installing, false);
     atomic_init(&job->yield_for_game_requests, false);
     atomic_init(&job->update_received, false);
@@ -1999,7 +2010,7 @@ static void touch_tap(int x, int y) {
         app.top_focus = TOP_NONE;
         if (x >= DOWNLOADS_DIM_X) input(HidNpadButton_Minus);
         else if (x >= 880) input(HidNpadButton_B);
-        else if (x >= 685) input(HidNpadButton_Y);
+        else if (x >= 685) input(app.download_busy ? HidNpadButton_Y : HidNpadButton_ZL);
         else if (x >= 455) input(HidNpadButton_X);
     }
 }
@@ -2299,6 +2310,11 @@ static void input(u64 buttons) {
         }
         if (app.queue_focus) app.queue_index = move(app.queue_index, app.queue_count, buttons);
         else app.saved_index = move(app.saved_index, app.saved_count, buttons);
+        if ((buttons & HidNpadButton_ZL) && !app.queue_focus && app.saved_count &&
+            !app.download_busy && !app.queue_count) {
+            app.confirm_install = true;
+            return;
+        }
         if (buttons & HidNpadButton_X) {
             if (app.queue_focus && app.queue_count) remove_queued(app.queue_index);
             else if (!app.queue_focus && app.saved_count)
@@ -2308,7 +2324,7 @@ static void input(u64 buttons) {
         if ((buttons & HidNpadButton_A) && !app.queue_focus && app.saved_count) {
             const char *selected_file = app.saved[app.saved_index].file;
             if (saved_archive(selected_file)) start_saved(selected_file, true);
-            else if (saved_nsp(selected_file)) start_saved(selected_file, false);
+            else if (saved_installable(selected_file)) start_saved(selected_file, false);
             else if (!app.download_busy && !app.queue_count) app.confirm_install = true;
             else strcpy(app.notice, "DBI можна відкрити після завершення черги");
         }
@@ -2802,25 +2818,36 @@ static void draw_game(void) {
 }
 
 static void draw_downloads(void) {
+    const int bar_width = 1148, marker_width = 172;
     rect(40, 106, 1200, 530, panel);
     unsigned stage = app.download_busy || app.download_finished ? transfer_stage() : 0;
+    bool copying = app.download_busy && stage == 1 && atomic_load(&app.download.copying_port_files);
     text(app.large, app.active_transfer.app_update && (app.download_busy || app.download_finished) ?
-         "Оновлення NXLoad" : stage == 2 ? "Встановлення" : stage == 1 ? "Розпакування" :
+         "Оновлення NXLoad" : stage == 2 ? "Встановлення" : copying ? "Перенесення файлів порту" :
+         stage == 1 ? "Розпакування" :
          "Завантаження", 66, 128, 1100, white);
     if (app.download_busy || app.download_finished) {
         uint64_t have = atomic_load(&app.download.received), total = atomic_load(&app.download.total);
         double percent = total ? SDL_min(100.0, 100.0 * have / total) : 0;
         char line[192];
         text(app.normal, tr(app.active_transfer.name), 66, 182, 825, white);
-        rect(66, 225, 1148, 8, selected);
-        rect(66, 225, (int)(1148 * percent / 100.0), 8, blue);
+        rect(66, 225, bar_width, 8, selected);
+        if (app.download_busy && stage == 1) {
+            int travel = bar_width - marker_width;
+            int offset = (int)(SDL_GetTicks64() / 8 % (2 * travel));
+            rect(66 + SDL_min(offset, 2 * travel - offset), 225, marker_width, 8, blue);
+        } else {
+            rect(66, 225, (int)(bar_width * percent / 100.0), 8, blue);
+        }
         if (app.download_busy && stage == 2) {
             if (total)
                 snprintf(line, sizeof(line), tr("Встановлення на microSD · %.1f%% · %.1f / %.1f МіБ"),
                          percent, have / 1048576.0, total / 1048576.0);
-            else strcpy(line, "Перевірка пакета NSP…");
+            else strcpy(line, "Перевірка пакета…");
+        } else if (copying) {
+            strcpy(line, "Додавання файлів до папки switch…");
         } else if (app.download_busy && stage == 1) {
-            snprintf(line, sizeof(line), tr("Розпакування архіву · %.1f / %.1f МіБ"), have / 1048576.0, total / 1048576.0);
+            snprintf(line, sizeof(line), tr("Розпаковано %.1f МіБ"), have / 1048576.0);
         } else if (app.download_busy && total) {
             snprintf(line, sizeof(line), tr("%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с"),
                      percent, have / 1048576.0, total / 1048576.0, app.speed / 1048576.0);
@@ -2838,7 +2865,7 @@ static void draw_downloads(void) {
             snprintf(line, sizeof(line), tr("%s  ·  API HTTP %ld  ·  Файл HTTP %ld"),
                      tr(app.download.result), app.download.api_http, app.download.http);
         }
-        text(app.small, line, 66, 249, 815, blue);
+        text(app.small, line, 66, 249, app.download_busy ? 815 : bar_width, blue);
         if (app.download_busy && have < total && app.speed > 0 && app.speed_stage == stage) {
             uint64_t seconds = (uint64_t)SDL_min(359999.0, (total - have) / app.speed + 0.99);
             char eta[80];
@@ -2846,7 +2873,7 @@ static void draw_downloads(void) {
                      seconds / 3600, seconds / 60 % 60, seconds % 60);
             right_text(app.small, eta, 889, 249, 325, blue);
         }
-        if (app.download_finished && stage != 2)
+        if (app.download_finished)
             text(app.small, app.download.tls_detail, 66, 270, 1148, gray);
     }
     rect(650, 298, 1, 288, selected);
@@ -3018,6 +3045,8 @@ static void draw(void) {
         text(app.small, "← / →  Списки    A  Встановити / розпакувати", 40, 665, 410, gray);
         text(app.small, app.queue_focus ? "X  Прибрати з черги" : "X  Видалити файл", 455, 665, 225, gray);
         if (app.download_busy) text(app.small, "Y  Скасувати", 685, 665, 190, gray);
+        else if (!app.queue_focus && app.saved_count && !app.queue_count)
+            text(app.small, "ZL  Відкрити DBI", 685, 665, 190, gray);
         text(app.small, "B  Назад", 880, 665, DOWNLOADS_DIM_X - 880, gray);
         text(app.small, "−  Вимкнути екран", DOWNLOADS_DIM_X, 665, TOP_END - DOWNLOADS_DIM_X, gray);
     }

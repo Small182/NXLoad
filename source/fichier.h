@@ -13,6 +13,7 @@
 typedef struct {
     atomic_bool cancelled;
     atomic_bool unpacking;
+    atomic_bool copying_port_files;
     atomic_bool installing;
     atomic_bool yield_for_game_requests;
     atomic_bool update_received;

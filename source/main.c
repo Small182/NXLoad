@@ -415,10 +415,12 @@ static void download_worker(void *arg) {
             job->result = error;
             return;
         }
-        rar_delete_failed = job->delete_rar && unlink(path) != 0;
-        job->result = rar_delete_failed ? "RAR розпаковано · не вдалося видалити архів" :
-                      job->delete_rar ? "RAR розпаковано · архів видалено" : "RAR розпаковано · архів збережено";
-        if (!job->install_after_download) return;
+        if (!job->install_after_download) {
+            rar_delete_failed = job->delete_rar && unlink(path) != 0;
+            job->result = rar_delete_failed ? "RAR розпаковано · не вдалося видалити архів" :
+                          job->delete_rar ? "RAR розпаковано · архів видалено" : "RAR розпаковано · архів збережено";
+            return;
+        }
         for (size_t i = 0; i < packages.count; ++i) {
             if (!nsp_name(packages.paths[i])) {
                 job->result = "RAR розпаковано. NXLoad встановлює NSP. Інші формати можна відкрити в DBI.";
@@ -433,6 +435,7 @@ static void download_worker(void *arg) {
             }
             if (job->delete_nsp && unlink(packages.paths[i])) nsp_delete_failed = true;
         }
+        rar_delete_failed = job->delete_rar && unlink(path) != 0;
     } else if (job->install_after_download || job->local_install) {
         if (!nsp_name(path) && !nsp_signature(path)) {
             job->result = "Файл збережено. NXLoad встановлює NSP. Інші формати можна відкрити в DBI.";
@@ -1298,7 +1301,8 @@ static void start_saved(const char *file, bool unpack) {
     DownloadRequest request = {.unpack = unpack, .install_local = !unpack};
     snprintf(request.name, sizeof(request.name), "%.191s", file);
     snprintf(request.url, sizeof(request.url), NXLOAD_DOWNLOAD_DIR "/%s", file);
-    strcpy(app.notice, enqueue_transfer(&request));
+    if (unpack) choose_transfer(&request);
+    else strcpy(app.notice, enqueue_transfer(&request));
 }
 
 static void delete_saved_file(void) {
@@ -2365,7 +2369,7 @@ static void draw_game(void) {
 
 static void draw_downloads(void) {
     rect(40, 106, 1200, 530, panel);
-    unsigned stage = app.download_busy ? transfer_stage() : 0;
+    unsigned stage = app.download_busy || app.download_finished ? transfer_stage() : 0;
     text(app.large, app.active_transfer.app_update && (app.download_busy || app.download_finished) ?
          "Оновлення NXLoad" : stage == 2 ? "Встановлення" : stage == 1 ? "Розпакування" :
          "Завантаження", 66, 128, 1100, white);
@@ -2376,12 +2380,12 @@ static void draw_downloads(void) {
         text(app.normal, tr(app.active_transfer.name), 66, 182, 825, white);
         rect(66, 225, 1148, 8, selected);
         rect(66, 225, (int)(1148 * percent / 100.0), 8, blue);
-        if (stage == 2) {
+        if (app.download_busy && stage == 2) {
             if (total)
                 snprintf(line, sizeof(line), tr("Встановлення на microSD · %.1f%% · %.1f / %.1f МіБ"),
                          percent, have / 1048576.0, total / 1048576.0);
             else strcpy(line, "Перевірка пакета NSP…");
-        } else if (stage == 1) {
+        } else if (app.download_busy && stage == 1) {
             snprintf(line, sizeof(line), tr("Розпакування RAR · %.1f / %.1f МіБ"), have / 1048576.0, total / 1048576.0);
         } else if (app.download_busy && total) {
             snprintf(line, sizeof(line), tr("%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с"),
@@ -2408,7 +2412,7 @@ static void draw_downloads(void) {
                      seconds / 3600, seconds / 60 % 60, seconds % 60);
             right_text(app.small, eta, 889, 249, 325, blue);
         }
-        if (app.download_finished)
+        if (app.download_finished && !stage)
             text(app.small, app.download.tls_detail, 66, 270, 1148, gray);
     }
     rect(650, 298, 1, 288, selected);
@@ -2496,8 +2500,8 @@ static void draw(void) {
         rect(190, 200, 900, 305, panel);
         text(app.large, "Дія з файлом", 224, 230, 828, white);
         text(app.small, app.draft_transfer.name, 224, 284, 828, gray);
-        row(0, app.download_choice, 225, 324, 828, "Завантажити");
-        row(1, app.download_choice, 225, 384, 828, "Завантажити й встановити");
+        row(0, app.download_choice, 225, 324, 828, app.draft_transfer.unpack ? "Розпакувати" : "Завантажити");
+        row(1, app.download_choice, 225, 384, 828, app.draft_transfer.unpack ? "Розпакувати й встановити" : "Завантажити й встановити");
         text(app.small, "A  Обрати     B  Назад", 224, 454, 828, gray);
     } else if (app.confirm_install) {
         rect(190, 200, 900, 305, selected);

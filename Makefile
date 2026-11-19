@@ -8,7 +8,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET := NXLoad
 APP_TITLE := NXLoad
 APP_AUTHOR := Small182
-APP_VERSION := 1.0.32
+APP_VERSION := 1.0.33
 NXLOAD_BUILD_SHA ?= $(shell git -C "$(TOPDIR)" rev-parse HEAD 2>/dev/null || printf '%s' "$${GITHUB_SHA:-unknown}")
 NXLOAD_BUILD_RUN ?= $(if $(filter push,$(GITHUB_EVENT_NAME)),$(GITHUB_RUN_NUMBER))
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

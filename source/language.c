@@ -213,6 +213,8 @@ static const struct {
     {"Розпакування", "Extracting"},
     {"Розпакування RAR · %.1f / %.1f МіБ", "Extracting RAR · %.1f / %.1f MiB"},
     {"Розпакування скасовано", "Extraction cancelled"},
+    {"Розпакувати", "Extract"},
+    {"Розпакувати й встановити", "Extract and install"},
     {"Розробник · %s", "Developer · %s"},
     {"Світла", "Light"},
     {"Сервіс квитків недоступний", "The ticket service is unavailable"},

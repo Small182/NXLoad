@@ -44,21 +44,38 @@ bool rar_signature(const char *path) {
            (signature[6] == 0 || (size == 8 && signature[6] == 1 && signature[7] == 0));
 }
 
-static const char *entry_name(const char *path) {
-    if (!path || !*path || *path == '/' || *path == '\\' || strchr(path, ':')) return NULL;
+static bool entry_name(const char *path, char *name, size_t capacity) {
+    if (!path || !*path || *path == '/' || *path == '\\') return false;
+    unsigned char first = (unsigned char)path[0];
+    if (((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')) &&
+        path[1] == ':') return false;
+
     const char *base = path;
     for (const char *p = path; ; ++p) {
-        unsigned char c = (unsigned char)*p;
-        if (c == '/' || c == '\\' || !c) {
+        if (*p == '/' || *p == '\\' || !*p) {
             size_t length = (size_t)(p - base);
-            if (!length || (length == 1 && *base == '.') ||
-                (length == 2 && base[0] == '.' && base[1] == '.')) return NULL;
-            if (!c) return *base == '.' || length >= sizeof(((ExtractedFile *)0)->name) ? NULL : base;
+            if (length == 2 && base[0] == '.' && base[1] == '.') return false;
+            if (!*p) break;
             base = p + 1;
-        } else if (c < 32 || c == 127 || strchr("<>|?*\"", c)) {
-            return NULL;
         }
     }
+    if (!package_name(base) || *base == '.') return false;
+
+    const char *ext = strrchr(base, '.');
+    size_t stem = (size_t)(ext - base), extension = strlen(ext);
+    if (capacity <= extension + 1) return false;
+    size_t max_stem = capacity - extension - 1;
+    if (stem > max_stem) {
+        stem = max_stem;
+        while (stem && ((unsigned char)base[stem] & 0xc0) == 0x80) --stem;
+    }
+    // Only the basename is written. Map characters FAT does not accept.
+    for (size_t i = 0; i < stem; ++i) {
+        unsigned char c = (unsigned char)base[i];
+        name[i] = c < 32 || c == 127 || strchr(":<>|?*\"", c) ? '_' : (char)c;
+    }
+    memcpy(name + stem, ext, extension + 1);
+    return stem != 0;
 }
 
 static bool unused_path(const char *path) {
@@ -138,8 +155,7 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
            (status = archive_read_next_header(reader, &entry)) == ARCHIVE_OK) {
         const char *path_in_archive = archive_entry_pathname(entry);
         if (!path_in_archive || !package_name(path_in_archive)) continue;
-        const char *name = entry_name(path_in_archive);
-        if (!name || archive_entry_filetype(entry) != AE_IFREG ||
+        if (archive_entry_filetype(entry) != AE_IFREG ||
             archive_entry_symlink(entry) || archive_entry_hardlink(entry)) {
             error = "Неприпустимий шлях пакета в RAR";
             break;
@@ -159,13 +175,17 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
         }
 
         ExtractedFile *output = &outputs[count];
-        int size = snprintf(output->destination, sizeof(output->destination), "%s/%s", directory, name);
+        if (!entry_name(path_in_archive, output->name, sizeof(output->name))) {
+            error = "Неприпустимий шлях пакета в RAR";
+            break;
+        }
+        int size = snprintf(output->destination, sizeof(output->destination), "%s/%s", directory, output->name);
         if (size <= 0 || (size_t)size >= sizeof(output->destination) || !unused_path(output->destination)) {
             error = "Пакет із такою назвою вже є або шлях недоступний";
             break;
         }
         for (size_t i = 0; i < count; ++i)
-            if (!strcasecmp(outputs[i].name, name)) error = "У RAR повторюється назва пакета";
+            if (!strcasecmp(outputs[i].name, output->name)) error = "У RAR повторюється назва пакета";
         if (error) break;
 
         size = snprintf(output->temporary, sizeof(output->temporary), "%s/.nxload-XXXXXX", directory);
@@ -173,7 +193,6 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
             error = "Шлях до microSD задовгий";
             break;
         }
-        strcpy(output->name, name);
         ++count;
         atomic_fetch_add(&job->total, (uint64_t)length);
         error = write_entry(reader, job, output, (uint64_t)length, buffer);

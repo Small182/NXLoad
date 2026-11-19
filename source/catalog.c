@@ -768,6 +768,71 @@ static bool romsns_download_page(xmlNodePtr node, char url[CATALOG_URL]) {
     return false;
 }
 
+static void read_romsns_media(xmlNodePtr root, char description[PORT_DESCRIPTION_BYTES],
+                               char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count) {
+    xmlNodePtr article = find_class(root, "entry-content");
+    if (!article) return;
+    xmlNodePtr intro = find_class(article->children, "dynamic-entry-content");
+    if (!intro) intro = article;
+    size_t length = 0;
+    for (xmlNodePtr node = intro->children; node; node = node->next) {
+        if (node->type != XML_ELEMENT_NODE) continue;
+        if (has_class(node, "pv2025-heading") || has_class(node, "pv2025-wrap") ||
+            has_class(node, "ams-content")) break;
+        if (!is_element(node, "p") || length + 3 >= PORT_DESCRIPTION_BYTES) continue;
+        size_t start = length ? length + 2 : 0;
+        description[start] = 0;
+        xmlChar *content = xmlNodeGetContent(node);
+        copy_text(description + start, PORT_DESCRIPTION_BYTES - start, content);
+        xmlFree(content);
+        if (description[start]) {
+            if (length) memcpy(description + length, "\n\n", 2);
+            length = start + strlen(description + start);
+        }
+    }
+
+    xmlNodePtr track = find_class(article->children, "pv2025-track");
+    for (xmlNodePtr slide = track ? track->children : NULL;
+         slide && *count < CATALOG_SCREENSHOTS; slide = slide->next) {
+        if (slide->type != XML_ELEMENT_NODE || !has_class(slide, "pv2025-slide")) continue;
+        xmlNodePtr img = find_tag(slide->children, "img");
+        if (!img) continue;
+        xmlChar *value = xmlGetProp(img, BAD_CAST "data-src");
+        if (!value || !*value) {
+            xmlFree(value);
+            value = xmlGetProp(img, BAD_CAST "src");
+        }
+        // WordPress can leave Unicode characters unescaped in image paths.
+        xmlChar *encoded = value ? xmlURIEscapeStr(value, BAD_CAST ":/?&=%#+,;@!$'()*[]") : NULL;
+        char url[CATALOG_URL];
+        bool valid = site_url(encoded, url, CATALOG_ROMSNS) &&
+            !strncmp(url, ROMSNS "/wp-content/uploads/", sizeof(ROMSNS "/wp-content/uploads/") - 1);
+        xmlFree(encoded);
+        xmlFree(value);
+        for (size_t i = 0; valid && i < *count; ++i)
+            if (!strcmp(screenshots[i], url)) valid = false;
+        if (valid) strcpy(screenshots[(*count)++], url);
+    }
+}
+
+bool catalog_read_romsns_media(const char *page, atomic_bool *cancel,
+                               char description[PORT_DESCRIPTION_BYTES],
+                               char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count) {
+    description[0] = 0;
+    *count = 0;
+    char normalized[CATALOG_URL];
+    if (!game_page(BAD_CAST page, normalized, CATALOG_ROMSNS) || atomic_load(cancel)) return false;
+    CURL *curl = curl_easy_init();
+    if (!curl) return false;
+    CatalogFetchStatus status;
+    htmlDocPtr doc = fetch_page(curl, cancel, normalized, &status, false);
+    curl_easy_cleanup(curl);
+    if (!doc) return false;
+    read_romsns_media(xmlDocGetRootElement(doc), description, screenshots, count);
+    xmlFreeDoc(doc);
+    return true;
+}
+
 static void load_details(CatalogJob *job) {
     GameDetails *details = &job->details;
     strcpy(details->title, job->game.title);

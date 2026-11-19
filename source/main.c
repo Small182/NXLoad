@@ -172,6 +172,7 @@ typedef struct {
     int description_scroll;
     bool show_original, fullscreen_shot;
     GameMetadata metadata;
+    char port_description[PORT_DESCRIPTION_BYTES];
     GameGallery gallery;
     GalleryJob gallery_job;
     Thread gallery_thread;
@@ -734,8 +735,14 @@ static void refresh_catalogs(void) {
     start_next_index();
 }
 
+static bool use_romsns_port_media(void) {
+    return app.settings.source_enabled[CATALOG_ROMSNS] &&
+           romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS]);
+}
+
 static void request_game_files(void) {
     if (app.screen != GAME || app.game_tab == GAME_OVERVIEW) return;
+    if (app.game_tab == GAME_MEDIA && use_romsns_port_media()) return;
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) {
         if (app.game_tab == GAME_MEDIA && source != CATALOG_ROMSHQ) continue;
         if (!app.settings.source_enabled[source] || app.files_loaded[source] || app.catalog_busy[source] ||
@@ -1050,6 +1057,7 @@ static void update_description(void) {
     app.description = NULL;
     app.description_scroll = 0;
     const char *summary = app.show_original ? app.metadata.original : app.metadata.description;
+    if (app.port_description[0] && use_romsns_port_media()) summary = app.port_description;
     if (!*summary) return;
     SDL_Surface *paragraph = TTF_RenderUTF8_Blended_Wrapped(app.normal, summary, gray, 750);
     if (!paragraph) return;
@@ -1059,18 +1067,25 @@ static void update_description(void) {
 
 static void pump_gallery(void) {
     GalleryJob *job = &app.gallery_job;
+    bool port_media = use_romsns_port_media();
     if (app.gallery_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.gallery_thread), 0))) {
         threadWaitForExit(&app.gallery_thread);
         threadClose(&app.gallery_thread);
         app.gallery_busy = false;
-        if (!atomic_load(&job->cancel) && !strcmp(job->page, app.active_game.page))
+        if (!atomic_load(&job->cancel) && !strcmp(job->page, app.active_game.page)) {
             app.gallery = job->result;
+            if (job->port_description[0]) {
+                strcpy(app.port_description, job->port_description);
+                update_description();
+            }
+        }
     }
-    if (app.screen == GAME && app.game_tab == GAME_MEDIA &&
+    if (app.screen == GAME && (port_media || app.game_tab == GAME_MEDIA) &&
         !app.gallery_busy && !app.gallery_requested) {
         memset(job, 0, sizeof(*job));
         atomic_init(&job->cancel, false);
         strcpy(job->page, app.active_game.page);
+        if (port_media) strcpy(job->romsns_page, app.game_sources[CATALOG_ROMSNS].page);
         if (app.active_metadata && app.active_metadata->nintendo_life[0]) {
             strcpy(job->nintendo_life, app.active_metadata->nintendo_life);
             strcpy(job->title, app.active_metadata->title);
@@ -1085,7 +1100,8 @@ static void pump_gallery(void) {
         app.gallery_requested = true;
         app.gallery_busy = start_worker(&app.gallery_thread, gallery_worker, job);
         if (!app.gallery_busy)
-            strcpy(app.gallery.issue, "Не вдалося запустити запит Nintendo Life");
+            strcpy(app.gallery.issue, port_media ? "Не вдалося запустити запит ROMsNS" :
+                   "Не вдалося запустити запит Nintendo Life");
     }
 }
 
@@ -1244,7 +1260,7 @@ static void finish_jobs(void) {
             app.details[source] = job->details;
             strcpy(app.file_errors[source], job->error);
             if (app.settings.source_enabled[source] && source == CATALOG_ROMSHQ &&
-                job->details.screenshot_count && !app.gallery.count) {
+                job->details.screenshot_count && !app.gallery.count && !use_romsns_port_media()) {
                 if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
                 app.screenshot_index = 0;
                 app.gallery.count = job->details.screenshot_count;
@@ -1691,6 +1707,15 @@ static void change_setting(size_t row, bool activate) {
         if (row >= SETTINGS_NSROMS && row <= SETTINGS_ROMSNS) {
             app.file_index = 0;
             app.file_scroll = 0;
+        }
+        if (row == SETTINGS_ROMSNS && romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS]) &&
+            (app.screen == GAME || (app.screen == DOWNLOADS && app.previous == GAME))) {
+            if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
+            app.gallery_requested = false;
+            app.screenshot_index = 0;
+            app.port_description[0] = 0;
+            memset(&app.gallery, 0, sizeof(app.gallery));
+            update_description();
         }
     } else {
         *value = !*value;
@@ -2336,7 +2361,8 @@ static void input(u64 buttons) {
                 else if (app.trailers.count) open_trailer(0);
             }
         } else {
-            if ((buttons & HidNpadButton_X) && app.metadata.original[0]) {
+            if ((buttons & HidNpadButton_X) && app.metadata.original[0] &&
+                !(app.port_description[0] && use_romsns_port_media())) {
                 app.show_original = !app.show_original;
                 update_description();
             }
@@ -2396,6 +2422,7 @@ static void input(u64 buttons) {
             for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source)
                 if (entry->games[source]) app.game_sources[source] = *entry->games[source];
             app.show_original = false;
+            app.port_description[0] = 0;
             memset(&app.details, 0, sizeof(app.details));
             memset(&app.metadata, 0, sizeof(app.metadata));
             memset(&app.gallery, 0, sizeof(app.gallery));
@@ -2645,9 +2672,12 @@ static void draw_game_overview(void) {
                 text(app.small, "↑ / ↓  Читати опис", 430, 522, 769, gray);
         }
     } else {
-        text(app.normal, "Опис недоступний", 430, 269, 769, gray);
+        bool loading = use_romsns_port_media() && (app.gallery_busy || !app.gallery_requested);
+        text(app.normal, loading ? "Завантаження опису…" : "Опис недоступний", 430, 269, 769, gray);
     }
-    if (app.metadata.original[0]) {
+    if (app.port_description[0] && use_romsns_port_media()) {
+        text(app.small, "Опис · ROMsNS", 430, 548, 769, gray);
+    } else if (app.metadata.original[0]) {
         text(app.small, app.show_original ? "Англійський оригінал" : "Український опис", 430, 548, 769, gray);
         text(app.small, app.show_original ? "X  Українською" : "X  Показати оригінал", 430, 577, 769, blue);
     }
@@ -2656,7 +2686,7 @@ static void draw_game_overview(void) {
 static void draw_game_screenshots(void) {
     if (!app.gallery.count) {
         const char *status = app.gallery_busy || !app.gallery_requested ||
-            app.catalog_busy[CATALOG_ROMSHQ] ? "Пошук скриншотів…" :
+            (app.catalog_busy[CATALOG_ROMSHQ] && !use_romsns_port_media()) ? "Пошук скриншотів…" :
             app.gallery.issue[0] ? app.gallery.issue : "Скриншоти недоступні";
         text(app.normal, status, 430, 273, 769, gray);
         return;

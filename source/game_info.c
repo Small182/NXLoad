@@ -485,6 +485,13 @@ unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *
 }
 
 void load_game_gallery(GalleryJob *job) {
+    if (job->romsns_page[0]) {
+        bool loaded = catalog_read_romsns_media(job->romsns_page, &job->cancel, job->port_description,
+                                                job->result.screenshots, &job->result.count);
+        if (!loaded || !job->result.count)
+            strcpy(job->result.issue, "Скриншоти ROMsNS недоступні");
+        return;
+    }
     char name[CATALOG_TEXT], key[CATALOG_TEXT], alternate[CATALOG_TEXT] = {0};
     snprintf(name, sizeof(name), "%s", job->title[0] ? job->title :
              job->heading[0] ? job->heading : job->catalog_title);

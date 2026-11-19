@@ -276,7 +276,6 @@ static const struct {
     {"↓ + Встановити · %.145s", "↓ + Install · %.145s"},
     {"−  Освітлити екран", "−  Restore screen"},
     {"−  Приглушити екран", "−  Dim screen"},
-    {"★ У вибраному", "★ In Favorites"},
 };
 
 void set_english(bool enabled) {

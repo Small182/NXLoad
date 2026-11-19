@@ -499,12 +499,16 @@ static void load_favorites(void) {
     fclose(file);
 }
 
-static bool set_favorite(const char *title) {
-    char key[CATALOG_TEXT];
-    snprintf(key, sizeof(key), "%.191s", title);
+static void make_favorite_key(char key[CATALOG_TEXT], const char *title) {
+    snprintf(key, CATALOG_TEXT, "%.191s", title);
     clean_catalog_title(key);
     for (char *c = key; *c; ++c)
         if (*c == '\n' || *c == '\r') *c = ' ';
+}
+
+static bool set_favorite(const char *title) {
+    char key[CATALOG_TEXT];
+    make_favorite_key(key, title);
     if (!key[0] || !nxload_ensure_storage()) return false;
     size_t index = favorite_index(key);
     bool add = index == app.favorites_count;
@@ -595,8 +599,7 @@ static void rebuild_view(const char *keep) {
         if (app.genre && (!entry->metadata || !(entry->metadata->genres & (1u << (app.genre - 1))))) continue;
         if (app.favorites_open) {
             char key[CATALOG_TEXT];
-            snprintf(key, sizeof(key), "%.191s", entry_title(entry));
-            clean_catalog_title(key);
+            make_favorite_key(key, entry_title(entry));
             if (favorite_index(key) == app.favorites_count) continue;
         }
         ++app.genre_count;
@@ -2023,8 +2026,7 @@ static void input(u64 buttons) {
             update_description();
             memset(app.files_loaded, 0, sizeof(app.files_loaded));
             memset(app.file_errors, 0, sizeof(app.file_errors));
-            snprintf(app.favorite_key, sizeof(app.favorite_key), "%.191s", entry_title(entry));
-            clean_catalog_title(app.favorite_key);
+            make_favorite_key(app.favorite_key, entry_title(entry));
             app.file_index = 0;
             app.file_scroll = 0;
             app.screenshot_index = 0;
@@ -2055,6 +2057,31 @@ static void draw_grid_cover(SDL_Texture *cover, int x, int y, int size) {
     SDL_RenderCopy(app.renderer, cover, &src, &dst);
 }
 
+static void draw_favorite_star(int x, int y) {
+    static const SDL_Point points[] = {
+        {14, 14}, {14, 0}, {18, 9}, {28, 10}, {21, 17}, {23, 27},
+        {14, 22}, {5, 27}, {7, 17}, {0, 10}, {10, 9},
+    };
+    static const int triangles[] = {
+        0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5, 0, 5, 6,
+        0, 6, 7, 0, 7, 8, 0, 8, 9, 0, 9, 10, 0, 10, 1,
+    };
+    SDL_Vertex vertices[sizeof(points) / sizeof(*points)] = {0};
+    for (size_t i = 0; i < sizeof(vertices) / sizeof(*vertices); ++i) {
+        vertices[i].position = (SDL_FPoint){x + points[i].x + 1, y + points[i].y + 2};
+        vertices[i].color = (SDL_Color){40, 25, 8, 255};
+    }
+    SDL_RenderGeometry(app.renderer, NULL, vertices, sizeof(vertices) / sizeof(*vertices),
+                       triangles, sizeof(triangles) / sizeof(*triangles));
+    for (size_t i = 0; i < sizeof(vertices) / sizeof(*vertices); ++i) {
+        vertices[i].position.x -= 1;
+        vertices[i].position.y -= 2;
+        vertices[i].color = (SDL_Color){255, 201, 75, 255};
+    }
+    SDL_RenderGeometry(app.renderer, NULL, vertices, sizeof(vertices) / sizeof(*vertices),
+                       triangles, sizeof(triangles) / sizeof(*triangles));
+}
+
 static void draw_library(void) {
     for (size_t i = 0; i < TAB_COUNT; ++i) {
         int x = tab_left(i), width = tab_widths[i];
@@ -2079,6 +2106,11 @@ static void draw_library(void) {
         int x = GRID_X + (int)(i % GRID_COLUMNS) * GRID_STEP_X + inset;
         int y = GRID_Y + (int)(i / GRID_COLUMNS) * GRID_STEP_Y - app.grid_scroll + inset;
         draw_grid_cover(cover_texture(entry_game(entry), entry->metadata), x, y, size);
+        if (app.favorites_count) {
+            char key[CATALOG_TEXT];
+            make_favorite_key(key, entry_title(entry));
+            if (favorite_index(key) < app.favorites_count) draw_favorite_star(x + 8, y + 8);
+        }
         unsigned rating = entry->metadata ? entry->metadata->rating : 0;
         char score[12] = "—";
         if (rating) snprintf(score, sizeof(score), "%u.%u", rating / 10, rating % 10);
@@ -2101,11 +2133,7 @@ static void draw_library(void) {
     if (app.game_count) {
         const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
         text(app.normal, entry_title(entry), 40, 593, 905, white);
-        char key[CATALOG_TEXT];
-        snprintf(key, sizeof(key), "%.191s", entry_title(entry));
-        clean_catalog_title(key);
-        text(app.small, favorite_index(key) < app.favorites_count ? "★ У вибраному" : app.notice,
-             1000, 593, 240, blue);
+        text(app.small, app.notice, 1000, 593, 240, blue);
     } else if (!app.index_busy) {
         text(app.normal, app.favorites_open ? "У вибраному немає ігор" :
              app.entry_count ? "Ігор за цими фільтрами не знайдено" : "Каталог порожній",
@@ -2191,6 +2219,7 @@ static void draw_cover(void) {
     rect(56, 127, 308, 308, background);
     SDL_Texture *cover = cover_texture(&app.active_game, app.active_metadata);
     fit_cover(cover, 56, 127, 308, 308);
+    if (favorite_index(app.favorite_key) < app.favorites_count) draw_favorite_star(64, 135);
     unsigned rating = app.active_metadata ? app.active_metadata->rating : 0;
     char score[48] = "Рейтинг · —";
     if (rating) snprintf(score, sizeof(score), tr("Рейтинг · %u.%u / 10"), rating / 10, rating % 10);
@@ -2305,8 +2334,6 @@ static void draw_game(void) {
     const char *title = app.active_metadata ? app.active_metadata->title :
                         app.metadata.title[0] ? app.metadata.title : app.active_game.title;
     text(app.large, title, 430, 130, 772, white);
-    if (favorite_index(app.favorite_key) < app.favorites_count)
-        text(app.small, "★ У вибраному", 430, 177, 772, blue);
     if (app.notice[0] && app.game_tab != GAME_FILES)
         right_text(app.small, app.notice, 700, 177, 510, gray);
     const char *tabs[] = {"Огляд", "Скриншоти", "Файли"};

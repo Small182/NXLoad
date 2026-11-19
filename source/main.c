@@ -2587,6 +2587,24 @@ static void draw_game_screenshots(void) {
     }
 }
 
+static const char *file_display_label(const char *label, char *translated, size_t capacity) {
+    if (app.settings.english) return label;
+    const char *name, *suffix;
+    if (!strncasecmp(label, "Base", 4) && !isalnum((unsigned char)label[4])) {
+        name = "Базова гра";
+        suffix = label + 4;
+        if (!strncasecmp(suffix, " Game", 5) && !isalnum((unsigned char)suffix[5]))
+            suffix += 5;
+    } else if (!strncasecmp(label, "Update", 6) && !isalnum((unsigned char)label[6])) {
+        name = "Оновлення";
+        suffix = label + 6;
+    } else {
+        return label;
+    }
+    snprintf(translated, capacity, "%s%s", name, suffix);
+    return translated;
+}
+
 static void draw_game_files(void) {
     FileRow rows[CATALOG_SOURCE_COUNT * (CATALOG_FILE_COUNT + 2)];
     size_t count = file_rows(rows);
@@ -2601,15 +2619,17 @@ static void draw_game_files(void) {
         int y = FILE_LIST_Y + (int)i * FILE_STEP - app.file_scroll;
         if (y >= FILE_LIST_BOTTOM) break;
         if (rows[i].file) {
+            char translated[CATALOG_TEXT + sizeof("Базова гра")];
+            const char *label = file_display_label(rows[i].label, translated, sizeof(translated));
             const char *size = rows[i].file->size[0] ? rows[i].file->size : "—";
-            if (!strstr(rows[i].label, size)) {
+            if (!strstr(label, size)) {
                 if (i == app.file_index && !app.top_focus) {
                     rect(429, y, 782, 42, selected);
                     rect(429, y, 3, 42, blue);
                 }
-                text(app.normal, rows[i].label, 440, y + 8, 602, white);
+                text(app.normal, label, 440, y + 8, 602, white);
                 right_text(app.small, size, 1048, y + 11, 152, gray);
-            } else row(i, app.top_focus ? SIZE_MAX : app.file_index, 429, y, 782, rows[i].label);
+            } else row(i, app.top_focus ? SIZE_MAX : app.file_index, 429, y, 782, label);
         } else if (rows[i].heading) {
             rect(429, y, 782, 42, background);
             text(app.normal, rows[i].label, 440, y + 8, 758, blue);

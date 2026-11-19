@@ -3,6 +3,8 @@
 
 #include "fichier.h"
 
+#define UPDATE_DETAILS_BYTES 8192
+
 typedef struct {
     char id[24], digest[72], sha[41], version[24];
     uint64_t run;
@@ -11,6 +13,7 @@ typedef struct {
 typedef struct {
     atomic_bool cancelled;
     UpdateBuild build;
+    char details[UPDATE_DETAILS_BYTES];
     const char *error;
 } UpdateCheck;
 

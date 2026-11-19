@@ -51,6 +51,10 @@
 #define COVER_WORKERS 3
 #define GRID_THUMB_SIZE 180
 #define DOWNLOAD_QUEUE_LIMIT 24
+#define UPDATE_NOTES_WIDTH 920
+#define UPDATE_NOTES_Y 211
+#define UPDATE_NOTES_LINE 23
+#define UPDATE_NOTES_ROWS 15
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 typedef enum { BACKLIGHT_UNCHANGED, BACKLIGHT_APPLET, BACKLIGHT_LBL } BacklightControl;
@@ -183,9 +187,11 @@ typedef struct {
     bool catalog_busy[CATALOG_SOURCE_COUNT];
     size_t download_choice;
     char update_target[256], staged_update_sha[41];
-    bool update_ready, update_checking, update_offered;
+    bool update_ready, update_checking, update_offered, update_details_open;
     UpdateCheck update_check;
     Thread update_thread;
+    struct { uint16_t offset, length; } update_lines[UPDATE_DETAILS_BYTES];
+    int update_line_count, update_details_scroll;
     char query[96], notice[192], delete_file[sizeof(((SavedFile *)0)->file)];
     DownloadRequest active_transfer, draft_transfer, queue[DOWNLOAD_QUEUE_LIMIT];
     size_t queue_count, queue_index;
@@ -1219,6 +1225,7 @@ static void finish_jobs(void) {
         threadClose(&app.update_thread);
         app.update_checking = false;
         app.update_offered = app.update_check.build.id[0] != 0;
+        app.update_details_open = false;
         snprintf(app.update_notice, sizeof(app.update_notice), "%s",
                  app.update_check.error ? app.update_check.error : app.update_offered ?
                  "Доступне оновлення NXLoad" : "Вже встановлено актуальну збірку NXLoad");
@@ -1421,8 +1428,53 @@ static bool update_dialog_visible(void) {
            !app.confirm_install && !app.delete_file[0] && !app.filters_open;
 }
 
+static void open_update_details(void) {
+    const char *notes = app.update_check.details;
+    app.update_details_open = true;
+    app.update_details_scroll = app.update_line_count = 0;
+    for (const char *p = notes; *p;) {
+        char line[256];
+        size_t length = strcspn(p, "\n");
+        size_t bytes = SDL_min(length, sizeof(line) - 1);
+        while (bytes > 1 && ((unsigned char)p[bytes] & 0xc0) == 0x80) --bytes;
+        const char *end = p + bytes;
+        if (bytes) {
+            memcpy(line, p, bytes);
+            line[bytes] = 0;
+            int extent = 0, characters = 0;
+            if (TTF_MeasureUTF8(app.small, line, UPDATE_NOTES_WIDTH - 8, &extent, &characters) == 0) {
+                end = p;
+                while (end < p + bytes && characters-- > 0)
+                    do { ++end; } while (end < p + bytes && ((unsigned char)*end & 0xc0) == 0x80);
+                if (end == p)
+                    do { ++end; } while (end < p + bytes && ((unsigned char)*end & 0xc0) == 0x80);
+            }
+            if (end < p + length) {
+                const char *word = end;
+                while (word > p && word[-1] != ' ') --word;
+                if (word > p) end = word;
+            }
+        }
+        const char *visible = end;
+        while (visible > p && visible[-1] == ' ') --visible;
+        app.update_lines[app.update_line_count].offset = (uint16_t)(p - notes);
+        app.update_lines[app.update_line_count++].length = (uint16_t)(visible - p);
+        p = end;
+        while (*p == ' ') ++p;
+        if (*p == '\n') ++p;
+    }
+}
+
+static bool scroll_update_details(int lines) {
+    int previous = app.update_details_scroll;
+    int maximum = SDL_max(0, app.update_line_count - UPDATE_NOTES_ROWS);
+    app.update_details_scroll = SDL_clamp(previous + lines, 0, maximum);
+    return previous != app.update_details_scroll;
+}
+
 static void respond_to_update(bool install) {
     app.update_offered = false;
+    app.update_details_open = false;
     if (!install) {
         app.update_notice[0] = 0;
         return;
@@ -1767,6 +1819,7 @@ static void toggle_trailer(void) {
 }
 
 static void touch_swipe(int y, int dx, int dy) {
+    if (update_dialog_visible()) return;
     if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download || app.settings_open) return;
     if (abs(dx) < 42 || abs(dx) <= abs(dy)) return;
     if (app.trailer_open) {
@@ -1796,7 +1849,13 @@ static void touch_tap(int x, int y) {
         return;
     }
     if (update_dialog_visible()) {
-        if (x >= 224 && x < 1050 && y >= 418 && y < 488) respond_to_update(x < 640);
+        if (app.update_details_open) {
+            if (x >= 820 && x < 1104 && y >= 567 && y < 608) app.update_details_open = false;
+        } else if (x >= 224 && x < 1050 && y >= 418 && y < 488) {
+            if (x < 495) respond_to_update(true);
+            else if (x < 785) open_update_details();
+            else respond_to_update(false);
+        }
         return;
     }
     if (app.choose_download) {
@@ -1920,10 +1979,17 @@ static void touch_tap(int x, int y) {
     }
 }
 
-typedef enum { DRAG_NONE, DRAG_GRID, DRAG_DESCRIPTION, DRAG_FILES, DRAG_SAVED, DRAG_QUEUE, DRAG_SETTINGS } DragArea;
+typedef enum {
+    DRAG_NONE, DRAG_GRID, DRAG_DESCRIPTION, DRAG_FILES, DRAG_SAVED, DRAG_QUEUE,
+    DRAG_SETTINGS, DRAG_UPDATE_DETAILS
+} DragArea;
 
 static DragArea drag_area(int x, int y) {
-    if (app.fullscreen_shot || update_dialog_visible()) return DRAG_NONE;
+    if (app.fullscreen_shot) return DRAG_NONE;
+    if (update_dialog_visible())
+        return app.update_details_open && x >= 170 && x < 1110 &&
+               y >= UPDATE_NOTES_Y && y < UPDATE_NOTES_Y + UPDATE_NOTES_ROWS * UPDATE_NOTES_LINE ?
+            DRAG_UPDATE_DETAILS : DRAG_NONE;
     if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download) return DRAG_NONE;
     if (app.settings_open)
         return x >= 180 && x < 1100 && y >= SETTINGS_Y &&
@@ -1939,6 +2005,12 @@ static DragArea drag_area(int x, int y) {
 }
 
 static bool drag_scroll(DragArea area, int delta, int *remainder) {
+    if (update_dialog_visible() && area != DRAG_UPDATE_DETAILS) return false;
+    if (area == DRAG_UPDATE_DETAILS) {
+        int pixels = *remainder + delta;
+        *remainder = pixels % UPDATE_NOTES_LINE;
+        return app.update_details_open && scroll_update_details(pixels / UPDATE_NOTES_LINE);
+    }
     if (area == DRAG_GRID) return scroll_grid(delta);
     if (area == DRAG_DESCRIPTION) return scroll_description(delta);
     if (area == DRAG_FILES) {
@@ -2094,8 +2166,13 @@ static void input(u64 buttons) {
         return;
     }
     if (update_dialog_visible()) {
-        if (buttons & HidNpadButton_A) respond_to_update(true);
+        if (app.update_details_open) {
+            if (buttons & (HidNpadButton_B | HidNpadButton_X)) app.update_details_open = false;
+            else if (buttons & up_buttons) scroll_update_details(-1);
+            else if (buttons & down_buttons) scroll_update_details(1);
+        } else if (buttons & HidNpadButton_A) respond_to_update(true);
         else if (buttons & HidNpadButton_B) respond_to_update(false);
+        else if (buttons & HidNpadButton_X) open_update_details();
         else if (buttons & HidNpadButton_Plus) app.close = true;
         return;
     }
@@ -2769,6 +2846,32 @@ static void draw_downloads(void) {
     text(app.small, notice, 66, 608, 1148, gray);
 }
 
+static void draw_update_details(const char *version) {
+    rect(140, 106, 1000, 508, panel);
+    text(app.large, "Деталі оновлення", 176, 126, UPDATE_NOTES_WIDTH, white);
+    text(app.small, version, 176, 178, UPDATE_NOTES_WIDTH, gray);
+    if (!app.update_line_count)
+        text(app.normal, "Опис оновлення недоступний", 176, UPDATE_NOTES_Y, UPDATE_NOTES_WIDTH, gray);
+    for (int row = 0; row < UPDATE_NOTES_ROWS && app.update_details_scroll + row < app.update_line_count; ++row) {
+        int i = app.update_details_scroll + row;
+        char line[256];
+        size_t length = app.update_lines[i].length;
+        memcpy(line, app.update_check.details + app.update_lines[i].offset, length);
+        line[length] = 0;
+        text(app.small, line, 176, UPDATE_NOTES_Y + row * UPDATE_NOTES_LINE, UPDATE_NOTES_WIDTH, white);
+    }
+    if (app.update_line_count > UPDATE_NOTES_ROWS) {
+        text(app.small, "↑ / ↓  Прокрутити", 176, 576, 480, gray);
+        int height = UPDATE_NOTES_LINE * UPDATE_NOTES_ROWS;
+        int thumb = SDL_max(16, height * UPDATE_NOTES_ROWS / app.update_line_count);
+        int top = (height - thumb) * app.update_details_scroll / (app.update_line_count - UPDATE_NOTES_ROWS);
+        rect(1107, UPDATE_NOTES_Y, 3, height, selected);
+        rect(1107, UPDATE_NOTES_Y + top, 3, thumb, blue);
+    }
+    rect(820, 567, 278, 38, selected);
+    right_text(app.small, "B  Назад", 832, 576, 250, blue);
+}
+
 static void draw_update_dialog(void) {
     char line[112];
     const UpdateBuild *build = &app.update_check.build;
@@ -2776,13 +2879,18 @@ static void draw_update_dialog(void) {
         snprintf(line, sizeof(line), tr("Версія %s"), build->version);
     else
         snprintf(line, sizeof(line), tr("Збірка %" PRIu64 " · %.8s"), build->run, build->sha);
+    if (app.update_details_open) {
+        draw_update_details(line);
+        return;
+    }
     rect(190, 200, 900, 305, selected);
     text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
     text(app.normal, line, 224, 298, 828, gray);
     text(app.small, "Оновлення встановиться автоматично після завершення черги.", 224, 343, 828, gray);
     text(app.small, app.update_target, 224, 374, 828, gray);
-    text(app.normal, "A  Встановити", 224, 428, 396, blue);
-    text(app.normal, "B  Пізніше", 656, 428, 390, gray);
+    text(app.normal, "A  Встановити", 224, 428, 262, blue);
+    text(app.normal, "X  Деталі", 500, 428, 277, blue);
+    text(app.normal, "B  Пізніше", 793, 428, 255, gray);
 }
 
 static void draw_trailer(void) {

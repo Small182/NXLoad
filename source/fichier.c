@@ -3,6 +3,7 @@
 #include "range.h"
 #include "storage.h"
 #include "language.h"
+#include "json.h"
 #include "unpack.h"
 
 #include <curl/curl.h>
@@ -542,70 +543,6 @@ static bool resolve_bunny(CURL *curl, Transfer *t, char out[URL_CAPACITY]) {
 // DLArchive returns a flat JSON object with string, boolean and numeric fields.
 static void skip_json_space(const char **p) {
     while (isspace((unsigned char)**p)) ++*p;
-}
-
-static bool json_hex4(const char **s, unsigned *value) {
-    const char *hex = "0123456789abcdef";
-    *value = 0;
-    for (unsigned i = 0; i < 4; ++i) {
-        int digit = tolower((unsigned char)**s);
-        const char *p = digit ? strchr(hex, digit) : NULL;
-        if (!p) return false;
-        *value = 16 * *value + (unsigned)(p - hex);
-        ++*s;
-    }
-    return true;
-}
-
-static bool read_json_string(const char **p, char *out, size_t capacity) {
-    if (**p != '"') return false;
-    const char *s = *p + 1;
-    size_t n = 0;
-    while (*s && *s != '"') {
-        unsigned char ch = (unsigned char)*s++;
-        if (ch < 0x20) return false;
-        if (ch == '\\') {
-            ch = (unsigned char)*s++;
-            const char *simple = "\"\\/bfnrt";
-            const char *escape = ch ? strchr(simple, ch) : NULL;
-            if (escape) {
-                ch = (unsigned char)"\"\\/\b\f\n\r\t"[escape - simple];
-            } else if (ch == 'u') {
-                unsigned code;
-                if (!json_hex4(&s, &code) || !code) return false;
-                if (code >= 0xd800 && code <= 0xdbff) {
-                    if (s[0] != '\\' || s[1] != 'u') return false;
-                    s += 2;
-                    unsigned low;
-                    if (!json_hex4(&s, &low) || low < 0xdc00 || low > 0xdfff) return false;
-                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
-                } else if (code >= 0xdc00 && code <= 0xdfff) {
-                    return false;
-                }
-                if (code > 0x7f) {
-                    unsigned width = code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
-                    if (n + width >= capacity) return false;
-                    for (unsigned i = width - 1; i > 0; --i) {
-                        out[n + i] = (char)(0x80 | (code & 0x3f));
-                        code >>= 6;
-                    }
-                    const unsigned char prefix[] = {0, 0, 0xc0, 0xe0, 0xf0};
-                    out[n] = (char)(prefix[width] | code);
-                    n += width;
-                    continue;
-                }
-                ch = (unsigned char)code;
-            } else {
-                return false;
-            }
-        }
-        if (n + 1 >= capacity) return false;
-        out[n++] = (char)ch;
-    }
-    if (*s != '"') return false;
-    out[n] = 0;
-    *p = s + 1;
-    return true;
 }
 
 static bool read_dlarchive_reply(Transfer *t, char out[URL_CAPACITY]) {

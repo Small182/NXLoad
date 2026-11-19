@@ -213,7 +213,7 @@ static bool read_run(Json run, UpdateBuild *build, char id[24]) {
            strlen(build->sha) == 40 && strspn(build->sha, "0123456789abcdef") == 40;
 }
 
-static bool newest_run(Response *r, UpdateBuild *latest, char run_id[24]) {
+static bool newest_run(Response *r, UpdateBuild *latest, char run_id[24], Json *head_commit) {
     Json body = {r->json, r->json + r->size};
     Json runs = field(body, "workflow_runs");
     const char *cursor = NULL;
@@ -223,6 +223,7 @@ static bool newest_run(Response *r, UpdateBuild *latest, char run_id[24]) {
         if (read_run(run, &candidate, id) && candidate.run > latest->run) {
             *latest = candidate;
             strcpy(run_id, id);
+            if (head_commit) *head_commit = field(run, "head_commit");
         }
     }
     return latest->run != 0;
@@ -261,7 +262,44 @@ static const char *release_http_error(void) {
     return "Не вдалося отримати публічний реліз NXLoad з GitHub";
 }
 
-static const char *check_release(Response *r, UpdateBuild *result) {
+static void read_update_details(Json object, const char *key, char out[UPDATE_DETAILS_BYTES]) {
+    out[0] = 0;
+    Json value = field(object, key);
+    if (!value.begin || *value.begin != '"') return;
+    size_t capacity = (size_t)(value.end - value.begin);
+    char *decoded = malloc(capacity);
+    if (!decoded) return;
+    const char *cursor = value.begin;
+    if (read_json_string(&cursor, decoded, capacity) && cursor == value.end) {
+        char *kept = decoded;
+        for (const char *p = decoded; *p; ++p) {
+            unsigned char ch = (unsigned char)*p;
+            if (ch == '\r') {
+                if (p[1] != '\n') *kept++ = '\n';
+            } else if (ch == '\t') {
+                *kept++ = ' ';
+            } else if (ch == '\n' || (ch >= 32 && ch != 127)) {
+                *kept++ = (char)ch;
+            }
+        }
+        const char *start = whitespace(decoded, kept);
+        while (kept > start && isspace((unsigned char)kept[-1])) --kept;
+        size_t length = (size_t)(kept - start);
+        if (length < UPDATE_DETAILS_BYTES) {
+            memcpy(out, start, length);
+            out[length] = 0;
+        } else {
+            static const char suffix[] = "\n…";
+            length = UPDATE_DETAILS_BYTES - sizeof(suffix);
+            while ((start[length] & 0xc0) == 0x80) --length;
+            memcpy(out, start, length);
+            memcpy(out + length, suffix, sizeof(suffix));
+        }
+    }
+    free(decoded);
+}
+
+static const char *check_release(Response *r, UpdateCheck *check) {
     const char *invalid = "У релізі NXLoad немає придатного файлу оновлення";
     long status = 0;
     if (!request(RELEASES "latest", NULL, r, &status))
@@ -288,6 +326,7 @@ static const char *check_release(Response *r, UpdateBuild *result) {
         }
     }
     if (!found) return invalid;
+    read_update_details(release, "body", check->details);
     char url[160];
     snprintf(url, sizeof(url), REPOSITORY "commits/%s", tag);
     if (!request(url, NULL, r, &status)) return release_http_error();
@@ -296,7 +335,7 @@ static const char *check_release(Response *r, UpdateBuild *result) {
         strlen(candidate.sha) != 40 || strspn(candidate.sha, "0123456789abcdef") != 40)
         return invalid;
     strcpy(candidate.version, tag + 1);
-    *result = candidate;
+    check->build = candidate;
     return NULL;
 }
 
@@ -306,6 +345,7 @@ void check_update(UpdateCheck *check) {
     long status = 0;
     UpdateBuild candidate = {0};
     check->build = (UpdateBuild){0};
+    check->details[0] = 0;
     check->error = NULL;
     Response r = {.cancelled = &check->cancelled, .json = malloc(JSON_LIMIT + 1)};
     if (!r.json) {
@@ -313,7 +353,7 @@ void check_update(UpdateCheck *check) {
         return;
     }
     if (!read_token(token)) {
-        check->error = check_release(&r, &check->build);
+        check->error = check_release(&r, check);
         goto done;
     }
     const char *runs = ACTIONS "runs?branch=" UPDATE_BRANCH "&event=push&status=success&per_page=10";
@@ -321,11 +361,13 @@ void check_update(UpdateCheck *check) {
         check->error = http_error(status);
         goto done;
     }
-    if (!newest_run(&r, &candidate, run_id)) {
+    Json head_commit = {0};
+    if (!newest_run(&r, &candidate, run_id, &head_commit)) {
         check->error = no_build;
         goto done;
     }
     if (!strcmp(candidate.sha, NXLOAD_BUILD_SHA)) goto done;
+    read_update_details(head_commit, "message", check->details);
     uint64_t installed = strtoull(NXLOAD_BUILD_RUN, NULL, 10);
     if (!installed) {
         // A build without the CI run number can still identify itself by its commit.
@@ -333,7 +375,7 @@ void check_update(UpdateCheck *check) {
             snprintf(url, sizeof(url), "%s&head_sha=%s", runs, NXLOAD_BUILD_SHA);
             UpdateBuild current = {0};
             char current_id[24];
-            if (request(url, token, &r, &status) && newest_run(&r, &current, current_id)
+            if (request(url, token, &r, &status) && newest_run(&r, &current, current_id, NULL)
                 && !strcmp(current.sha, NXLOAD_BUILD_SHA)) installed = current.run;
         }
         if (!installed) {

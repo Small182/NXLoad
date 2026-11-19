@@ -53,6 +53,7 @@
 
 typedef enum { LIBRARY, GAME, DOWNLOADS } Screen;
 typedef enum { BACKLIGHT_UNCHANGED, BACKLIGHT_APPLET, BACKLIGHT_LBL } BacklightControl;
+typedef enum { SLEEP_UNCHANGED, SLEEP_APPLET, SLEEP_MEDIA } SleepControl;
 typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
 typedef enum {
     SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG,
@@ -134,6 +135,7 @@ typedef struct {
     int grid_scroll, file_scroll;
     bool favorites_open, dimmed;
     BacklightControl backlight;
+    SleepControl sleep_control;
     char (*favorites)[CATALOG_TEXT];
     size_t favorites_count;
     uint64_t deleted_until, prefetch_at;
@@ -1821,11 +1823,34 @@ static bool wake_download_screen(void) {
     return true;
 }
 
-static void download_screen_hook(AppletHookType hook, void *unused) {
+static void keep_console_awake(bool enabled) {
+    if (enabled) {
+        if (app.sleep_control != SLEEP_UNCHANGED) return;
+        bool already_disabled = false;
+        if (R_SUCCEEDED(appletIsAutoSleepDisabled(&already_disabled)) && already_disabled)
+            return;
+        if (R_SUCCEEDED(appletSetAutoSleepDisabled(true)))
+            app.sleep_control = SLEEP_APPLET;
+        else if (R_SUCCEEDED(appletSetMediaPlaybackState(true)))
+            app.sleep_control = SLEEP_MEDIA;
+    } else if (app.sleep_control != SLEEP_UNCHANGED) {
+        Result rc = app.sleep_control == SLEEP_APPLET ? appletSetAutoSleepDisabled(false) :
+                    appletSetMediaPlaybackState(false);
+        if (R_SUCCEEDED(rc)) app.sleep_control = SLEEP_UNCHANGED;
+    }
+}
+
+static void app_lifecycle_hook(AppletHookType hook, void *unused) {
     (void)unused;
+    bool focused = appletGetFocusState() == AppletFocusState_InFocus;
+    if (hook == AppletHookType_OnFocusState)
+        keep_console_awake(focused);
+    else if (hook == AppletHookType_OnExitRequest)
+        keep_console_awake(false);
+
     if (app.dimmed && (hook == AppletHookType_OnExitRequest ||
                       hook == AppletHookType_OnOperationMode ||
-                      (hook == AppletHookType_OnFocusState && appletGetFocusState() != AppletFocusState_InFocus)))
+                      (hook == AppletHookType_OnFocusState && !focused)))
         wake_download_screen();
 }
 
@@ -2635,8 +2660,9 @@ int main(int argc, char **argv) {
         load_catalog_metadata();
         open_catalogs();
         start_update_check(false);
-        AppletHookCookie screen_hook;
-        appletHook(&screen_hook, download_screen_hook, NULL);
+        AppletHookCookie lifecycle_hook;
+        appletHook(&lifecycle_hook, app_lifecycle_hook, NULL);
+        keep_console_awake(appletGetFocusState() == AppletFocusState_InFocus);
         uint64_t next_frame = 0, next_scroll = 0;
         u64 held = 0;
         while (appletMainLoop() && !app.close) {
@@ -2670,7 +2696,8 @@ int main(int argc, char **argv) {
             if (elapsed < 16) SDL_Delay((uint32_t)(16 - elapsed));
         }
         wake_download_screen();
-        appletUnhook(&screen_hook);
+        keep_console_awake(false);
+        appletUnhook(&lifecycle_hook);
         if (app.backlight == BACKLIGHT_LBL) lblExit();
     } else {
         SDL_Quit();

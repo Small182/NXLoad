@@ -31,7 +31,9 @@
 #define ROMSNS "https://romsns.com"
 #define ROMSNS_LIST ROMSNS "/"
 #define DLARCHIVE_POST "https://dlarchive.my.id/?post_type=roms&p="
-#define DRIVE_PREFIX "https://drive.dlarchive.my.id/dl/?id="
+#define DRIVE_PATH "https://drive.dlarchive.my.id/dl"
+#define DATANODES "https://datanodes.to/"
+#define FICHIER "https://1fichier.com/"
 #define PAGE_BYTES (4 * 1024 * 1024)
 #define COVER_BYTES (2 * 1024 * 1024)
 #define CACHE_MAGIC "NXLCAT02"
@@ -43,11 +45,17 @@ typedef struct {
     unsigned char *data;
     size_t size;
     size_t capacity;
+    CURL *html_connection;
 } Buffer;
 
 static size_t receive(void *data, size_t width, size_t count, void *ptr) {
     Buffer *buf = ptr;
     size_t bytes = width * count;
+    if (buf->html_connection) {
+        char *type = NULL;
+        curl_easy_getinfo(buf->html_connection, CURLINFO_CONTENT_TYPE, &type);
+        if (!type || strncasecmp(type, "text/html", sizeof("text/html") - 1)) return 0;
+    }
     if (bytes > buf->capacity - buf->size) return 0;
     memcpy(buf->data + buf->size, data, bytes);
     buf->size += bytes;
@@ -60,9 +68,9 @@ static int should_cancel(void *ptr, curl_off_t a, curl_off_t b, curl_off_t c, cu
 }
 
 static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t limit,
-                    CatalogFetchStatus *status, bool thumbnail, bool redirects) {
+                    CatalogFetchStatus *status, bool thumbnail, bool redirects, bool html_only) {
     *status = (CatalogFetchStatus){0};
-    Buffer buf = { .data = malloc(limit + 1), .capacity = limit };
+    Buffer buf = { .data = malloc(limit + 1), .capacity = limit, .html_connection = html_only ? curl : NULL };
     if (!buf.data) {
         status->curl = CURLE_OUT_OF_MEMORY;
         return (Buffer){0};
@@ -108,7 +116,7 @@ static unsigned char *fetch_resource(const char *url, atomic_bool *cancel, size_
         *status = (CatalogFetchStatus){ .curl = CURLE_FAILED_INIT };
         return NULL;
     }
-    Buffer data = fetch(curl, cancel, url, limit, status, false, true);
+    Buffer data = fetch(curl, cancel, url, limit, status, false, true, false);
     curl_easy_cleanup(curl);
     *bytes = data.size;
     return data.data;
@@ -121,7 +129,7 @@ unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t 
 
 unsigned char *catalog_fetch_thumbnail(CURL *connection, const char *url, atomic_bool *cancel, size_t *bytes) {
     CatalogFetchStatus status;
-    Buffer image = fetch(connection, cancel, url, COVER_BYTES, &status, true, true);
+    Buffer image = fetch(connection, cancel, url, COVER_BYTES, &status, true, true, false);
     *bytes = image.size;
     return image.data;
 }
@@ -132,7 +140,7 @@ unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size
 }
 
 static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, CatalogFetchStatus *status, bool redirects) {
-    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status, false, redirects);
+    Buffer buf = fetch(curl, cancel, url, PAGE_BYTES, status, false, redirects, false);
     if (!buf.data) return NULL;
     htmlDocPtr doc = htmlReadMemory((char *)buf.data, (int)buf.size, url, "UTF-8",
         HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);
@@ -479,12 +487,19 @@ static bool size_attribute(xmlNodePtr node, const char *name, bool bytes, char s
     return ok;
 }
 
+static const char *dlarchive_id(const char *url) {
+    if (!url || strncmp(url, DRIVE_PATH, sizeof(DRIVE_PATH) - 1)) return NULL;
+    const char *query = url + sizeof(DRIVE_PATH) - 1;
+    if (*query == '/') ++query;
+    return strncmp(query, "?id=", 4) ? NULL : query + 4;
+}
+
 static bool download_link_node(xmlNodePtr node) {
     if (xmlHasProp(node, BAD_CAST "data-romshq-download")) return true;
     if (!is_element(node, "a")) return false;
     xmlChar *href = xmlGetProp(node, BAD_CAST "href");
     const char *url = (const char *)href;
-    bool found = url && (!strncmp(url, DRIVE_PREFIX, sizeof(DRIVE_PREFIX) - 1) ||
+    bool found = url && (dlarchive_id(url) ||
         !strncmp(url, "https://datanodes.to/", sizeof("https://datanodes.to/") - 1) ||
         !strncmp(url, "https://1fichier.com/", sizeof("https://1fichier.com/") - 1));
     xmlFree(href);
@@ -537,12 +552,14 @@ static void strip_nsp_suffix(char *title) {
 }
 
 static void romsns_file_label(xmlNodePtr link, GameFile *file) {
-    for (xmlNodePtr node = link->parent; node && node->type == XML_ELEMENT_NODE; node = node->parent) {
-        if (!has_class(node, "roms-card")) continue;
-        xmlNodePtr sub = find_class(node->children, "roms-sub");
-        char label[CATALOG_TEXT];
-        if (sub) {
-            node_text(sub, label);
+    for (xmlNodePtr node = link; node && node->type == XML_ELEMENT_NODE; node = node->parent) {
+        if (has_class(node, "roms-card")) break;
+        for (xmlNodePtr previous = node->prev; previous; previous = previous->prev) {
+            if (previous->type != XML_ELEMENT_NODE) continue;
+            if (has_class(previous, "roms-grid") || has_class(previous, "roms-head")) break;
+            if (!has_class(previous, "roms-sub")) continue;
+            char label[CATALOG_TEXT];
+            node_text(previous, label);
             labeled_size(label, file->size);
             char *end = strchr(label, ':');
             if (end) {
@@ -550,27 +567,30 @@ static void romsns_file_label(xmlNodePtr link, GameFile *file) {
                 *end = 0;
                 if (*label) strcpy(file->title, label);
             }
+            return;
         }
-        return;
     }
 }
 
 static void read_files(xmlNodePtr node, GameDetails *details, bool romsns) {
-    for (; node; node = node->next) {
+    for (; node && details->count < CATALOG_FILE_COUNT; node = node->next) {
         if (is_element(node, "a")) {
             xmlChar *href = xmlGetProp(node, BAD_CAST "href");
-            if (href && !strncmp((char *)href, DRIVE_PREFIX, sizeof(DRIVE_PREFIX) - 1)) {
-                const char *id = (char *)href + sizeof(DRIVE_PREFIX) - 1;
+            const char *id = dlarchive_id((const char *)href);
+            if (id) {
+                char title[CATALOG_TEXT] = {0};
+                node_text(node, title);
                 const size_t n = strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-");
-                bool unique = n && n < DLARCHIVE_ID_CAPACITY && (!id[n] || id[n] == '&');
+                bool unique = n && n < DLARCHIVE_ID_CAPACITY && (!id[n] || id[n] == '&') &&
+                              (!romsns || !strcasecmp(title, "Fast Drive"));
                 for (size_t i = 0; unique && i < details->count; ++i)
                     if (strlen(details->files[i].id) == n && !memcmp(details->files[i].id, id, n)) unique = false;
-                if (unique && details->count < CATALOG_FILE_COUNT) {
+                if (unique) {
                     GameFile *file = &details->files[details->count++];
                     file->source = FILE_DLARCHIVE;
                     memcpy(file->id, id, n);
                     file->id[n] = 0;
-                    node_text(node, file->title);
+                    strcpy(file->title, title);
                     read_file_size(node, file->size);
                     if (romsns) romsns_file_label(node, file);
                     strip_nsp_suffix(file->title);
@@ -646,24 +666,26 @@ static void read_romshq_files(xmlNodePtr node, GameDetails *details) {
         if (is_element(node, "a") || is_element(node, "button")) {
             GameFile file = {0};
             xmlChar *href = xmlGetProp(node, BAD_CAST "href");
-            bool valid = romshq_button_id(node, file.id);
-            if (valid) file.source = FILE_ROMSHQ_SIGNED;
-            else if (href && strlen((char *)href) < sizeof(file.url)) {
+            bool signed_link = romshq_button_id(node, file.id);
+            bool valid = signed_link;
+            if (href && strlen((char *)href) < sizeof(file.url)) {
                 const char *link = (const char *)href;
-                if (!strncmp(link, "https://datanodes.to/", sizeof("https://datanodes.to/") - 1)) {
+                if (!strncmp(link, DATANODES, sizeof(DATANODES) - 1)) {
                     file.source = FILE_DATANODES;
                     valid = true;
-                } else if (!strncmp(link, "https://1fichier.com/", sizeof("https://1fichier.com/") - 1)) {
+                    strcpy(file.url, link);
+                } else if (!strncmp(link, FICHIER, sizeof(FICHIER) - 1)) {
                     file.source = FILE_1FICHIER;
                     valid = true;
+                    strcpy(file.url, link);
                 }
-                if (valid) strcpy(file.url, link);
             }
+            if (signed_link) file.source = FILE_ROMSHQ_SIGNED;
             xmlFree(href);
             for (size_t i = 0; valid && i < details->count; ++i) {
                 const GameFile *previous = &details->files[i];
                 if (previous->source == file.source && !strcmp(previous->id, file.id) &&
-                    !strcmp(previous->url, file.url)) valid = false;
+                    (signed_link || !strcmp(previous->url, file.url))) valid = false;
             }
             if (valid) {
                 romshq_file_title(node, file.title);
@@ -676,6 +698,22 @@ static void read_romshq_files(xmlNodePtr node, GameDetails *details) {
         }
         read_romshq_files(node->children, details);
     }
+}
+
+static bool romshq_base_size(xmlNodePtr node, char size[32]) {
+    for (; node; node = node->next) {
+        if (is_element(node, "h3")) {
+            char label[CATALOG_TEXT] = {0};
+            node_text(node, label);
+            xmlNodePtr value = xmlNextElementSibling(node);
+            if (value && is_element(value, "p") && !strcasecmp(label, "File Size")) {
+                node_text(value, label);
+                if (labeled_size(label, size)) return true;
+            }
+        }
+        if (romshq_base_size(node->children, size)) return true;
+    }
+    return false;
 }
 
 static void read_romshq_screenshots(xmlNodePtr node, GameDetails *details) {
@@ -736,6 +774,14 @@ static void load_details(CatalogJob *job) {
         if (job->source == CATALOG_ROMSHQ) {
             xmlNodePtr files = romshq_section(root, "Download Links", "download");
             if (files) read_romshq_files(files->children, details);
+            for (size_t i = 0; i < details->count; ++i) {
+                GameFile *file = &details->files[i];
+                if (!file->size[0] && !strcmp(file->title, "Базова гра")) {
+                    char size[32];
+                    if (romshq_base_size(root, size))
+                        snprintf(file->size, sizeof(file->size), "≈ %.26s", size);
+                }
+            }
             xmlNodePtr gallery = romshq_section(root, "Screenshots", "screenshots");
             if (gallery) read_romshq_screenshots(gallery->children, details);
         } else {
@@ -744,6 +790,8 @@ static void load_details(CatalogJob *job) {
             char page[CATALOG_URL];
             if (romsns && !details->count && !atomic_load(&job->cancel) && romsns_download_page(root, page)) {
                 htmlDocPtr intermediate = fetch_page(curl, &job->cancel, page, &status, false);
+                if (!intermediate && status.curl == CURLE_OPERATION_TIMEDOUT && !atomic_load(&job->cancel))
+                    intermediate = fetch_page(curl, &job->cancel, page, &status, false);
                 if (intermediate) {
                     read_files(xmlDocGetRootElement(intermediate), details, true);
                     xmlFreeDoc(intermediate);
@@ -783,17 +831,17 @@ void catalog_request(CatalogJob *job) {
 }
 
 static const char *size_probe_url(const GameFile *file) {
-    if (file->source == FILE_DATANODES &&
-        !strncmp(file->url, "https://datanodes.to/", sizeof("https://datanodes.to/") - 1)) return file->url;
-    if (file->source == FILE_1FICHIER &&
-        !strncmp(file->url, "https://1fichier.com/", sizeof("https://1fichier.com/") - 1)) return file->url;
+    if ((file->source == FILE_DATANODES || file->source == FILE_ROMSHQ_SIGNED) &&
+        !strncmp(file->url, DATANODES, sizeof(DATANODES) - 1)) return file->url;
+    if ((file->source == FILE_1FICHIER || file->source == FILE_ROMSHQ_SIGNED) &&
+        !strncmp(file->url, FICHIER, sizeof(FICHIER) - 1)) return file->url;
     return NULL;
 }
 
 bool catalog_can_probe_size(const GameFile *file) {
     if (file->source == FILE_DLARCHIVE)
         return file->id[0] && !file->id[strspn(file->id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")];
-    return !file->size[0] && size_probe_url(file);
+    return (!file->size[0] || !strncmp(file->size, "≈ ", sizeof("≈ ") - 1)) && size_probe_url(file);
 }
 
 static uint64_t dlarchive_size(CURL *curl, const GameFile *file, atomic_bool *cancel) {
@@ -804,7 +852,7 @@ static uint64_t dlarchive_size(CURL *curl, const GameFile *file, atomic_bool *ca
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_REFERER, "https://drive.dlarchive.my.id/");
     CatalogFetchStatus status;
-    Buffer data = fetch(curl, cancel, url, 32 * 1024, &status, false, false);
+    Buffer data = fetch(curl, cancel, url, 32 * 1024, &status, false, false, false);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
     curl_slist_free_all(headers);
     if (!data.data) return 0;
@@ -857,12 +905,70 @@ static uint64_t head_size(CURL *curl, const char *url, atomic_bool *cancel) {
     return (uint64_t)length;
 }
 
+static bool datanodes_page_size(htmlDocPtr doc, const char *file, char size[32]) {
+    const char *id = file + sizeof(DATANODES) - 1;
+    size_t id_length = strcspn(id, "/?#");
+    bool matches = false;
+    char label[32] = {0};
+    xmlNodePtr head = find_tag(xmlDocGetRootElement(doc), "head");
+    for (xmlNodePtr node = head ? head->children : NULL; node; node = node->next) {
+        if (!is_element(node, "meta")) continue;
+        xmlChar *property = xmlGetProp(node, BAD_CAST "property");
+        xmlChar *content = xmlGetProp(node, BAD_CAST "content");
+        const char *text = (const char *)content;
+        if (text && id_length && !xmlStrcmp(property, BAD_CAST "og:url") &&
+            !strncmp(text, DATANODES, sizeof(DATANODES) - 1)) {
+            const char *canonical = text + sizeof(DATANODES) - 1;
+            matches = strcspn(canonical, "/?#") == id_length && !memcmp(canonical, id, id_length);
+        } else if (text && !xmlStrcmp(property, BAD_CAST "og:title")) {
+            const char *suffix = strrchr(text, '(');
+            if (suffix && text[strlen(text) - 1] == ')') labeled_size(suffix + 1, label);
+        }
+        xmlFree(content);
+        xmlFree(property);
+    }
+    if (!matches || !label[0]) return false;
+    strcpy(size, label);
+    return true;
+}
+
+static void datanodes_size(CURL *curl, const char *file, atomic_bool *cancel, char size[32]) {
+    // The public file page can redirect to /download with a session cookie.
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+    char url[CATALOG_URL];
+    strcpy(url, file);
+    for (unsigned hop = 0; hop < 4 && !atomic_load(cancel); ++hop) {
+        CatalogFetchStatus status;
+        Buffer body = fetch(curl, cancel, url, 256 * 1024, &status, false, false, true);
+        if (body.data) {
+            htmlDocPtr doc = htmlReadMemory((char *)body.data, (int)body.size, url, "UTF-8",
+                HTML_PARSE_NONET | HTML_PARSE_NOWARNING | HTML_PARSE_NOERROR);
+            free(body.data);
+            if (doc) {
+                datanodes_page_size(doc, file, size);
+                xmlFreeDoc(doc);
+            }
+            return;
+        }
+        char *next = NULL;
+        curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &next);
+        if (status.http < 300 || status.http >= 400 || !next ||
+            strncmp(next, DATANODES, sizeof(DATANODES) - 1) ||
+            strlen(next) >= sizeof(url) || !strcmp(url, next)) return;
+        strcpy(url, next);
+    }
+}
+
 void catalog_probe_size(GameFile *file, atomic_bool *cancel) {
     if (!catalog_can_probe_size(file) || atomic_load(cancel)) return;
     CURL *curl = curl_easy_init();
     if (!curl) return;
+    const char *url = size_probe_url(file);
     uint64_t size = file->source == FILE_DLARCHIVE ? dlarchive_size(curl, file, cancel) :
-                    head_size(curl, size_probe_url(file), cancel);
+                    head_size(curl, url, cancel);
+    if (!size && url && !strncmp(url, DATANODES, sizeof(DATANODES) - 1))
+        datanodes_size(curl, url, cancel, file->size);
     curl_easy_cleanup(curl);
     if (size) {
         static const char *const units[] = {"B", "KiB", "MiB", "GiB", "TiB"};

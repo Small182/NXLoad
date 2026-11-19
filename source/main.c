@@ -2258,9 +2258,14 @@ static void input(u64 buttons) {
         buttons = HidNpadButton_X;
     }
     if (buttons & HidNpadButton_B) {
-        app.game_index = 0;
-        app.grid_scroll = 0;
-        app.prefetch_at = 0;
+        if (app.query[0]) {
+            app.query[0] = 0;
+            rebuild_view(NULL);
+        } else {
+            app.game_index = 0;
+            app.grid_scroll = 0;
+            app.prefetch_at = 0;
+        }
         app.genre_focus = false;
         app.top_focus = TOP_NONE;
         return;
@@ -2793,7 +2798,9 @@ static void draw(void) {
     else if (app.screen == GAME) draw_game();
     else draw_downloads();
     if (app.screen == LIBRARY) {
-        text(app.small, "A  Відкрити    B  На початок    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування",
+        text(app.small, app.query[0] ?
+             "A  Відкрити    B  Скинути пошук    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування" :
+             "A  Відкрити    B  На початок    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування",
              40, 665, 1200, gray);
     } else if (app.screen == GAME) {
         text(app.small, "← / →  Вкладки    Y  Вибране    B  Назад    ↑  Верхнє меню    −  Налаштування",

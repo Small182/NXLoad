@@ -18,6 +18,7 @@ static const struct {
     {"A  Видалити", "A  Delete"},
     {"A  Встановити", "A  Install"},
     {"A  Відкрити    B  На початок    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування", "A  Open    B  First cover    X  Search    Y  Favorites    L / R  Sections    ZL  Sort    −  Settings"},
+    {"A  Відкрити    B  Скинути пошук    X  Пошук    Y  Вибране    L / R  Розділи    ZL  Сортування    −  Налаштування", "A  Open    B  Clear search    X  Search    Y  Favorites    L / R  Sections    ZL  Sort    −  Settings"},
     {"A  Відкрити DBI", "A  Open DBI"},
     {"A  Відтворити знову", "A  Replay"},
     {"A  Застосувати", "A  Apply"},

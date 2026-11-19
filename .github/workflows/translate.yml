@@ -1,0 +1,116 @@
+name: Translate NXLoad descriptions
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nxload-descriptions-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'native-1fichier')
+    runs-on: ubuntu-latest
+    outputs:
+      pending: ${{ steps.prepare.outputs.pending }}
+      recovering: ${{ steps.prepare.outputs.recovering }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: prepare
+        run: |
+          if test -f .github/workflows/recover-translations.yml; then
+            printf 'recovering=true\n' >> "$GITHUB_OUTPUT"
+          else
+            python3 tools/translate-metadata.py prepare translation-plan
+          fi
+      - if: steps.prepare.outputs.recovering != 'true' && steps.prepare.outputs.pending != '0'
+        run: |
+          curl -fLsS --retry 2 --max-time 180 'https://data.argosopentech.com/argospm/v1/translate-en_uk-1_9.argosmodel' -o translation-plan/en-uk.argosmodel
+          echo 'a4915e274380812a1f020aaf801969d51d999127d13e5445d53cbb1f7675deda  translation-plan/en-uk.argosmodel' | sha256sum --check -
+      - uses: actions/upload-artifact@v4
+        if: steps.prepare.outputs.recovering != 'true'
+        with:
+          name: ukrainian-description-plan
+          path: translation-plan/
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
+
+  translate:
+    if: needs.plan.outputs.recovering != 'true' && needs.plan.outputs.pending != '0'
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ukrainian-description-plan
+          path: translation-plan
+      - env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 -m venv translation-env
+          translation-env/bin/pip -q install 'ctranslate2==4.7.1' 'sentencepiece==0.2.1'
+          translation-env/bin/python tools/translate-metadata.py translate \
+            "translation-plan/input-$SHARD.json.gz" "translation-results/output-$SHARD.json.gz" \
+            --model translation-plan/en-uk.argosmodel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ukrainian-descriptions-${{ matrix.shard }}
+          path: translation-results/
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    if: ${{ !cancelled() && needs.plan.outputs.recovering != 'true' && needs.plan.result == 'success' && (needs.translate.result == 'success' || needs.translate.result == 'skipped') }}
+    needs: [plan, translate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.publish.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ukrainian-description-plan
+          path: translation-plan
+      - if: needs.plan.outputs.pending != '0'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ukrainian-descriptions-*
+          merge-multiple: true
+          path: translation-results
+      - id: publish
+        env:
+          DESTINATION_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          python3 tools/translate-metadata.py merge translation-plan/plan.json.gz translation-results tools/translations.uk.json.gz
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/translations.uk.json.gz
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update Ukrainian TitleDB descriptions'
+            git push origin "HEAD:refs/heads/$DESTINATION_BRANCH"
+          fi
+          printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: publish
+    uses: ./.github/workflows/build.yml
+    with:
+      revision: ${{ needs.publish.outputs.revision }}

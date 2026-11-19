@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "language.h"
 #include "game_info.h"
+#include "json.h"
+#include "trailers.h"
 
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
@@ -537,4 +539,93 @@ void load_game_gallery(GalleryJob *job) {
     titledb_gallery(job);
     if (!job->result.count && !job->result.issue[0])
         strcpy(job->result.issue, "Скриншоти гри в Nintendo Life не знайдено");
+}
+
+#define NINTENDO_PRODUCTS "https://www.nintendo.com/us/store/products/"
+#define NINTENDO_VIDEO "https://assets.nintendo.com/video/upload/"
+#define SWITCH_VIDEO_PATH "store/software/switch/"
+#define TRAILER_MP4 "c_limit,w_854,h_480,vc_h264/"
+
+static bool nintendo_trailers(const char *html, GameTrailers *result) {
+    const char *script = strstr(html, "<script id=\"__NEXT_DATA__\"");
+    const char *start = script ? strchr(script, '>') : NULL;
+    const char *end = start ? strstr(++start, "</script>") : NULL;
+    if (!end) return false;
+
+    Json root = {start, end};
+    Json props = field(field(root, "props"), "pageProps");
+    Json current = field(field(props, "analytics"), "product");
+    char sku[24];
+    if (!string_field(current, "sku", sku, sizeof(sku)) ||
+        !sku[0] || sku[strspn(sku, "0123456789")]) return false;
+    char key[64];
+    snprintf(key, sizeof(key), "Product:{\\\"sku\\\":\\\"%s\\\"}", sku);
+    Json product = field(field(props, "initialApolloState"), key);
+    if (!literal(field(field(product, "platform"), "code"), "\"NINTENDO_SWITCH\"")) return false;
+
+    char nsuid[24];
+    if (!string_field(product, "nsuid", nsuid, sizeof(nsuid)) ||
+        strlen(nsuid) != 14 || nsuid[strspn(nsuid, "0123456789")]) return false;
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), SWITCH_VIDEO_PATH "%s/Video/", nsuid);
+    size_t prefix_size = strlen(prefix);
+    Json gallery = field(product, "productGallery");
+    const char *cursor = NULL;
+    while (result->count < TRAILER_LIMIT) {
+        Json asset = next_object(gallery, &cursor);
+        if (!asset.begin) break;
+        char id[160];
+        if (!literal(field(asset, "resourceType"), "\"video\"") ||
+            !literal(field(asset, "type"), "\"upload\"") ||
+            !string_field(asset, "publicId", id, sizeof(id))) continue;
+        const char *path = id + (id[0] == '/');
+        if (!begins(path, prefix) || strlen(path + prefix_size) != 64 ||
+            strspn(path + prefix_size, "0123456789abcdef") != 64) continue;
+        char url[CATALOG_URL];
+        snprintf(url, sizeof(url), NINTENDO_VIDEO "%s%s.mp4", TRAILER_MP4, path);
+        bool duplicate = false;
+        for (size_t i = 0; i < result->count; ++i)
+            if (!strcmp(result->urls[i], url)) duplicate = true;
+        if (!duplicate) strcpy(result->urls[result->count++], url);
+    }
+    return true;
+}
+
+void load_game_trailers(TrailerJob *job) {
+    char name[CATALOG_TEXT], slugs[2][CATALOG_TEXT] = {{0}};
+    snprintf(name, sizeof(name), "%s", job->title);
+    clean_heading(name);
+    remove_suffix(name, "nintendo switch");
+    remove_suffix(name, "switch");
+    make_slug(slugs[0], name);
+    for (char *p = slugs[0]; *p; ++p) if (*p == '_') *p = '-';
+
+    const char *path = strrchr(job->page, '/');
+    if (path && !path[1]) {
+        --path;
+        while (path > job->page && *path != '/') --path;
+    }
+    if (path) {
+        ++path;
+        size_t n = strspn(path, "abcdefghijklmnopqrstuvwxyz0123456789-");
+        if (n > 7 && !memcmp(path + n - 7, "-switch", 7)) n -= 7;
+        if (n < sizeof(slugs[1]))
+            snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)n, path);
+    }
+
+    for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
+        if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
+        char url[CATALOG_URL];
+        snprintf(url, sizeof(url), NINTENDO_PRODUCTS "%s-switch/", slugs[i]);
+        CatalogFetchStatus status;
+        size_t size;
+        unsigned char *body = catalog_fetch_document(url, &job->cancel, &size, &status);
+        if (!body) {
+            if (status.http != 404) break;
+            continue;
+        }
+        bool matched = nintendo_trailers((const char *)body, &job->result);
+        free(body);
+        if (matched) break;
+    }
 }

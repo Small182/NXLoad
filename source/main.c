@@ -25,6 +25,7 @@
 #include "language.h"
 #include "unpack.h"
 #include "updater.h"
+#include "trailers.h"
 
 #define GRID_COLUMNS 6
 #define GRID_ROWS 2
@@ -76,7 +77,7 @@ typedef enum {
 #define SETTINGS_X 1175
 #define TOP_END 1240
 #define DOWNLOADS_DIM_X 1000
-typedef enum { GAME_OVERVIEW, GAME_SCREENSHOTS, GAME_FILES } GameTab;
+typedef enum { GAME_OVERVIEW, GAME_MEDIA, GAME_FILES } GameTab;
 typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
 
 static const char *const sort_names[] = {"За рейтингом", "За алфавітом", "За датою виходу"};
@@ -168,6 +169,13 @@ typedef struct {
     GalleryJob gallery_job;
     Thread gallery_thread;
     bool gallery_busy, gallery_requested;
+    GameTrailers trailers;
+    TrailerJob trailer_job;
+    Thread trailer_thread;
+    bool trailer_busy, trailer_requested, trailer_open;
+    size_t trailer_index;
+    uint64_t trailer_controls_until;
+    TrailerState trailer_state;
     bool confirm_install, choose_download, close, download_busy, download_finished;
     bool catalog_busy[2];
     size_t download_choice;
@@ -404,6 +412,7 @@ static size_t move(size_t current, size_t count, u64 buttons) {
 
 static void catalog_worker(void *arg) { catalog_request(arg); }
 static void gallery_worker(void *arg) { load_game_gallery(arg); }
+static void trailer_worker(void *arg) { load_game_trailers(arg); }
 static void index_worker(void *arg) { catalog_build_index(arg); }
 static void update_check_worker(void *arg) { check_update(arg); }
 static void download_worker(void *arg) {
@@ -675,7 +684,7 @@ static void refresh_catalogs(void) {
 static void request_game_files(void) {
     if (app.screen != GAME || app.game_tab == GAME_OVERVIEW) return;
     for (unsigned source = 0; source < 2; ++source) {
-        if (app.game_tab == GAME_SCREENSHOTS && source != CATALOG_ROMSHQ) continue;
+        if (app.game_tab == GAME_MEDIA && source != CATALOG_ROMSHQ) continue;
         if (!app.settings.source_enabled[source] || app.files_loaded[source] || app.catalog_busy[source] ||
             !app.game_sources[source].page[0]) continue;
         CatalogJob *job = &app.pending[source];
@@ -815,7 +824,7 @@ static bool uses_cover(const Game *game, const CatalogMetadata *metadata, const 
 
 static bool cover_visible(const CoverJob *job) {
     if (app.screen == GAME) {
-        if (app.game_tab == GAME_SCREENSHOTS) {
+        if (app.game_tab == GAME_MEDIA) {
             if (!job->screenshot) return false;
             size_t first = app.screenshot_index ? app.screenshot_index - 1 : 0;
             size_t end = SDL_min(app.gallery.count, app.screenshot_index + 2);
@@ -865,7 +874,7 @@ static void finish_cover(CoverJob *job) {
 static const char *next_cover(bool *screenshot) {
     *screenshot = false;
     if (app.screen == GAME) {
-        if (app.game_tab != GAME_SCREENSHOTS)
+        if (app.game_tab != GAME_MEDIA)
             return missing_cover(&app.active_game, app.active_metadata);
         if (!app.gallery.count) return NULL;
         *screenshot = true;
@@ -950,7 +959,7 @@ static void pump_gallery(void) {
         if (!atomic_load(&job->cancel) && !strcmp(job->page, app.active_game.page))
             app.gallery = job->result;
     }
-    if (app.screen == GAME && app.game_tab == GAME_SCREENSHOTS &&
+    if (app.screen == GAME && app.game_tab == GAME_MEDIA &&
         !app.gallery_busy && !app.gallery_requested) {
         memset(job, 0, sizeof(*job));
         atomic_init(&job->cancel, false);
@@ -970,6 +979,27 @@ static void pump_gallery(void) {
         if (!app.gallery_busy)
             strcpy(app.gallery.issue, "Не вдалося запустити запит Nintendo Life");
     }
+}
+
+static void pump_trailers(void) {
+    TrailerJob *job = &app.trailer_job;
+    if (app.trailer_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.trailer_thread), 0))) {
+        threadWaitForExit(&app.trailer_thread);
+        threadClose(&app.trailer_thread);
+        app.trailer_busy = false;
+        if (!atomic_load(&job->cancel) && !strcmp(job->page, app.active_game.page))
+            app.trailers = job->result;
+    }
+    if (app.screen != GAME || app.game_tab != GAME_MEDIA ||
+        app.trailer_busy || app.trailer_requested) return;
+    memset(job, 0, sizeof(*job));
+    atomic_init(&job->cancel, false);
+    strcpy(job->page, app.active_game.page);
+    const char *title = app.active_metadata ? app.active_metadata->title :
+        app.metadata.title[0] ? app.metadata.title : app.active_game.title;
+    strcpy(job->title, title);
+    app.trailer_requested = true;
+    app.trailer_busy = start_worker(&app.trailer_thread, trailer_worker, job);
 }
 
 static int file_compare(const void *a, const void *b) {
@@ -1046,7 +1076,7 @@ static void pump_index(void) {
     CatalogIndex *index = &app.catalogs[job->source];
     bool game_request = app.screen == GAME &&
         (app.catalog_busy[0] || app.catalog_busy[1] || app.gallery_busy ||
-         (app.game_tab == GAME_SCREENSHOTS && !app.gallery_requested));
+         (app.game_tab == GAME_MEDIA && !app.gallery_requested));
     atomic_store(&job->paused, app.download_busy || game_request);
     size_t published = atomic_load(&job->published);
     if (app.show_partial_index && published > index->count) {
@@ -1277,7 +1307,7 @@ static void start_update_check(bool manual) {
 }
 
 static bool update_dialog_visible(void) {
-    return app.update_offered && !app.fullscreen_shot && !app.choose_download &&
+    return app.update_offered && !app.fullscreen_shot && !app.trailer_open && !app.choose_download &&
            !app.confirm_install && !app.delete_file[0] && !app.filters_open;
 }
 
@@ -1597,18 +1627,57 @@ static void step_screenshot(bool next) {
     if (!next && app.screenshot_index) --app.screenshot_index;
 }
 
+static void open_trailer(size_t index) {
+    if (index >= app.trailers.count) return;
+    app.trailer_index = index;
+    app.trailer_open = true;
+    app.trailer_controls_until = SDL_GetTicks64() + 3000;
+    app.trailer_state = trailer_play(app.renderer, app.trailers.urls[index]) ?
+        TRAILER_LOADING : TRAILER_ERROR;
+}
+
+static void close_trailer(void) {
+    trailer_stop();
+    app.trailer_open = false;
+}
+
+static void step_trailer(bool next) {
+    if (next && app.trailer_index + 1 < app.trailers.count)
+        open_trailer(app.trailer_index + 1);
+    else if (!next && app.trailer_index)
+        open_trailer(app.trailer_index - 1);
+}
+
+static void toggle_trailer(void) {
+    if (app.trailer_state == TRAILER_ENDED || app.trailer_state == TRAILER_ERROR)
+        open_trailer(app.trailer_index);
+    else trailer_pause();
+    app.trailer_controls_until = SDL_GetTicks64() + 3000;
+}
+
 static void touch_swipe(int y, int dx, int dy) {
     if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download || app.settings_open) return;
     if (abs(dx) < 42 || abs(dx) <= abs(dy)) return;
+    if (app.trailer_open) {
+        trailer_seek(dx < 0);
+        app.trailer_controls_until = SDL_GetTicks64() + 3000;
+        return;
+    }
     if (app.fullscreen_shot) { step_screenshot(dx < 0); return; }
     if (app.screen == LIBRARY && y >= TAB_Y && y < TAB_Y + TAB_HEIGHT) next_genre_tab(dx < 0);
     if (app.screen == GAME && y >= 201 && y < 245)
         input(dx < 0 ? HidNpadButton_Right : HidNpadButton_Left);
-    else if (app.screen == GAME && app.game_tab == GAME_SCREENSHOTS && y >= 259 && y < FILE_LIST_BOTTOM)
+    else if (app.screen == GAME && app.game_tab == GAME_MEDIA && y >= 259 && y < FILE_LIST_BOTTOM)
         step_screenshot(dx < 0);
 }
 
 static void touch_tap(int x, int y) {
+    if (app.trailer_open) {
+        if (x < 175 && y < 90) close_trailer();
+        else if (y >= 652 && x > 1010 && app.trailers.count > 1) step_trailer(x >= 1140);
+        else toggle_trailer();
+        return;
+    }
     if (app.fullscreen_shot) {
         if (x < 150 && y < 90) app.fullscreen_shot = false;
         else if (x < 240) step_screenshot(false);
@@ -1711,7 +1780,10 @@ static void touch_tap(int x, int y) {
                 app.top_focus = TOP_NONE;
                 select_file_action(rows[index].file);
             }
-        } else if (app.game_tab == GAME_SCREENSHOTS && y >= 259 && y < FILE_LIST_BOTTOM) {
+        } else if (app.game_tab == GAME_MEDIA && x >= 945 && x < 1204 &&
+                   y >= 593 && y < 633 && app.trailers.count) {
+            open_trailer(0);
+        } else if (app.game_tab == GAME_MEDIA && y >= 259 && y < FILE_LIST_BOTTOM) {
             if (x >= 430 && x < 550) step_screenshot(false);
             else if (x >= 1080 && x < 1204) step_screenshot(true);
             else if (x >= 550 && x < 1080 && app.gallery.count) app.fullscreen_shot = true;
@@ -1910,6 +1982,16 @@ static void input(u64 buttons) {
         else if (buttons & HidNpadButton_Plus) app.close = true;
         return;
     }
+    if (app.trailer_open) {
+        app.trailer_controls_until = SDL_GetTicks64() + 3000;
+        if (buttons & HidNpadButton_B) close_trailer();
+        else if (buttons & HidNpadButton_Plus) app.close = true;
+        else if (buttons & HidNpadButton_L) step_trailer(false);
+        else if (buttons & HidNpadButton_R) step_trailer(true);
+        else if (buttons & (left_buttons | right_buttons)) trailer_seek((buttons & right_buttons) != 0);
+        else if (buttons & HidNpadButton_A) toggle_trailer();
+        return;
+    }
     if (app.fullscreen_shot) {
         if (buttons & HidNpadButton_B) app.fullscreen_shot = false;
         else if (buttons & (left_buttons | HidNpadButton_L)) step_screenshot(false);
@@ -2023,6 +2105,7 @@ static void input(u64 buttons) {
             for (unsigned source = 0; source < 2; ++source)
                 if (app.catalog_busy[source]) atomic_store(&app.pending[source].cancel, true);
             if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
+            if (app.trailer_busy) atomic_store(&app.trailer_job.cancel, true);
             app.notice[0] = 0;
             app.screen = LIBRARY;
             return;
@@ -2042,17 +2125,21 @@ static void input(u64 buttons) {
         }
         if ((buttons & up_buttons) &&
             ((app.game_tab == GAME_OVERVIEW && !app.description_scroll) ||
-             app.game_tab == GAME_SCREENSHOTS ||
+             app.game_tab == GAME_MEDIA ||
              (app.game_tab == GAME_FILES && !app.file_scroll && app.file_index <= 1))) {
             app.top_focus = TOP_DOWNLOADS;
             return;
         }
         if (app.game_tab == GAME_FILES) {
             move_file_selection(buttons);
-        } else if (app.game_tab == GAME_SCREENSHOTS) {
+        } else if (app.game_tab == GAME_MEDIA) {
             if (buttons & HidNpadButton_L) step_screenshot(false);
             if (buttons & HidNpadButton_R) step_screenshot(true);
-            if ((buttons & HidNpadButton_A) && app.gallery.count) app.fullscreen_shot = true;
+            if ((buttons & HidNpadButton_X) && app.trailers.count) open_trailer(0);
+            if (buttons & HidNpadButton_A) {
+                if (app.gallery.count) app.fullscreen_shot = true;
+                else if (app.trailers.count) open_trailer(0);
+            }
         } else {
             if ((buttons & HidNpadButton_X) && app.metadata.original[0]) {
                 app.show_original = !app.show_original;
@@ -2112,6 +2199,8 @@ static void input(u64 buttons) {
             memset(&app.details, 0, sizeof(app.details));
             memset(&app.metadata, 0, sizeof(app.metadata));
             memset(&app.gallery, 0, sizeof(app.gallery));
+            memset(&app.trailers, 0, sizeof(app.trailers));
+            app.trailer_requested = false;
             read_game_metadata(&app.metadata, app.active_game.title, entry_title(entry));
             if (!app.game_sources[CATALOG_ROMSHQ].page[0] &&
                 (app.active_metadata || app.metadata.title[0]))
@@ -2433,7 +2522,7 @@ static void draw_game(void) {
     text(app.large, title, 430, 130, 772, white);
     if (app.notice[0] && app.game_tab != GAME_FILES)
         right_text(app.small, app.notice, 700, 177, 510, gray);
-    const char *tabs[] = {"Огляд", "Скриншоти", "Файли"};
+    const char *tabs[] = {"Огляд", "Медіа", "Файли"};
     for (unsigned i = 0; i < sizeof(tabs) / sizeof(tabs[0]); ++i) {
         int x = 430 + (int)i * 252;
         bool selected_tab = (GameTab)i == app.game_tab;
@@ -2442,7 +2531,15 @@ static void draw_game(void) {
         text(app.normal, tabs[i], x + 13, 208, 215, selected_tab ? white : gray);
     }
     if (app.game_tab == GAME_OVERVIEW) draw_game_overview();
-    else if (app.game_tab == GAME_SCREENSHOTS) draw_game_screenshots();
+    else if (app.game_tab == GAME_MEDIA) {
+        draw_game_screenshots();
+        if (app.trailers.count) {
+            char label[96];
+            snprintf(label, sizeof(label), tr("X  Трейлери · %zu"), app.trailers.count);
+            rect(945, 595, 259, 34, selected);
+            text(app.small, label, 960, 603, 230, blue);
+        }
+    }
     else draw_game_files();
 }
 
@@ -2537,7 +2634,38 @@ static void draw_update_dialog(void) {
     text(app.normal, "B  Пізніше", 656, 428, 390, gray);
 }
 
+static void draw_trailer(void) {
+    const SDL_Color black = {0, 0, 0, 255}, light = {245, 245, 245, 255};
+    rect(0, 0, 1280, 720, black);
+    app.trailer_state = trailer_draw(app.renderer);
+    const char *status = app.trailer_state == TRAILER_LOADING ? "Завантаження трейлера…" :
+                         app.trailer_state == TRAILER_ERROR ? "Трейлер недоступний" :
+                         app.trailer_state == TRAILER_ENDED ? "Трейлер завершено" : NULL;
+    if (status) {
+        rect(40, 320, 430, 52, black);
+        text(app.normal, status, 55, 331, 400, light);
+    }
+    if (status || app.trailer_state == TRAILER_PAUSED || SDL_GetTicks64() < app.trailer_controls_until) {
+        rect(0, 0, 153, 60, black);
+        text(app.small, "B  Назад", 25, 19, 115, light);
+        rect(0, 662, 1280, 58, black);
+        const char *controls = app.trailer_state == TRAILER_ERROR || app.trailer_state == TRAILER_ENDED ?
+            "A  Відтворити знову" : "A  Пауза / Відтворити    ← / →  ±10 с";
+        text(app.small, controls, 40, 681, 760, light);
+        if (app.trailers.count > 1) {
+            char page[64];
+            snprintf(page, sizeof(page), "L / R    %zu / %zu", app.trailer_index + 1, app.trailers.count);
+            right_text(app.small, page, 1000, 681, 230, light);
+        }
+    }
+}
+
 static void draw(void) {
+    if (app.trailer_open) {
+        draw_trailer();
+        SDL_RenderPresent(app.renderer);
+        return;
+    }
     if (app.dimmed) {
         SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
         SDL_RenderClear(app.renderer);
@@ -2687,8 +2815,9 @@ int main(int argc, char **argv) {
             request_game_files();
             pump_index();
             pump_gallery();
+            pump_trailers();
             bool cover_finished = pump_covers();
-            if (buttons || touch_changed || cover_finished || now >= next_frame) {
+            if (app.trailer_open || buttons || touch_changed || cover_finished || now >= next_frame) {
                 draw();
                 next_frame = now + 150;
             }
@@ -2713,6 +2842,8 @@ int main(int argc, char **argv) {
     if (app.update_checking) atomic_store(&app.update_check.cancelled, true);
     if (app.index_busy) atomic_store(&app.index_job.cancel, true);
     if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
+    if (app.trailer_busy) atomic_store(&app.trailer_job.cancel, true);
+    trailer_shutdown();
     for (unsigned source = 0; source < 2; ++source)
         if (app.catalog_busy[source]) atomic_store(&app.pending[source].cancel, true);
     for (unsigned source = 0; source < 2; ++source) {
@@ -2743,6 +2874,10 @@ int main(int argc, char **argv) {
     if (app.gallery_busy) {
         threadWaitForExit(&app.gallery_thread);
         threadClose(&app.gallery_thread);
+    }
+    if (app.trailer_busy) {
+        threadWaitForExit(&app.trailer_thread);
+        threadClose(&app.trailer_thread);
     }
     for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
     for (size_t i = 0; i < TEXT_SLOTS; ++i)

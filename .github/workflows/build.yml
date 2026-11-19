@@ -20,13 +20,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.revision || github.sha }}
-      - name: Ensure libarchive for Switch
+      - name: Ensure libarchive and libmpv for Switch
         run: |
-          if "${DEVKITPRO}/portlibs/switch/bin/aarch64-none-elf-pkg-config" --static --exists libarchive; then
-            echo "switch-libarchive is already installed"
+          if "${DEVKITPRO}/portlibs/switch/bin/aarch64-none-elf-pkg-config" --static --exists libarchive mpv; then
+            echo "switch-libarchive and switch-libmpv are already installed"
           else
             for attempt in 1 2 3; do
-              if dkp-pacman -Sy --needed --noconfirm switch-libarchive; then exit 0; fi
+              if dkp-pacman -Sy --needed --noconfirm switch-libarchive switch-libmpv; then exit 0; fi
               echo "Package mirror unavailable; retry $attempt"
               sleep 6
             done

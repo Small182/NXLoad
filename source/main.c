@@ -1412,8 +1412,10 @@ static void move_file_selection(u64 buttons) {
     app.file_index = index;
     if (buttons & (up_buttons | down_buttons)) {
         int top = (int)index * FILE_STEP;
+        int bottom = top + FILE_STEP;
+        if (index && rows[index - 1].heading) top -= FILE_STEP;
         app.file_scroll = clamp_file_scroll(SDL_clamp(app.file_scroll,
-            top + FILE_STEP - (FILE_LIST_BOTTOM - FILE_LIST_Y), top), count);
+            bottom - (FILE_LIST_BOTTOM - FILE_LIST_Y), top), count);
     }
     if ((buttons & HidNpadButton_A) && rows[index].file)
         select_file_action(rows[index].file);

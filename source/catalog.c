@@ -452,6 +452,20 @@ static void read_file_size(xmlNodePtr node, char size[32]) {
     }
 }
 
+static void strip_nsp_suffix(char *title) {
+    size_t end = strlen(title);
+    while (end) {
+        while (end && isspace((unsigned char)title[end - 1])) --end;
+        if (end < 3 || strncasecmp(title + end - 3, "nsp", 3)) break;
+        size_t start = end - 3;
+        if (start && title[start - 1] != '.' && !isspace((unsigned char)title[start - 1])) break;
+        end = start;
+        if (end && title[end - 1] == '.') --end;
+        title[end] = 0;
+    }
+    title[end] = 0;
+}
+
 static void read_files(xmlNodePtr node, GameDetails *details) {
     for (; node; node = node->next) {
         if (is_element(node, "a")) {
@@ -468,6 +482,7 @@ static void read_files(xmlNodePtr node, GameDetails *details) {
                     file->id[n] = 0;
                     node_text(node, file->title);
                     read_file_size(node, file->size);
+                    strip_nsp_suffix(file->title);
                     if (!file->title[0]) strcpy(file->title, "Файл DLArchive");
                 }
             }

@@ -333,7 +333,7 @@ static void draw_header(void) {
     } else {
         text(app.normal, "‹ Назад", SEARCH_X + 10, 32, 150, white);
     }
-    if (!downloads) {
+    if (!downloads && !app.settings_open) {
         const int arrow_x = DOWNLOADS_X + 28, arrow_y = 34;
         bool blink = app.download_busy && !app.active_transfer.app_update &&
                      SDL_GetTicks64() % 1600 < 800;

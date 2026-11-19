@@ -91,6 +91,7 @@ typedef struct {
 bool catalog_can_probe_size(const GameFile *file);
 void catalog_probe_size(GameFile *file, atomic_bool *cancel);
 void catalog_request(CatalogJob *job);
+bool romsns_is_homebrew_port(const Game *game);
 void catalog_build_index(CatalogIndexJob *job);
 bool catalog_read_cache(CatalogIndex *index, CatalogSource source);
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes);

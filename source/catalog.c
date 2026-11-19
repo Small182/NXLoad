@@ -307,6 +307,16 @@ static bool contains(const Game *games, size_t count, const char *url) {
     return false;
 }
 
+bool romsns_is_homebrew_port(const Game *game) {
+    if (!game) return false;
+    if (strcasestr(game->title, "(Homebrew Port)")) return true;
+    static const char suffix[] = "-homebrew-port";
+    size_t end = strlen(game->page);
+    if (end && game->page[end - 1] == '/') --end;
+    size_t length = sizeof(suffix) - 1;
+    return end >= length && !strncasecmp(game->page + end - length, suffix, length);
+}
+
 static void romshq_platform(xmlNodePtr node, bool *switch_game, bool *other) {
     for (; node; node = node->next) {
         if (node->type != XML_ELEMENT_NODE) continue;

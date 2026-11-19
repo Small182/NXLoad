@@ -86,9 +86,10 @@ static const char *const sort_names[] = {"За рейтингом", "За алф
 static const char *const genre_names[] = {
     "Усі жанри", "Екшн", "Пригоди", "Аркада", "Настільні", "Освітні", "Файтинг",
     "Шутер від першої особи", "Музика", "Для вечірок", "Платформер", "Головоломки",
-    "Гонки", "RPG", "Шутер", "Симуляція", "Спорт", "Стратегії", "Інше",
+    "Гонки", "RPG", "Шутер", "Симуляція", "Спорт", "Стратегії", "Інше", "Порти",
 };
 #define GENRE_COUNT (sizeof(genre_names) / sizeof(genre_names[0]))
+#define PORTS_GENRE (GENRE_COUNT - 1)
 static const size_t genre_tabs[] = {0, 1, 2, 13, 11, 12, 17, FAVORITES_TAB};
 static const int tab_widths[] = {96, 122, 137, 104, 178, 125, 145, 169};
 #define TAB_COUNT (sizeof(genre_tabs) / sizeof(genre_tabs[0]))
@@ -435,13 +436,17 @@ static bool network_download_active(void) {
     return app.download_busy && transfer_stage() == 0;
 }
 
+static bool update_in_progress(void) {
+    return app.update_ready || (app.download_busy && app.active_transfer.app_update);
+}
+
 static void download_worker(void *arg) {
     FichierJob *job = arg;
     const char *path = job->url;
     if (job->app_update) {
         const char *error = stage_update(job, path, &app.active_transfer.update);
         job->update_staged = error == NULL;
-        job->result = error ? error : "Оновлення готове. Встановлення після завершення черги.";
+        job->result = error ? error : "Очікуйте встановлення";
         return;
     }
     if (!job->local_unpack && !job->local_install) {
@@ -639,6 +644,12 @@ static int compare_rows(const void *left, const void *right) {
     return order ? order : strcmp(entry_game(a)->page, entry_game(b)->page);
 }
 
+static bool matches_genre(const CatalogEntry *entry, size_t genre) {
+    if (!genre) return true;
+    if (genre == PORTS_GENRE) return romsns_is_homebrew_port(entry->games[CATALOG_ROMSNS]);
+    return entry->metadata && (entry->metadata->genres & (1u << (genre - 1)));
+}
+
 static void rebuild_view(const char *keep) {
     size_t old_index = app.game_index;
     int old_scroll = app.grid_scroll;
@@ -649,7 +660,7 @@ static void rebuild_view(const char *keep) {
     app.game_index = 0;
     for (size_t i = 0; i < app.entry_count; ++i) {
         const CatalogEntry *entry = &app.entries[i];
-        if (app.genre && (!entry->metadata || !(entry->metadata->genres & (1u << (app.genre - 1))))) continue;
+        if (!matches_genre(entry, app.genre)) continue;
         if (app.favorites_open) {
             char key[CATALOG_TEXT];
             make_favorite_key(key, entry_title(entry));
@@ -1292,6 +1303,7 @@ static void launch_next_transfer(void) {
     atomic_init(&job->unpacking, false);
     atomic_init(&job->installing, false);
     atomic_init(&job->yield_for_game_requests, false);
+    atomic_init(&job->update_received, false);
     atomic_init(&job->received, 0);
     atomic_init(&job->total, 0);
     atomic_init(&job->streams, 0);
@@ -2022,8 +2034,14 @@ static bool poll_touch(bool controller_input) {
     static int start_x, start_y, x, y, remainder;
     static bool touching, cancelled, dragged;
     static DragArea area;
-    HidTouchScreenState state;
-    if (!hidGetTouchScreenStates(&state, 1)) return false;
+    HidTouchScreenState state = {0};
+    bool have_state = hidGetTouchScreenStates(&state, 1) != 0;
+    if (update_in_progress()) {
+        touching = dragged = false;
+        cancelled = !have_state || state.count != 0;
+        return false;
+    }
+    if (!have_state) return false;
     if (app.dimmed && state.count && !controller_input && !cancelled) {
         wake_download_screen();
         touching = dragged = false;
@@ -2063,7 +2081,7 @@ static bool poll_touch(bool controller_input) {
 }
 
 static void input(u64 buttons) {
-    if (!buttons) return;
+    if (!buttons || update_in_progress()) return;
     if (app.dimmed) {
         if (buttons & HidNpadButton_Minus) wake_download_screen();
         return;
@@ -2786,7 +2804,33 @@ static void draw_trailer(void) {
     }
 }
 
+static void draw_update_progress(void) {
+    rect(0, 0, 1280, 720, background);
+    rect(190, 216, 900, 268, panel);
+    text(app.large, "Оновлення NXLoad", 224, 245, 828, white);
+    if (app.update_ready || atomic_load(&app.download.update_received)) {
+        text(app.normal, "Очікуйте встановлення", 224, 323, 828, blue);
+        return;
+    }
+    text(app.normal, "Завантаження оновлення NXLoad…", 224, 323, 828, gray);
+    uint64_t total = atomic_load(&app.download.total);
+    if (!total) return;
+    uint64_t have = atomic_load(&app.download.received);
+    double progress = SDL_min(1.0, (double)have / total);
+    rect(224, 382, 828, 8, selected);
+    rect(224, 382, (int)(828 * progress), 8, blue);
+    char line[96];
+    snprintf(line, sizeof(line), tr("%.1f%%  ·  %.1f / %.1f МіБ  ·  %.1f МіБ/с"),
+             100 * progress, have / 1048576.0, total / 1048576.0, app.speed / 1048576.0);
+    text(app.small, line, 224, 405, 828, gray);
+}
+
 static void draw(void) {
+    if (update_in_progress()) {
+        draw_update_progress();
+        SDL_RenderPresent(app.renderer);
+        return;
+    }
     if (app.trailer_open) {
         draw_trailer();
         SDL_RenderPresent(app.renderer);
@@ -2926,7 +2970,11 @@ int main(int argc, char **argv) {
             while (SDL_PollEvent(&event)) {}
             padUpdate(&pad);
             finish_jobs();
-            if (app.close) break;
+            if (app.dimmed && update_in_progress()) wake_download_screen();
+            if (app.close) {
+                if (app.update_ready) draw();
+                break;
+            }
             u64 buttons = padGetButtonsDown(&pad);
             u64 vertical = padGetButtons(&pad) & (up_buttons | down_buttons);
             uint64_t now = SDL_GetTicks64();
@@ -2955,7 +3003,6 @@ int main(int argc, char **argv) {
             if (elapsed < 16) SDL_Delay((uint32_t)(16 - elapsed));
         }
         wake_download_screen();
-        keep_console_awake(false);
         appletUnhook(&lifecycle_hook);
         if (app.backlight == BACKLIGHT_LBL) lblExit();
     } else {
@@ -3014,6 +3061,9 @@ int main(int argc, char **argv) {
         threadWaitForExit(&app.trailer_thread);
         threadClose(&app.trailer_thread);
     }
+    if (romfs_ready) romfsExit();
+    bool update_installed = app.update_ready && apply_update(app.update_target, app.staged_update_sha);
+    keep_console_awake(false);
     for (size_t i = 0; i < COVER_SLOTS; ++i) SDL_DestroyTexture(app.covers[i].texture);
     for (size_t i = 0; i < TEXT_SLOTS; ++i)
         if (text_cache[i].texture) SDL_DestroyTexture(text_cache[i].texture);
@@ -3033,14 +3083,12 @@ int main(int argc, char **argv) {
     if (R_SUCCEEDED(entropy)) csrngExit();
     free_catalog_metadata();
     free(app.favorites);
-    if (romfs_ready) romfsExit();
     if (app.update_ready) {
-        bool installed = apply_update(app.update_target, app.staged_update_sha);
         char arguments[sizeof(app.update_target) + 2];
         snprintf(arguments, sizeof(arguments), "\"%s\"", app.update_target);
-        if (!installed || (envHasNextLoad() && R_FAILED(envSetNextLoad(app.update_target, arguments)))) {
+        if (!update_installed || (envHasNextLoad() && R_FAILED(envSetNextLoad(app.update_target, arguments)))) {
             consoleInit(NULL);
-            puts(tr(installed ? "Оновлення встановлено. Відкрий цей файл у Homebrew Menu:" :
+            puts(tr(update_installed ? "Оновлення встановлено. Відкрий цей файл у Homebrew Menu:" :
                                "Не вдалося встановити оновлення NXLoad. Перевір файл і його резервну копію:"));
             puts(app.update_target);
             puts(tr("Натисни +, щоб вийти."));

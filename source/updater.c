@@ -406,6 +406,7 @@ const char *stage_update(FichierJob *job, const char *target, const UpdateBuild 
     bool received = request(url, release ? NULL : token, &r, &status);
     bool saved = fclose(r.out) == 0;
     if (!received || !saved) { update_error = release ? release_http_error() : http_error(status); goto done; }
+    atomic_store(&job->update_received, true);
     if (!download_digest(&r, build->digest)) { update_error = "Контрольна сума збірки не збігається"; goto done; }
     if (!access(stage, F_OK) && unlink(stage)) {
         update_error = "Не вдалося прибрати попередній тимчасовий файл оновлення";

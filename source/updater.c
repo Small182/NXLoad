@@ -25,7 +25,9 @@
 
 #define UPDATE_BRANCH "native-1fichier"
 #define BUILD_WORKFLOW ".github/workflows/build.yml"
-#define ACTIONS "https://api.github.com/repos/Small182/NXLoad/actions/"
+#define REPOSITORY "https://api.github.com/repos/Small182/NXLoad/"
+#define ACTIONS REPOSITORY "actions/"
+#define RELEASES REPOSITORY "releases/"
 #define TOKEN_PATH NXLOAD_APP_DIR "/github-token.txt"
 #define JSON_LIMIT (512 * 1024)
 #define ZIP_LIMIT (96 * UINT64_C(1024) * 1024)
@@ -162,31 +164,30 @@ static int progress(void *arg, curl_off_t total, curl_off_t current,
 }
 
 static bool request(const char *url, const char *token, Response *r, long *status) {
+    *status = 0;
     CURL *curl = curl_easy_init();
     if (!curl) return false;
-    struct curl_slist *headers = curl_slist_append(NULL, "Accept: application/vnd.github+json");
+    struct curl_slist *headers = curl_slist_append(NULL, r->out && !token ?
+        "Accept: application/octet-stream" : "Accept: application/vnd.github+json");
+    struct curl_slist *updated = NULL;
     if (headers && !r->out) {
-        struct curl_slist *fresh = curl_slist_append(headers, "Cache-Control: no-cache");
-        if (!fresh) {
-            curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
-            return false;
-        }
-        headers = fresh;
+        updated = curl_slist_append(headers, "Cache-Control: no-cache");
+        if (!updated) goto failed;
+        headers = updated;
     }
-    char bearer[560];
-    int n = snprintf(bearer, sizeof(bearer), "Authorization: Bearer %s", token);
-    struct curl_slist *with_token = n > 0 && (size_t)n < sizeof(bearer) && headers ?
-                                   curl_slist_append(headers, bearer) : NULL;
-    if (!with_token) {
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        return false;
+    if (headers && token) {
+        char bearer[560];
+        int n = snprintf(bearer, sizeof(bearer), "Authorization: Bearer %s", token);
+        if (n <= 0 || (size_t)n >= sizeof(bearer)) goto failed;
+        updated = curl_slist_append(headers, bearer);
+        if (!updated) goto failed;
+        headers = updated;
     }
+    if (!headers) goto failed;
     r->size = 0;
     if (r->json) r->json[0] = 0;
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, with_token);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad");
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, r->out ? 1L : 0L);
@@ -205,8 +206,13 @@ static bool request(const char *url, const char *token, Response *r, long *statu
     CURLcode result = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
     curl_easy_cleanup(curl);
-    curl_slist_free_all(with_token);
+    curl_slist_free_all(headers);
     return result == CURLE_OK && *status == 200;
+
+failed:
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return false;
 }
 
 static bool read_token(char token[512]) {
@@ -222,11 +228,7 @@ static bool read_token(char token[512]) {
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") == n;
 }
 
-bool update_configured(void) {
-    return !access(TOKEN_PATH, R_OK);
-}
-
-static bool zip_digest(Response *r, const char *expected) {
+static bool download_digest(Response *r, const char *expected) {
     const char hex[] = "0123456789abcdef";
     unsigned char bytes[SHA256_HASH_SIZE];
     char hash[SHA256_HASH_SIZE * 2 + 1];
@@ -310,16 +312,76 @@ static bool newest_run(Response *r, UpdateBuild *latest, char run_id[24]) {
     return latest->run != 0;
 }
 
+static bool asset_digest(Json asset, UpdateBuild *build) {
+    return id_field(asset, build->id) &&
+           string_field(asset, "digest", build->digest, sizeof(build->digest)) &&
+           strlen(build->digest) == 71 && !strncmp(build->digest, "sha256:", 7) &&
+           strspn(build->digest + 7, "0123456789abcdef") == 64;
+}
+
 static bool read_artifact(Response *r, UpdateBuild *build) {
     Json artifacts = field((Json){r->json, r->json + r->size}, "artifacts");
     const char *cursor = NULL;
     for (Json item = next_object(artifacts, &cursor); item.begin; item = next_object(artifacts, &cursor)) {
         if (literal(field(item, "name"), "\"NXLoad\"") && literal(field(item, "expired"), "false") &&
-            id_field(item, build->id) && string_field(item, "digest", build->digest, sizeof(build->digest)) &&
-            strlen(build->digest) == 71 && !strncmp(build->digest, "sha256:", 7) &&
-            strspn(build->digest + 7, "0123456789abcdef") == 64) return true;
+            asset_digest(item, build)) return true;
     }
     return false;
+}
+
+static bool version_number(const char *version, uint64_t *number) {
+    *number = 0;
+    for (unsigned i = 0; i < 3; ++i) {
+        size_t digits = strspn(version, "0123456789");
+        if (!digits || digits > 5 || (digits > 1 && *version == '0') ||
+            version[digits] != (i < 2 ? '.' : 0)) return false;
+        *number = *number * 100000 + strtoul(version, NULL, 10);
+        version += digits + (i < 2);
+    }
+    return true;
+}
+
+static const char *release_http_error(void) {
+    return "Не вдалося отримати публічний реліз NXLoad з GitHub";
+}
+
+static const char *check_release(Response *r, UpdateBuild *result) {
+    const char *invalid = "У релізі NXLoad немає придатного файлу оновлення";
+    long status = 0;
+    if (!request(RELEASES "latest", NULL, r, &status))
+        return status == 404 ? NULL : release_http_error();
+    Json release = {r->json, r->json + r->size};
+    char tag[24];
+    uint64_t latest, installed;
+    if (!string_field(release, "tag_name", tag, sizeof(tag)) || tag[0] != 'v' ||
+        !literal(field(release, "draft"), "false") ||
+        !literal(field(release, "prerelease"), "false") ||
+        !version_number(tag + 1, &latest) || !version_number(NXLOAD_VERSION, &installed))
+        return invalid;
+    if (latest <= installed) return NULL;
+
+    UpdateBuild candidate = {0};
+    const char *cursor = NULL;
+    Json assets = field(release, "assets");
+    bool found = false;
+    for (Json item = next_object(assets, &cursor); item.begin; item = next_object(assets, &cursor)) {
+        if (literal(field(item, "name"), "\"NXLoad.nro\"") &&
+            literal(field(item, "state"), "\"uploaded\"") && asset_digest(item, &candidate)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return invalid;
+    char url[160];
+    snprintf(url, sizeof(url), REPOSITORY "commits/%s", tag);
+    if (!request(url, NULL, r, &status)) return release_http_error();
+    Json commit = {r->json, r->json + r->size};
+    if (!string_field(commit, "sha", candidate.sha, sizeof(candidate.sha)) ||
+        strlen(candidate.sha) != 40 || strspn(candidate.sha, "0123456789abcdef") != 40)
+        return invalid;
+    strcpy(candidate.version, tag + 1);
+    *result = candidate;
+    return NULL;
 }
 
 void check_update(UpdateCheck *check) {
@@ -329,14 +391,14 @@ void check_update(UpdateCheck *check) {
     UpdateBuild candidate = {0};
     check->build = (UpdateBuild){0};
     check->error = NULL;
-    if (!read_token(token)) {
-        check->error = "Додай токен GitHub у switch/nxload/github-token.txt";
-        return;
-    }
     Response r = {.cancelled = &check->cancelled, .json = malloc(JSON_LIMIT + 1)};
     if (!r.json) {
         check->error = "Бракує пам’яті для перевірки оновлення";
         return;
+    }
+    if (!read_token(token)) {
+        check->error = check_release(&r, &check->build);
+        goto done;
     }
     const char *runs = ACTIONS "runs?branch=" UPDATE_BRANCH "&event=push&status=success&per_page=10";
     if (!request(runs, token, &r, &status)) {
@@ -405,8 +467,9 @@ static bool nro_has_build(const char *path, const char *sha) {
 }
 
 const char *stage_update(FichierJob *job, const char *target, const UpdateBuild *build) {
-    char token[512], stage[320], zip[] = NXLOAD_APP_DIR "/.update-XXXXXX";
-    if (!read_token(token)) return "Додай токен GitHub у switch/nxload/github-token.txt";
+    char token[512], stage[320], downloaded[] = NXLOAD_APP_DIR "/.update-XXXXXX";
+    bool release = build->version[0] != 0;
+    if (!release && !read_token(token)) return "Додай токен GitHub у switch/nxload/github-token.txt";
     if (!build->id[0]) return "Спочатку перевір наявність оновлення NXLoad";
     if (snprintf(stage, sizeof(stage), "%s.new", target) >= (int)sizeof(stage))
         return "Шлях до NXLoad.nro задовгий";
@@ -416,23 +479,23 @@ const char *stage_update(FichierJob *job, const char *target, const UpdateBuild 
     const char *update_error;
     long status = 0;
     char url[256];
-    bool zip_created = false;
-    int fd = mkstemp(zip);
+    bool temporary_created = false;
+    int fd = mkstemp(downloaded);
     if (fd < 0) { update_error = "Не вдалося створити файл оновлення на microSD"; goto done; }
-    zip_created = true;
+    temporary_created = true;
     r.out = fdopen(fd, "wb");
     if (!r.out) { close(fd); update_error = "Не вдалося записати файл оновлення"; goto done; }
     sha256ContextCreate(&r.sha);
-    snprintf(url, sizeof(url), ACTIONS "artifacts/%s/zip", build->id);
-    bool received = request(url, token, &r, &status);
+    snprintf(url, sizeof(url), release ? RELEASES "assets/%s" : ACTIONS "artifacts/%s/zip", build->id);
+    bool received = request(url, release ? NULL : token, &r, &status);
     bool saved = fclose(r.out) == 0;
-    if (!received || !saved) { update_error = http_error(status); goto done; }
-    if (!zip_digest(&r, build->digest)) { update_error = "Контрольна сума збірки не збігається"; goto done; }
+    if (!received || !saved) { update_error = release ? release_http_error() : http_error(status); goto done; }
+    if (!download_digest(&r, build->digest)) { update_error = "Контрольна сума збірки не збігається"; goto done; }
     if (!access(stage, F_OK) && unlink(stage)) {
         update_error = "Не вдалося прибрати попередній тимчасовий файл оновлення";
         goto done;
     }
-    if (!extract_nro(job, zip, stage)) {
+    if (release ? rename(downloaded, stage) != 0 : !extract_nro(job, downloaded, stage)) {
         update_error = "Не вдалося підготувати NXLoad.nro. Перевір місце та відсутність файлу .new.";
         goto done;
     }
@@ -444,7 +507,7 @@ const char *stage_update(FichierJob *job, const char *target, const UpdateBuild 
     update_error = NULL;
 
 done:
-    if (zip_created) unlink(zip);
+    if (temporary_created) unlink(downloaded);
     if (atomic_load(&job->cancelled)) {
         if (!update_error) unlink(stage);
         return "Оновлення скасовано";

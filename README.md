@@ -1,55 +1,47 @@
 # NXLoad
 
-Відкрий картку гри кнопкою **A**. **L/R** перемикають огляд, скриншоти та файли. У галереї гортай стрілками **←/→**.
+[Українська](#українська) · [English](#english) · [Завантажити / Download](https://github.com/Small182/NXLoad/releases/latest)
 
-Для зіставлених ігор назва й оцінка читачів беруться з [Nintendo Life](https://www.nintendolife.com/games). Англійські описи, видавці, дати та жанри беруться з [TitleDB](https://github.com/blawar/titledb). Квадратні обкладинки 256 × 256 беруться з CDN Nintendo eShop за посиланнями TitleDB. Для ігор без такої іконки NXLoad використовує Nintendo Life або обкладинку джерела файлів. NXLoad завантажує видимі обкладинки та готує до двох сусідніх сторінок у кожен бік. Мініатюри зберігаються у `switch/nxload/downloads/covers/`. Галереї 1-2-Switch і MySims Cozy Bundle вбудовані у збірку. Інші знімки беруться з галерей Nintendo Life, TitleDB або картки ROMsHQ.
+## Українська
 
-Для NSRoms/DLArchive NXLoad використовує до чотирьох з’єднань для файлів від 32 МіБ, якщо сервер підтримує HTTP Range і надає сильний ETag. Окремий потік записує отримані блоки на microSD, поки триває передача. Якщо сервер ігнорує запити по частинах, NXLoad використовує один потік.
+**NXLoad** — homebrew-каталог і менеджер завантажень для Nintendo Switch. Є пошук, вибране, скриншоти, черга завантажень, розпакування RAR та встановлення сумісних NSP на microSD. Інтерфейс доступний українською й англійською. Інший проєкт автора — [UAPlay для Nintendo Switch](https://github.com/Small182/UAPlay-nx).
 
-Нативний каталог Nintendo Switch та завантажувач DLArchive для microSD.
+**Встановлення.** Завантаж `NXLoad.nro` з [Releases](https://github.com/Small182/NXLoad/releases/latest), скопіюй у `switch/` на microSD та відкрий у Homebrew Menu. Завантажені файли зберігаються в `switch/nxload/downloads/`.
 
-Скопіюй `NXLoad.nro` у `switch/` і запусти через Homebrew Menu.
+**Оновлення.** За замовчуванням NXLoad перевіряє стабільні GitHub Releases без токена. Щоб отримувати збірки з комітів гілки `native-1fichier`, збережи fine-grained токен із дозволом **Actions: Read** для цього репозиторію у `switch/nxload/github-token.txt` на microSD. Після підтвердження оновлення встановлюється автоматично, коли черга завершена.
 
-- Рухайся сіткою стіком або хрестовиною. Вибрана обкладинка має рамку й трохи збільшується, а її назва з’являється внизу зліва. **A** відкриває картку. Дотики відкривають картки, вкладки і розділи, а свайпи гортають сітку та скриншоти.
-- **L/R** перемикають жанри бібліотеки. **ZL** відкриває сортування та всі жанри. **X** шукає в каталозі. За замовчуванням у кожному жанрі спочатку показуються ігри з вищим рейтингом.
-- **A** на вкладці «Файли» відкриває вибір «Завантажити» або «Завантажити й встановити». Обидві дії додають завдання в чергу поточного сеансу.
-- **Y** відкриває завантаження й чергу. **←/→** перемикають списки, **X** видаляє вибраний файл після підтвердження або прибирає завдання із черги, **ZL** скасовує поточну операцію.
-- **A** на збереженому NSP ставить встановлення на microSD у чергу. Для інших форматів можна відкрити DBI, якщо він є на карті.
-- **B** повертає назад. **+** виходить.
+**Джерела та запозичення.** Повний перелік каталогів, джерел метаданих, файлових сервісів та бібліотек наведено нижче у [спільному розділі](#джерела--credits).
 
-NXLoad читає каталог з NSRoms і отримує актуальне посилання від API DLArchive перед кожним завантаженням. Завантажені файли, архіви, розпаковані пакети та кеші каталогів зберігаються в `switch/nxload/downloads/`. Щоб побачити попередні завантаження в NXLoad, перенеси їх у цю папку.
+## English
 
-### Встановлення
+**NXLoad** is a homebrew catalog and download manager for Nintendo Switch. It includes search, favorites, screenshots, a download queue, RAR extraction, and installation of supported NSP packages to microSD. The interface is available in English and Ukrainian. See also the author's [UAPlay for Nintendo Switch](https://github.com/Small182/UAPlay-nx).
 
-- «Завантажити» залишає NSP на карті. RAR після завантаження розпаковується, а архів видаляється після успішного розпакування, якщо ввімкнено відповідний параметр.
-- «Завантажити й встановити» спочатку повністю завантажує файл, розпаковує RAR за потреби й встановлює NSP на microSD. Видалення NSP після успішного встановлення можна ввімкнути в «Налаштуваннях». Для встановлення потрібне додаткове місце на microSD.
-- Завантаження з ROMsHQ після переадресації використовує до чотирьох з'єднань, якщо файловий сервер підтримує запити HTTP Range і повертає сильний ETag. Інакше NXLoad завантажує файл одним з'єднанням.
+**Installation.** Download `NXLoad.nro` from [Releases](https://github.com/Small182/NXLoad/releases/latest), copy it to `switch/` on the microSD card, and open it from the Homebrew Menu. Downloads are saved in `switch/nxload/downloads/`.
 
-### Налаштування
+**Updates.** NXLoad checks stable GitHub Releases by default and needs no token for that channel. To get commit builds from the `native-1fichier` branch, save a fine-grained GitHub token with **Actions: Read** for this repository to `switch/nxload/github-token.txt` on the microSD card. After you confirm an update, it installs automatically when the queue finishes.
 
-Шестерня у верхньому правому куті або **−** відкриває налаштування. Там можна вибрати дію з файлом за замовчуванням, увімкнути видалення архівів і пакетів, а також запускати оновлення каталогів і NXLoad вручну.
+## Джерела / Credits
 
-Автоматичні оновлення каталогів перевіряють обидва джерела у фоні раз на 24 години. Щоденну перевірку каталогів можна вимкнути. NXLoad перевіряє наявність оновлення при запуску й пропонує встановити його. Перевірку також можна запустити вручну з налаштувань.
+| Джерело / Source | Використання / Use |
+| --- | --- |
+| [NSRoms](https://nsroms.net/) · [ROMsHQ](https://romshq.com/) | Каталоги, обкладинки й список файлів. ROMsHQ також надає галереї та вбудований знімок каталогу. / Catalogs, covers and file listings. ROMsHQ also supplies galleries and the bundled catalog snapshot. |
+| [DLArchive](https://drive.dlarchive.my.id/) · [DataNodes](https://datanodes.to/) · [1fichier](https://1fichier.com/) · [MegaUp](https://megaup.net/) · [NSWGF](https://nswgf.com/) | Файлові хости, дзеркала та обробники посилань у коді. / File hosts, mirrors, and source-specific link handlers in the codebase. |
+| [Nintendo Life](https://www.nintendolife.com/games) | Метадані, оцінки читачів, обкладинки й скриншоти. Вбудовані галереї 1-2-Switch та MySims Cozy Bundle використовують зображення Nintendo Life. / Metadata, reader ratings, covers and screenshots. The bundled 1-2-Switch and MySims Cozy Bundle galleries use Nintendo Life images. |
+| [TitleDB](https://github.com/blawar/titledb) · [Nintendo eShop](https://www.nintendo.com/store/games/) | Ідентифікатори, описи, жанри, дати, відомості про студії та зображення з CDN eShop. / Identifiers, descriptions, genres, dates, studio information, and images linked from the eShop CDN. |
+| [devkitPro](https://devkitpro.org/) · [libnx](https://github.com/switchbrew/libnx) · [Homebrew Menu](https://github.com/switchbrew/nx-hbmenu) | Інструменти збірки, системні API та запуск NRO. / Build toolchain, system APIs, and NRO launcher. |
+| [SDL2](https://github.com/libsdl-org/SDL) · [SDL_image](https://github.com/libsdl-org/SDL_image) · [SDL_ttf](https://github.com/libsdl-org/SDL_ttf) | Інтерфейс, зображення та текст із системним шрифтом Switch. / UI, image decoding, and text with the Switch system font. |
+| [curl](https://curl.se/) · [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) · [Mozilla CA bundle](https://curl.se/docs/caextract.html) | HTTPS, TLS і набір кореневих сертифікатів Mozilla, який поширює curl. / HTTPS, TLS, and the Mozilla root certificates distributed by curl. |
+| [libxml2](https://gitlab.gnome.org/GNOME/libxml2) · [libarchive](https://www.libarchive.org/) · [zlib](https://zlib.net/) | Розбір HTML, розпакування RAR і ZIP, стиснені метадані. / HTML parsing, RAR and ZIP extraction, and compressed metadata. |
+| [DBI](https://github.com/rashevskyv/dbi) (duckbill) · [GitHub Actions](https://github.com/features/actions) | DBI можна відкрити як окремий інсталятор, якщо він уже є на microSD. GitHub Actions збирає NRO. / DBI can be opened as a separate installer when already present on microSD. GitHub Actions builds the NRO. |
+| [OpenAI](https://openai.com/) | Підготовка українських перекладів описів в окремому процесі збірки. / Ukrainian game descriptions are prepared in a separate translation workflow. |
 
-Оновлювач вибирає новішу успішну збірку push гілки `native-1fichier` у GitHub Actions. У вікні оновлення **A** підтверджує встановлення, а **B** відкладає його. Для приватного репозиторію збережи fine-grained GitHub token, обмежений репозиторієм `Small182/NXLoad` і дозволом `Actions: Read`, у `switch/nxload/github-token.txt` на microSD. Файл містить лише токен. Зберігай його окремо від артефактів і репозиторію.
+Зображення, назви ігор і торговельні марки належать відповідним правовласникам. / Game images, titles, and trademarks belong to their respective owners.
 
-Після завантаження та перевірки SHA-256 NXLoad автоматично встановлює оновлення, щойно завершиться черга. Попередня збірка зберігається поруч із суфіксом `.bak`. Якщо Homebrew Menu підтримує автоматичний перезапуск, NXLoad відкриває оновлений NRO. Нові збірки з тією самою версією відрізняються за SHA коміту.
+## Збірка / Build
 
-## Збірка
+Потрібні Python 3, devkitA64, libnx, switch-tools, switch-pkg-config та Switch portlibs для SDL2, SDL2_image, SDL2_ttf, libxml2, libarchive і zlib. / Requires Python 3, devkitA64, libnx, switch-tools, switch-pkg-config, and the corresponding Switch portlibs.
 
-Потрібні Python 3, devkitA64, libnx, switch-tools, switch-pkg-config, switch-sdl2, switch-sdl2_ttf, switch-sdl2_image, switch-libxml2, switch-libarchive і switch-zlib. Запусти `bash tools/build-network.sh`, потім `make`. Make формує індекси ROMFS зі знімків TitleDB і Nintendo Life та завантажує знімки двох вбудованих галерей. GitHub Actions зберігає готовий `NXLoad.nro` в артефакті `NXLoad`.
-
-Щоб оновити знімок Nintendo Life, запусти `python3 tools/update-nintendo-life.py tools/nintendo-life.json.gz`. Для цього скрипту потрібні `curl` і `lxml`. У `tools/nintendo-life-ratings.json` можна додати перевірені оцінки читачів зі сторінок ігор, коли оцінки немає в загальному каталозі. У сітці «—» означає, що оцінки в індексі немає.
-
-NXLoad перевіряє HTTPS через Mbed TLS з вбудованим набором публічних кореневих сертифікатів [Mozilla CA](https://curl.se/docs/caextract.html), ліцензія MPL 2.0.
-
-Повний каталог NSRoms завантажується у фоні при першому запуску та зберігається в `switch/nxload/downloads/catalog.bin`. Кеш ROMsHQ лежить поруч у `romshq.bin`. Коли придатного кешу ще немає, NXLoad відкриває вбудований знімок каталогу ROMsHQ (Switch). Унизу бібліотеки показано загальну кількість унікальних ігор і кількість в обраному жанрі. Кеш читається одразу, а під час роботи NXLoad каталоги оновлюються у фоні раз на добу. Завантаження файлів призупиняє індексацію між запитами.
-
-### ROMsHQ та RAR
-
-- ROMsHQ /d/ та DataNodes можуть перенаправляти на окремий HTTPS-файловий сервер. NXLoad перевіряє адреси, проходить до 10 переадресацій, не передає підписані URL у заголовку Referer і не записує HTML-сторінку замість архіву. Якщо переадресацію відхилено, у «Завантаженнях» показується причина або назва кінцевого домену.
-
-- У вкладці «Файли» NXLoad одразу перевіряє обидва увімкнені джерела й показує файли групами NSRoms та ROMsHQ. Розмір відображається, коли джерело вказує його для конкретного файлу. У налаштуваннях можна окремо вимкнути кожне джерело й перемикати темну або світлу тему й обирати українську або англійську мову інтерфейсу.
-- У каталозі **B** повертає до першої обкладинки поточного розділу. У каталозі та картці гри **Y** додає або видаляє гру з розділу «Вибране». У картці гри стік і хрестовина перемикають вкладки. **A** на вкладці «Скриншоти» відкриває повноекранний перегляд зі свайпами або гортанням стіком, **B** повертає до картки.
-- На екрані «Завантаження» **Y** скасовує активну операцію, **X** видаляє збережений файл або елемент черги, а **−** приглушує екран.
-- Після завантаження RAR розпаковується автоматично. NXLoad видаляє архів після успішного збереження всіх пакетів, якщо автовидалення RAR увімкнено. Якщо операція завершилася помилкою або була скасована, архів можна повторно відкрити кнопкою **A** в «Завантаженнях».
+```sh
+bash tools/build-network.sh
+make
+```

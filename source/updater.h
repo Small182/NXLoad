@@ -4,7 +4,7 @@
 #include "fichier.h"
 
 typedef struct {
-    char id[24], digest[72], sha[41];
+    char id[24], digest[72], sha[41], version[24];
     uint64_t run;
 } UpdateBuild;
 
@@ -14,7 +14,6 @@ typedef struct {
     const char *error;
 } UpdateCheck;
 
-bool update_configured(void);
 void check_update(UpdateCheck *check);
 const char *stage_update(FichierJob *job, const char *target, const UpdateBuild *build);
 bool apply_update(const char *target, const char *sha);

@@ -71,8 +71,8 @@ typedef enum {
 #define DOWNLOADS_X 1108
 #define HOME_SEARCH_X 976
 #define HOME_SEARCH_WIDTH (DOWNLOADS_X - HOME_SEARCH_X - 8)
-#define DOWNLOADS_BACK_X 1055
-#define DOWNLOADS_BACK_WIDTH 112
+#define COMPACT_BACK_X 1055
+#define COMPACT_BACK_WIDTH 112
 #define SETTINGS_X 1175
 #define TOP_END 1240
 #define DOWNLOADS_DIM_X 1000
@@ -314,8 +314,8 @@ static void draw_header(void) {
     const bool downloads = app.screen == DOWNLOADS;
     const bool library = app.screen == LIBRARY;
     if (focused && app.top_focus == TOP_SEARCH) {
-        const int x = downloads ? DOWNLOADS_BACK_X : library ? HOME_SEARCH_X : SEARCH_X;
-        const int width = downloads ? DOWNLOADS_BACK_WIDTH : library ? HOME_SEARCH_WIDTH : 163;
+        const int x = downloads ? COMPACT_BACK_X : library ? HOME_SEARCH_X : SEARCH_X;
+        const int width = downloads ? COMPACT_BACK_WIDTH : library ? HOME_SEARCH_WIDTH : 163;
         rect(x, TOP_Y, width, TOP_HEIGHT, selected);
     }
     if (focused && app.top_focus == TOP_DOWNLOADS)
@@ -328,8 +328,8 @@ static void draw_header(void) {
         for (int i = 0; i < 3; ++i)
             SDL_RenderDrawLine(app.renderer, HOME_SEARCH_X + 22 + i, 47, HOME_SEARCH_X + 28 + i, 53);
         text(app.normal, "Пошук", HOME_SEARCH_X + 35, 32, HOME_SEARCH_WIDTH - 39, white);
-    } else if (downloads) {
-        right_text(app.normal, "‹ Назад", DOWNLOADS_BACK_X + 8, 32, DOWNLOADS_BACK_WIDTH - 16, white);
+    } else if (downloads || app.settings_open) {
+        right_text(app.normal, "‹ Назад", COMPACT_BACK_X + 8, 32, COMPACT_BACK_WIDTH - 16, white);
     } else {
         text(app.normal, "‹ Назад", SEARCH_X + 10, 32, 150, white);
     }
@@ -1269,10 +1269,6 @@ static void start_update_check(bool manual) {
         if (manual) strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
         return;
     }
-    if (!update_configured()) {
-        if (manual) strcpy(app.update_notice, "Додай токен GitHub у switch/nxload/github-token.txt");
-        return;
-    }
     atomic_init(&app.update_check.cancelled, false);
     app.update_checking = start_worker(&app.update_thread, update_check_worker, &app.update_check);
     strcpy(app.update_notice, app.update_checking ? "Перевірка оновлення NXLoad…" :
@@ -1646,11 +1642,11 @@ static void touch_tap(int x, int y) {
         return;
     }
     const bool downloads = app.screen == DOWNLOADS;
-    const bool back_hit = x >= DOWNLOADS_BACK_X && x < DOWNLOADS_BACK_X + DOWNLOADS_BACK_WIDTH;
+    const bool back_hit = x >= COMPACT_BACK_X && x < COMPACT_BACK_X + COMPACT_BACK_WIDTH;
     const bool settings_hit = x >= SETTINGS_X && x < TOP_END;
     if (app.settings_open) {
         if (y >= TOP_Y && y < TOP_Y + TOP_HEIGHT &&
-            (downloads ? back_hit || settings_hit : x >= SEARCH_X && x < TOP_END)) {
+            (back_hit || settings_hit)) {
             toggle_settings();
         } else if (x >= 180 && x < 1100 && y >= SETTINGS_Y) {
             size_t visible = (size_t)(y - SETTINGS_Y) / SETTINGS_STEP;
@@ -2504,8 +2500,11 @@ static void draw_downloads(void) {
 
 static void draw_update_dialog(void) {
     char line[112];
-    snprintf(line, sizeof(line), tr("Збірка %" PRIu64 " · %.8s"),
-             app.update_check.build.run, app.update_check.build.sha);
+    const UpdateBuild *build = &app.update_check.build;
+    if (build->version[0])
+        snprintf(line, sizeof(line), tr("Версія %s"), build->version);
+    else
+        snprintf(line, sizeof(line), tr("Збірка %" PRIu64 " · %.8s"), build->run, build->sha);
     rect(190, 200, 900, 305, selected);
     text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
     text(app.normal, line, 224, 298, 828, gray);

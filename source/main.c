@@ -74,6 +74,7 @@ typedef enum {
 #define SETTINGS_VISIBLE 10
 #define TOP_Y 21
 #define TOP_HEIGHT 53
+#define TOP_ICON_Y 34
 #define TOP_END 1240
 #define BATTERY_WIDTH 36
 #define SETTINGS_END (TOP_END - BATTERY_WIDTH)
@@ -83,7 +84,8 @@ typedef enum {
 #define HEADER_ACTION_WIDTH (DOWNLOADS_X - HEADER_ACTION_X - 8)
 #define COMPACT_BACK_X (SETTINGS_X - 120)
 #define COMPACT_BACK_WIDTH 112
-#define SD_STATUS_WIDTH 172
+#define SD_STATUS_WIDTH 240
+#define SD_STATUS_GAP 50
 #define DOWNLOADS_DIM_X 1000
 typedef enum { GAME_OVERVIEW, GAME_MEDIA, GAME_FILES } GameTab;
 typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
@@ -378,7 +380,8 @@ static void draw_header(void) {
         rect(SETTINGS_X, TOP_Y, SETTINGS_END - SETTINGS_X, TOP_HEIGHT, selected);
 
     if (library && !app.settings_open) {
-        right_text(app.normal, app.sd_status, HEADER_ACTION_X - SD_STATUS_WIDTH - 16, 32, SD_STATUS_WIDTH, gray);
+        right_text(app.normal, app.sd_status, HEADER_ACTION_X - SD_STATUS_WIDTH - SD_STATUS_GAP,
+                   32, SD_STATUS_WIDTH, gray);
         icon_circle(HEADER_ACTION_X + 17, 42, 8, 2, white);
         for (int i = 0; i < 3; ++i)
             SDL_RenderDrawLine(app.renderer, HEADER_ACTION_X + 22 + i, 47, HEADER_ACTION_X + 28 + i, 53);
@@ -389,7 +392,7 @@ static void draw_header(void) {
         right_text(app.normal, "‹ Назад", HEADER_ACTION_X + 8, 32, HEADER_ACTION_WIDTH - 16, white);
     }
     if (!downloads && !app.settings_open) {
-        const int arrow_x = DOWNLOADS_X + 28, arrow_y = 34;
+        const int arrow_x = DOWNLOADS_X + 28, arrow_y = TOP_ICON_Y;
         bool blink = app.download_busy && !app.active_transfer.app_update &&
                      SDL_GetTicks64() % 1600 < 800;
         SDL_Color icon = blink ? blue : white;
@@ -408,12 +411,12 @@ static void draw_header(void) {
     if (app.update_ready) icon_circle(gear_x + 16, gear_y - 14, 4, 4, blue);
 
     if (app.battery_percent >= 0) {
-        const int x = SETTINGS_END + (BATTERY_WIDTH - 16) / 2, y = 34;
-        const int fill = (app.battery_percent * 20 + 99) / 100;
-        rect(x + 5, y - 4, 6, 4, white);
-        rect(x, y, 16, 28, white);
-        rect(x + 2, y + 2, 12, 24, background);
-        rect(x + 4, y + 24 - fill, 8, fill, white);
+        const int x = SETTINGS_END + (BATTERY_WIDTH - 17) / 2, y = TOP_ICON_Y + 3;
+        const int fill = (app.battery_percent * 16 + 99) / 100;
+        rect(x + 5, TOP_ICON_Y, 7, 3, white);
+        rect(x, y, 17, 24, white);
+        rect(x + 3, y + 3, 11, 18, background);
+        rect(x + 4, y + 20 - fill, 9, fill, white);
     }
 }
 

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __SWITCH__
 #include <fcntl.h>
@@ -95,6 +96,17 @@ static void entry_detail(FichierJob *job, const char *reason, const char *path) 
 static bool unused_path(const char *path) {
     struct stat entry;
     return lstat(path, &entry) != 0 && errno == ENOENT;
+}
+
+static int create_staging_directory(const char *directory, char staging[OUTPUT_PATH]) {
+    unsigned long long timestamp = (unsigned long long)time(NULL);
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        int length = snprintf(staging, OUTPUT_PATH, "%s/nxload-unpack-%llx-%u", directory, timestamp, attempt);
+        if (length < 0 || length >= OUTPUT_PATH) return ENAMETOOLONG;
+        if (!mkdir(staging, 0777)) return 0;
+        if (errno != EEXIST) return errno;
+    }
+    return EEXIST;
 }
 
 static const char *port_path(const char *path) {
@@ -240,9 +252,16 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
         error = "Не вдалося відкрити архів";
         goto done;
     }
-    int length = snprintf(staging, sizeof(staging), "%s/.unpack-XXXXXX", directory);
-    if (length <= 0 || (size_t)length >= sizeof(staging) || !mkdtemp(staging)) {
-        error = nxload_storage_error(errno, "Не вдалося створити тимчасову папку розпакування");
+    int directory_error = create_staging_directory(directory, staging);
+    if (directory_error) {
+        error = nxload_storage_error(directory_error, "Не вдалося створити тимчасову папку розпакування");
+#ifdef __SWITCH__
+        if (directory_error != ENAMETOOLONG)
+            snprintf(job->tls_detail, sizeof(job->tls_detail), "mkdir · errno %d · FS 0x%08x",
+                     directory_error, fsdevGetLastResult());
+        else
+#endif
+            snprintf(job->tls_detail, sizeof(job->tls_detail), "mkdir · errno %d", directory_error);
         goto done;
     }
     staged = true;

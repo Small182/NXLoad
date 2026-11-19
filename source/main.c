@@ -398,7 +398,7 @@ static void download_worker(void *arg) {
     if (job->app_update) {
         const char *error = stage_update(job, path, &app.active_transfer.update);
         job->update_staged = error == NULL;
-        job->result = error ? error : "Оновлення готове. Натисни +, щоб застосувати.";
+        job->result = error ? error : "Оновлення готове. Встановлення після завершення черги.";
         return;
     }
     if (!job->local_unpack && !job->local_install) {
@@ -1113,7 +1113,6 @@ static void finish_jobs(void) {
         if (app.download.update_staged) {
             app.update_ready = true;
             strcpy(app.staged_update_sha, app.active_transfer.update.sha);
-            if (!app.queue_count && envHasNextLoad()) app.close = true;
         }
         if (app.active_transfer.app_update)
             snprintf(app.update_notice, sizeof(app.update_notice), "%s", tr(app.download.result));
@@ -1136,7 +1135,10 @@ static void finish_jobs(void) {
             app.speed_time = now;
         }
     }
-    if (!app.download_busy && app.queue_count) launch_next_transfer();
+    if (!app.download_busy) {
+        if (app.queue_count) launch_next_transfer();
+        else if (app.update_ready) app.close = true;
+    }
 }
 
 static void remove_queued(size_t index) {
@@ -2211,7 +2213,7 @@ static void draw_settings(void) {
                  app.index_notice[0][0] && app.index_notice[1][0] ? "  ·  " : "", tr(app.index_notice[1]));
         text(app.small, status, 195, 566, 895, gray);
     }
-    const char *update = app.update_ready ? "NXLoad оновиться під час виходу" :
+    const char *update = app.update_ready ? "Оновлення очікує завершення черги" :
         app.download_busy && app.active_transfer.app_update ? "Перевірка або завантаження NXLoad…" :
         app.update_notice;
     text(app.small, update, 195, 592, 895, blue);
@@ -2449,7 +2451,7 @@ static void draw_update_dialog(void) {
     rect(190, 200, 900, 305, selected);
     text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
     text(app.normal, line, 224, 298, 828, gray);
-    text(app.small, "Оновлення застосовується після завершення роботи NXLoad.", 224, 343, 828, gray);
+    text(app.small, "Оновлення встановиться автоматично після завершення черги.", 224, 343, 828, gray);
     text(app.small, app.update_target, 224, 374, 828, gray);
     text(app.normal, "A  Встановити", 224, 428, 396, blue);
     text(app.normal, "B  Пізніше", 656, 428, 390, gray);
@@ -2679,7 +2681,7 @@ int main(int argc, char **argv) {
         bool installed = apply_update(app.update_target, app.staged_update_sha);
         char arguments[sizeof(app.update_target) + 2];
         snprintf(arguments, sizeof(arguments), "\"%s\"", app.update_target);
-        if (!installed || !envHasNextLoad() || R_FAILED(envSetNextLoad(app.update_target, arguments))) {
+        if (!installed || (envHasNextLoad() && R_FAILED(envSetNextLoad(app.update_target, arguments)))) {
             consoleInit(NULL);
             puts(tr(installed ? "Оновлення встановлено. Відкрий цей файл у Homebrew Menu:" :
                                "Не вдалося встановити оновлення NXLoad. Перевір файл і його резервну копію:"));

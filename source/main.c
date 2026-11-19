@@ -69,6 +69,8 @@ typedef enum {
 #define TOP_HEIGHT 53
 #define SEARCH_X 929
 #define DOWNLOADS_X 1108
+#define HOME_SEARCH_X 976
+#define HOME_SEARCH_WIDTH (DOWNLOADS_X - HOME_SEARCH_X - 8)
 #define DOWNLOADS_BACK_X 1055
 #define DOWNLOADS_BACK_WIDTH 112
 #define SETTINGS_X 1175
@@ -310,19 +312,22 @@ static void icon_circle(int x, int y, int radius, int thickness, SDL_Color color
 static void draw_header(void) {
     const bool focused = !app.settings_open;
     const bool downloads = app.screen == DOWNLOADS;
-    if (focused && app.top_focus == TOP_SEARCH)
-        rect(downloads ? DOWNLOADS_BACK_X : SEARCH_X, TOP_Y,
-             downloads ? DOWNLOADS_BACK_WIDTH : 163, TOP_HEIGHT, selected);
+    const bool library = app.screen == LIBRARY;
+    if (focused && app.top_focus == TOP_SEARCH) {
+        const int x = downloads ? DOWNLOADS_BACK_X : library ? HOME_SEARCH_X : SEARCH_X;
+        const int width = downloads ? DOWNLOADS_BACK_WIDTH : library ? HOME_SEARCH_WIDTH : 163;
+        rect(x, TOP_Y, width, TOP_HEIGHT, selected);
+    }
     if (focused && app.top_focus == TOP_DOWNLOADS)
         rect(DOWNLOADS_X, TOP_Y, 57, TOP_HEIGHT, selected);
     if ((focused && app.top_focus == TOP_SETTINGS) || app.settings_open)
         rect(SETTINGS_X, TOP_Y, TOP_END - SETTINGS_X, TOP_HEIGHT, selected);
 
-    if (app.screen == LIBRARY && !app.settings_open) {
-        icon_circle(SEARCH_X + 19, 42, 8, 2, white);
+    if (library && !app.settings_open) {
+        icon_circle(HOME_SEARCH_X + 17, 42, 8, 2, white);
         for (int i = 0; i < 3; ++i)
-            SDL_RenderDrawLine(app.renderer, SEARCH_X + 24 + i, 47, SEARCH_X + 30 + i, 53);
-        text(app.normal, "Пошук", SEARCH_X + 44, 32, 105, white);
+            SDL_RenderDrawLine(app.renderer, HOME_SEARCH_X + 22 + i, 47, HOME_SEARCH_X + 28 + i, 53);
+        text(app.normal, "Пошук", HOME_SEARCH_X + 35, 32, HOME_SEARCH_WIDTH - 39, white);
     } else if (downloads) {
         right_text(app.normal, "‹ Назад", DOWNLOADS_BACK_X + 8, 32, DOWNLOADS_BACK_WIDTH - 16, white);
     } else {
@@ -1662,8 +1667,9 @@ static void touch_tap(int x, int y) {
         else if (downloads) {
             if (back_hit) input(HidNpadButton_B);
         } else if (x >= DOWNLOADS_X && x < SETTINGS_X) open_downloads();
-        else if (x >= SEARCH_X && x < DOWNLOADS_X)
-            input(app.screen == LIBRARY ? HidNpadButton_X : HidNpadButton_B);
+        else if (app.screen == LIBRARY) {
+            if (x >= HOME_SEARCH_X && x < HOME_SEARCH_X + HOME_SEARCH_WIDTH) input(HidNpadButton_X);
+        } else if (x >= SEARCH_X && x < DOWNLOADS_X) input(HidNpadButton_B);
         return;
     }
     if (app.screen == LIBRARY) {

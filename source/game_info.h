@@ -38,7 +38,7 @@ typedef struct {
 bool load_catalog_metadata(void);
 void free_catalog_metadata(void);
 void clean_catalog_title(char name[CATALOG_TEXT]);
-size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY]);
+size_t merge_catalogs(const CatalogIndex indexes[CATALOG_SOURCE_COUNT], CatalogEntry entries[MERGED_CAPACITY]);
 bool read_game_metadata(GameMetadata *metadata, const char *title, const char *heading);
 void load_game_gallery(GalleryJob *job);
 unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes);

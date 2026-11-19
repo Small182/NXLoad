@@ -223,7 +223,8 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
         t->text = strcasestr(line, "text/") || strcasestr(line, "html") || strcasestr(line, "json");
         t->binary = strcasestr(line, "application/octet-stream") ||
             strcasestr(line, "application/x-rar") || strcasestr(line, "application/vnd.rar") ||
-            strcasestr(line, "application/zip") || strcasestr(line, "application/x-7z") ||
+            strcasestr(line, "application/zip") || strcasestr(line, "application/x-zip-compressed") ||
+            strcasestr(line, "application/x-7z") ||
             ((t->job->dlarchive || t->job->romshq || t->job->datanodes) &&
                                   (strcasestr(line, "application/x-nsp") ||
                                     strcasestr(line, "application/force-download")));

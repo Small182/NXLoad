@@ -12,13 +12,13 @@
 #define CATALOG_TEXT 192
 #define CATALOG_PAGE_GAMES 64
 #define CATALOG_CAPACITY 8192
-#define MERGED_CAPACITY (2 * CATALOG_CAPACITY)
+#define MERGED_CAPACITY (CATALOG_SOURCE_COUNT * CATALOG_CAPACITY)
 #define CATALOG_MAX_PAGES 512
 #define CATALOG_CACHE_TTL (24 * 60 * 60)
 #define CATALOG_FILE_COUNT 24
 #define CATALOG_SCREENSHOTS 32
 
-typedef enum { CATALOG_NSROMS, CATALOG_ROMSHQ } CatalogSource;
+typedef enum { CATALOG_NSROMS, CATALOG_ROMSHQ, CATALOG_ROMSNS, CATALOG_SOURCE_COUNT } CatalogSource;
 typedef enum { FILE_DLARCHIVE, FILE_ROMSHQ_SIGNED, FILE_DATANODES, FILE_1FICHIER } GameFileSource;
 
 typedef struct {
@@ -33,7 +33,7 @@ typedef struct {
 } CatalogMetadata;
 
 typedef struct {
-    const Game *games[2];
+    const Game *games[CATALOG_SOURCE_COUNT];
     const CatalogMetadata *metadata;
 } CatalogEntry;
 
@@ -43,6 +43,7 @@ typedef struct {
     char url[CATALOG_URL];
     GameFileSource source;
     char size[32];
+    bool size_checked;
 } GameFile;
 
 typedef struct {
@@ -87,6 +88,8 @@ typedef struct {
     char error[CATALOG_TEXT];
 } CatalogIndexJob;
 
+bool catalog_can_probe_size(const GameFile *file);
+void catalog_probe_size(GameFile *file, atomic_bool *cancel);
 void catalog_request(CatalogJob *job);
 void catalog_build_index(CatalogIndexJob *job);
 bool catalog_read_cache(CatalogIndex *index, CatalogSource source);

@@ -4,11 +4,13 @@
 
 ## Українська
 
-**NXLoad** — homebrew-каталог і менеджер завантажень для Nintendo Switch. Є пошук, вибране, скриншоти, черга завантажень, розпакування RAR та встановлення сумісних NSP на microSD. Інтерфейс доступний українською й англійською. Інший проєкт автора — [UAPlay для Nintendo Switch](https://github.com/Small182/UAPlay-nx).
+**NXLoad** — homebrew-каталог і менеджер завантажень для Nintendo Switch. Є пошук, вибране, скриншоти, черга завантажень, розпакування RAR і ZIP та встановлення сумісних NSP на microSD. Інтерфейс доступний українською й англійською. Інший проєкт автора — [UAPlay для Nintendo Switch](https://github.com/Small182/UAPlay-nx).
 
 **Встановлення.** Завантаж `NXLoad.nro` з [Releases](https://github.com/Small182/NXLoad/releases/latest), скопіюй у `switch/` на microSD та відкрий у Homebrew Menu. Завантажені файли зберігаються в `switch/nxload/downloads/`.
 
 **Оновлення.** За замовчуванням NXLoad перевіряє стабільні GitHub Releases без токена. Щоб отримувати збірки з комітів гілки `native-1fichier`, збережи fine-grained токен із дозволом **Actions: Read** для цього репозиторію у `switch/nxload/github-token.txt` на microSD. Після підтвердження оновлення встановлюється автоматично, коли черга завершена.
+
+**Файли.** Збірки з комітів додають до спільного каталогу ROMsNS. На вкладці «Файли» показуються доступні розміри, зокрема розміри, отримані з метаданих DLArchive.
 
 **Медіа.** У збірках з комітів вкладка «Медіа» показує скриншоти й пропонує трейлери, коли для гри знайдено відео в американському Nintendo Store. Натисни X або торкнися кнопки «Трейлери», щоб відкрити відео на весь екран.
 
@@ -16,11 +18,13 @@
 
 ## English
 
-**NXLoad** is a homebrew catalog and download manager for Nintendo Switch. It includes search, favorites, screenshots, a download queue, RAR extraction, and installation of supported NSP packages to microSD. The interface is available in English and Ukrainian. See also the author's [UAPlay for Nintendo Switch](https://github.com/Small182/UAPlay-nx).
+**NXLoad** is a homebrew catalog and download manager for Nintendo Switch. It includes search, favorites, screenshots, a download queue, RAR and ZIP extraction, and installation of supported NSP packages to microSD. The interface is available in English and Ukrainian. See also the author's [UAPlay for Nintendo Switch](https://github.com/Small182/UAPlay-nx).
 
 **Installation.** Download `NXLoad.nro` from [Releases](https://github.com/Small182/NXLoad/releases/latest), copy it to `switch/` on the microSD card, and open it from the Homebrew Menu. Downloads are saved in `switch/nxload/downloads/`.
 
 **Updates.** NXLoad checks stable GitHub Releases by default and needs no token for that channel. To get commit builds from the `native-1fichier` branch, save a fine-grained GitHub token with **Actions: Read** for this repository to `switch/nxload/github-token.txt` on the microSD card. After you confirm an update, it installs automatically when the queue finishes.
+
+**Files.** Commit builds include ROMsNS in the merged catalog. The Files tab displays available download sizes, including sizes returned by DLArchive metadata.
 
 **Media.** In commit builds, the Media tab displays screenshots and offers trailers when the US Nintendo Store has a video for the game. Press X or tap Trailers to start full-screen playback.
 
@@ -28,7 +32,7 @@
 
 | Джерело / Source | Використання / Use |
 | --- | --- |
-| [NSRoms](https://nsroms.net/) · [ROMsHQ](https://romshq.com/) | Каталоги, обкладинки й список файлів. ROMsHQ також надає галереї та вбудований знімок каталогу. / Catalogs, covers and file listings. ROMsHQ also supplies galleries and the bundled catalog snapshot. |
+| [NSRoms](https://nsroms.net/) · [ROMsHQ](https://romshq.com/) · [ROMsNS](https://romsns.com/) | Каталоги, обкладинки й список файлів. ROMsHQ також надає галереї та вбудований знімок каталогу. / Catalogs, covers and file listings. ROMsHQ also supplies galleries and the bundled catalog snapshot. |
 | [DLArchive](https://drive.dlarchive.my.id/) · [DataNodes](https://datanodes.to/) · [1fichier](https://1fichier.com/) · [MegaUp](https://megaup.net/) · [NSWGF](https://nswgf.com/) | Файлові хости, дзеркала та обробники посилань у коді. / File hosts, mirrors, and source-specific link handlers in the codebase. |
 | [Nintendo Life](https://www.nintendolife.com/games) | Метадані, оцінки читачів, обкладинки й скриншоти. Вбудовані галереї 1-2-Switch та MySims Cozy Bundle використовують зображення Nintendo Life. / Metadata, reader ratings, covers and screenshots. The bundled 1-2-Switch and MySims Cozy Bundle galleries use Nintendo Life images. |
 | [TitleDB](https://github.com/blawar/titledb) · [Nintendo eShop](https://www.nintendo.com/store/games/) | Ідентифікатори, описи, жанри, дати, відомості про студії, зображення та відео з галерей Nintendo Store. / Identifiers, descriptions, genres, dates, studio information, and images and videos from Nintendo Store galleries. |

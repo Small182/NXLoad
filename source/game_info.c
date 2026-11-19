@@ -213,12 +213,13 @@ static int compare_merge_key(const void *a, const void *b) {
     return (left->index > right->index) - (left->index < right->index);
 }
 
-size_t merge_catalogs(const CatalogIndex indexes[2], CatalogEntry entries[MERGED_CAPACITY]) {
-    size_t total = indexes[CATALOG_NSROMS].count + indexes[CATALOG_ROMSHQ].count;
+size_t merge_catalogs(const CatalogIndex indexes[CATALOG_SOURCE_COUNT], CatalogEntry entries[MERGED_CAPACITY]) {
+    size_t total = 0;
+    for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) total += indexes[source].count;
     if (!total) return 0;
     MergeKey *keys = malloc(total * sizeof(*keys));
     size_t count = 0;
-    for (unsigned source = 0; source < 2; ++source) {
+    for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) {
         for (size_t i = 0; i < indexes[source].count; ++i) {
             const Game *game = &indexes[source].games[i];
             const CatalogMetadata *metadata = find_catalog_metadata(game);

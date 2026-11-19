@@ -29,17 +29,19 @@ bool package_name(const char *name) {
                    !strcasecmp(ext, ".nsz") || !strcasecmp(ext, ".xcz"));
 }
 
-bool rar_name(const char *name) {
+bool archive_name(const char *name) {
     const char *ext = strrchr(name, '.');
-    return ext && !strcasecmp(ext, ".rar");
+    return ext && (!strcasecmp(ext, ".rar") || !strcasecmp(ext, ".zip"));
 }
 
-bool rar_signature(const char *path) {
+bool archive_signature(const char *path) {
     unsigned char signature[8];
     FILE *file = fopen(path, "rb");
     if (!file) return false;
     size_t size = fread(signature, 1, sizeof(signature), file);
     fclose(file);
+    if (size >= 4 && (!memcmp(signature, "PK\x03\x04", 4) || !memcmp(signature, "PK\x05\x06", 4)))
+        return true;
     return size >= 7 && !memcmp(signature, "Rar!\x1a\x07", 6) &&
            (signature[6] == 0 || (size == 8 && signature[6] == 1 && signature[7] == 0));
 }
@@ -118,7 +120,7 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
         la_ssize_t bytes = archive_read_data(reader, buffer, 256 * 1024);
         if (!bytes) break;
         if (bytes < 0 || (uint64_t)bytes > size - written) {
-            error = "RAR пошкоджений, неповний або потребує іншого тому";
+            error = "Архів пошкоджений, неповний або потребує іншого тому";
             break;
         }
         if (fwrite(buffer, 1, (size_t)bytes, file) != (size_t)bytes) {
@@ -129,13 +131,13 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
         atomic_fetch_add(&job->received, (uint64_t)bytes);
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
-    if (!error && written != size) error = "Пакет у RAR неповний";
+    if (!error && written != size) error = "Пакет в архіві неповний";
     if (fclose(file) != 0 && !error)
         error = nxload_storage_error(errno, "Не вдалося зберегти розпакований пакет");
     return error;
 }
 
-const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
+const char *unpack_archive(FichierJob *job, const char *path, const char *directory,
                        UnpackedPackages *packages) {
     job->tls_detail[0] = 0;
     atomic_store(&job->unpacking, true);
@@ -143,15 +145,16 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
     atomic_store(&job->total, 0);
     atomic_store(&job->streams, 0);
     struct archive *reader = archive_read_new();
-    ExtractedFile *outputs = calloc(RAR_PACKAGE_LIMIT, sizeof(*outputs));
+    ExtractedFile *outputs = calloc(ARCHIVE_PACKAGE_LIMIT, sizeof(*outputs));
     unsigned char *buffer = malloc(256 * 1024);
     const char *error = "Не вдалося підготувати розархіватор";
     size_t count = 0;
     if (!reader || !outputs || !buffer) goto done;
     if (archive_read_support_format_rar(reader) != ARCHIVE_OK ||
         archive_read_support_format_rar5(reader) != ARCHIVE_OK ||
+        archive_read_support_format_zip_seekable(reader) != ARCHIVE_OK ||
         archive_read_open_filename(reader, path, 256 * 1024) != ARCHIVE_OK) {
-        error = "Не вдалося відкрити RAR";
+        error = "Не вдалося відкрити архів";
         goto done;
     }
 
@@ -164,36 +167,36 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
         if (!path_in_archive || !package_name(path_in_archive)) continue;
         unsigned type = archive_entry_filetype(entry);
         if (archive_entry_symlink(entry) || archive_entry_hardlink(entry)) {
-            error = "У RAR пакет є посиланням";
-            entry_detail(job, "RAR LINK", path_in_archive);
+            error = "В архіві пакет є посиланням";
+            entry_detail(job, "ARCHIVE LINK", path_in_archive);
             break;
         }
         if (type == AE_IFDIR) continue;
         if (type != AE_IFREG) {
-            error = "Непідтримуваний тип пакета в RAR";
+            error = "Непідтримуваний тип пакета в архіві";
             char reason[32];
-            snprintf(reason, sizeof(reason), "RAR TYPE %o", type);
+            snprintf(reason, sizeof(reason), "ARCHIVE TYPE %o", type);
             entry_detail(job, reason, path_in_archive);
             break;
         }
         if (archive_entry_is_encrypted(entry) > 0) {
-            error = "Пакет у RAR захищений паролем";
+            error = "Пакет в архіві захищений паролем";
             break;
         }
-        if (count >= RAR_PACKAGE_LIMIT) {
-            error = "Забагато пакетів в одному RAR";
+        if (count >= ARCHIVE_PACKAGE_LIMIT) {
+            error = "Забагато пакетів в одному архіві";
             break;
         }
         la_int64_t length = archive_entry_size(entry);
         if (length <= 0) {
-            error = "У RAR некоректний розмір пакета";
+            error = "В архіві некоректний розмір пакета";
             break;
         }
 
         ExtractedFile *output = &outputs[count];
         if (!entry_name(path_in_archive, output->name, sizeof(output->name))) {
-            error = "Неприпустимий шлях пакета в RAR";
-            entry_detail(job, "RAR PATH", path_in_archive);
+            error = "Неприпустимий шлях пакета в архіві";
+            entry_detail(job, "ARCHIVE PATH", path_in_archive);
             break;
         }
         int size = snprintf(output->destination, sizeof(output->destination), "%s/%s", directory, output->name);
@@ -202,7 +205,7 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
             break;
         }
         for (size_t i = 0; i < count; ++i)
-            if (!strcasecmp(outputs[i].name, output->name)) error = "У RAR повторюється назва пакета";
+            if (!strcasecmp(outputs[i].name, output->name)) error = "В архіві повторюється назва пакета";
         if (error) break;
 
         size = snprintf(output->temporary, sizeof(output->temporary), "%s/.nxload-XXXXXX", directory);
@@ -216,8 +219,8 @@ const char *unpack_rar(FichierJob *job, const char *path, const char *directory,
         if (error) break;
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
-    if (!error && status != ARCHIVE_EOF) error = "RAR пошкоджений, неповний або захищений";
-    if (!error && !count) error = "У RAR немає пакета NSP, XCI, NSZ або XCZ";
+    if (!error && status != ARCHIVE_EOF) error = "Архів пошкоджений, неповний або захищений";
+    if (!error && !count) error = "В архіві немає пакета NSP, XCI, NSZ або XCZ";
     for (size_t i = 0; !error && i < count; ++i) {
         ExtractedFile *output = &outputs[i];
         if (!unused_path(output->destination) || rename(output->temporary, output->destination)) {

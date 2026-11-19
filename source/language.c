@@ -57,6 +57,7 @@ static const struct {
     {"Введи назву гри", "Enter a game title"},
     {"Вже встановлено актуальну збірку NXLoad", "NXLoad is up to date"},
     {"Вибране", "Favorites"},
+    {"Видавець · %s", "Publisher · %s"},
     {"Видалити файл?", "Delete this file?"},
     {"Видаляти NSP після встановлення", "Delete NSP after installation"},
     {"Видаляти RAR після розпакування", "Delete RAR after extraction"},

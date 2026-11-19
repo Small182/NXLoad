@@ -2309,10 +2309,12 @@ static void draw_cover(void) {
                  date / 10000, date / 100 % 100, date % 100);
     else strcpy(release, "Дата виходу · —");
     text(app.small, release, 65, 493, 293, gray);
-    char developer[CATALOG_TEXT + 32];
-    snprintf(developer, sizeof(developer), tr("Розробник · %s"),
-             app.metadata.developer[0] ? app.metadata.developer : "—");
-    text(app.small, developer, 65, 526, 293, gray);
+    char studio[CATALOG_TEXT + 32];
+    bool show_publisher = !app.metadata.developer[0] && app.metadata.publisher[0];
+    const char *name = show_publisher ? app.metadata.publisher : app.metadata.developer;
+    snprintf(studio, sizeof(studio), tr(show_publisher ? "Видавець · %s" : "Розробник · %s"),
+             *name ? name : "—");
+    text(app.small, studio, 65, 526, 293, gray);
 }
 
 static void draw_game_overview(void) {

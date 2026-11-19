@@ -2574,7 +2574,7 @@ static void draw(void) {
         text(app.small, app.queue_focus ? "X  Прибрати з черги" : "X  Видалити файл", 455, 665, 225, gray);
         if (app.download_busy) text(app.small, "Y  Скасувати", 685, 665, 190, gray);
         text(app.small, "B  Назад", 880, 665, DOWNLOADS_DIM_X - 880, gray);
-        text(app.small, "−  Затемнити екран", DOWNLOADS_DIM_X, 665, TOP_END - DOWNLOADS_DIM_X, gray);
+        text(app.small, "−  Вимкнути екран", DOWNLOADS_DIM_X, 665, TOP_END - DOWNLOADS_DIM_X, gray);
     }
     if (app.filters_open) draw_filters();
     if (update_dialog_visible()) draw_update_dialog();

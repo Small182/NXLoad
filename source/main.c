@@ -1777,6 +1777,12 @@ static bool poll_touch(bool controller_input) {
     static DragArea area;
     HidTouchScreenState state;
     if (!hidGetTouchScreenStates(&state, 1)) return false;
+    if (app.dimmed && state.count && !controller_input) {
+        app.dimmed = false;
+        touching = dragged = false;
+        cancelled = true;
+        return true;
+    }
     if (state.count > 1 || (controller_input && state.count)) cancelled = true;
     if (state.count == 1 && !cancelled) {
         int previous_y = y;
@@ -1811,6 +1817,10 @@ static bool poll_touch(bool controller_input) {
 
 static void input(u64 buttons) {
     if (!buttons) return;
+    if (app.dimmed) {
+        if (buttons & HidNpadButton_Minus) app.dimmed = false;
+        return;
+    }
     if (update_dialog_visible()) {
         if (buttons & HidNpadButton_A) respond_to_update(true);
         else if (buttons & HidNpadButton_B) respond_to_update(false);
@@ -1855,7 +1865,7 @@ static void input(u64 buttons) {
         return;
     }
     if (!app.filters_open && (buttons & HidNpadButton_Minus)) {
-        if (app.screen == DOWNLOADS) app.dimmed = !app.dimmed;
+        if (app.screen == DOWNLOADS) app.dimmed = true;
         else toggle_settings();
         return;
     }
@@ -2441,6 +2451,12 @@ static void draw_update_dialog(void) {
 }
 
 static void draw(void) {
+    if (app.dimmed) {
+        SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
+        SDL_RenderClear(app.renderer);
+        SDL_RenderPresent(app.renderer);
+        return;
+    }
     if (app.fullscreen_shot) {
         rect(0, 0, 1280, 720, (SDL_Color){0, 0, 0, 255});
         draw_game_screenshots();
@@ -2471,7 +2487,7 @@ static void draw(void) {
         text(app.small, app.queue_focus ? "X  Прибрати з черги" : "X  Видалити файл", 455, 665, 225, gray);
         if (app.download_busy) text(app.small, "Y  Скасувати", 685, 665, 190, gray);
         text(app.small, "B  Назад", 880, 665, 175, gray);
-        text(app.small, app.dimmed ? "−  Освітлити екран" : "−  Приглушити екран", 1060, 665, 180, gray);
+        text(app.small, "−  Чорний екран", 1060, 665, 180, gray);
     }
     if (app.filters_open) draw_filters();
     if (update_dialog_visible()) draw_update_dialog();
@@ -2497,11 +2513,6 @@ static void draw(void) {
         text(app.normal, app.delete_file, 224, 298, 828, white);
         text(app.normal, "A  Видалити", 224, 428, 396, blue);
         text(app.normal, "B  Скасувати", 656, 428, 390, gray);
-    }
-    if (app.screen == DOWNLOADS && app.dimmed) {
-        SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_BLEND);
-        rect(0, 0, 1280, 720, (SDL_Color){0, 0, 0, 205});
-        SDL_SetRenderDrawBlendMode(app.renderer, SDL_BLENDMODE_NONE);
     }
     SDL_RenderPresent(app.renderer);
 }

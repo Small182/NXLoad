@@ -88,4 +88,15 @@ jobs:
           tag="v$version"
           notes=".github/release-notes/$tag.md"
           test -s "$notes"
-          gh release create "$tag" release/NXLoad.nro --target "$GITHUB_SHA" --title "NXLoad $version" --notes-file "$notes" --latest
+          assets=(release/NXLoad.nro)
+          nsp_source=$(git log -1 --format='%(trailers:key=NXLoad-NSP-From,valueonly)')
+          if [[ -n "$nsp_source" ]]; then
+            [[ "$nsp_source" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            nsp_digest=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$nsp_source" \
+              --jq '.assets[] | select(.name == "NXLoad.nsp") | .digest')
+            [[ "$nsp_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            gh release download "$nsp_source" --pattern NXLoad.nsp --dir release
+            printf '%s  %s\n' "${nsp_digest#sha256:}" release/NXLoad.nsp | sha256sum --check
+            assets+=(release/NXLoad.nsp)
+          fi
+          gh release create "$tag" "${assets[@]}" --target "$GITHUB_SHA" --title "NXLoad $version" --notes-file "$notes" --latest

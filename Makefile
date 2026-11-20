@@ -16,14 +16,15 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D
 LDFLAGS := -specs=$(LIBNX)/switch.specs $(ARCH)
 PKG_CONFIG := $(PORTLIBS)/bin/aarch64-none-elf-pkg-config
 PORT_PACKAGES := mpv sdl2 SDL2_ttf SDL2_image libxml-2.0 libarchive
-PORT_LIBS := $(shell $(PKG_CONFIG) --static --libs $(PORT_PACKAGES))
+NXLOAD_NETWORK := $(TOPDIR)/.nxdeps/install
+PORT_LIBS := $(filter-out -larchive,$(shell PKG_CONFIG_PATH="$(NXLOAD_NETWORK)/lib/pkgconfig" $(PKG_CONFIG) --static --libs $(PORT_PACKAGES)))
+ARCHIVE_LIB := $(NXLOAD_NETWORK)/lib/libarchive.a
 TITLEDB := $(TOPDIR)/romfs/titledb.bin
 CATALOG_META := $(TOPDIR)/romfs/catalog-meta.tsv
 ROMSHQ_SEED := $(TOPDIR)/romfs/romshq.tsv.gz
 GALLERIES := $(TOPDIR)/romfs/gallery/.ready
-NXLOAD_NETWORK := $(TOPDIR)/.nxdeps/install
 NETWORK_LIBS := $(addprefix $(NXLOAD_NETWORK)/lib/,libcurl.a libmbedtls.a libmbedx509.a libmbedcrypto.a)
-LIBS := $(NETWORK_LIBS) $(PORT_LIBS) -lGLESv2 -lz -lnx -lm
+LIBS := $(NETWORK_LIBS) $(ARCHIVE_LIB) $(PORT_LIBS) -lGLESv2 -lz -lnx -lm
 
 ifeq ($(TOPDIR),$(CURDIR))
 export TOPDIR
@@ -52,6 +53,6 @@ else
 OFILES := main.o catalog.o game_info.o cover_cache.o fichier.o unpack.o install.o updater.o settings.o language.o range.o tls_platform.o trailers.o
 all: $(OUTPUT).nro
 $(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(TITLEDB) $(CATALOG_META) $(GALLERIES) $(ROMSHQ_SEED)
-$(OUTPUT).elf: $(OFILES)
+$(OUTPUT).elf: $(OFILES) $(ARCHIVE_LIB)
 -include $(addprefix $(DEPSDIR)/,$(OFILES:.o=.d))
 endif

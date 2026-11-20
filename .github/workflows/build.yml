@@ -34,6 +34,8 @@ jobs:
           fi
       - name: Build curl and Mbed TLS for Switch
         run: bash tools/build-network.sh
+      - name: Build libarchive with 7z codec support
+        run: bash tools/build-archive.sh
       - run: make -j2
       - name: Check DLArchive TLS chain
         continue-on-error: true

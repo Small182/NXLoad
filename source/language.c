@@ -202,6 +202,7 @@ static const struct {
     {"Неприпустимий шлях файлу порту", "Invalid path for a port file"},
     {"Непідтримувана платформа в CNMT", "Unsupported platform in the CNMT"},
     {"Непідтримуваний Title ID у CNMT", "Unsupported Title ID in the CNMT"},
+    {"Непідтримуваний метод стиснення switch.7z", "Unsupported compression method in switch.7z"},
     {"Непідтримуваний тип вмісту в CNMT", "Unsupported content type in the CNMT"},
     {"Непідтримуваний тип пакета в архіві", "Unsupported package entry type in the archive"},
     {"Номер цієї збірки невідомий. Встанови актуальний NXLoad.nro вручну.", "This build number is unknown. Install the latest NXLoad.nro manually."},

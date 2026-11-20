@@ -330,9 +330,16 @@ static const char *unpack_port_7z(FichierJob *job, const char *path, const char 
     if (!error && assets->count == start) error = "У switch.7z немає файлів порту";
 
 done:
-    if (error && !job->tls_detail[0]) {
+    if (error) {
         const char *detail = archive_error_string(reader);
-        if (detail && *detail) entry_detail(job, "switch.7z", detail);
+        if (detail && *detail) {
+            if (!atomic_load(&job->cancelled) &&
+                (strstr(detail, "Unexpected codec ID") || strstr(detail, "Unknown codec ID") ||
+                 strstr(detail, "codec is unsupported") || strstr(detail, "Unsupported codec") ||
+                 strstr(detail, "Unsupported filter")))
+                error = "Непідтримуваний метод стиснення switch.7z";
+            if (!job->tls_detail[0]) entry_detail(job, "switch.7z", detail);
+        }
     }
     archive_read_free(reader);
     return error;

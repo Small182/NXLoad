@@ -53,5 +53,6 @@
 
 ```sh
 bash tools/build-network.sh
+bash tools/build-archive.sh
 make
 ```

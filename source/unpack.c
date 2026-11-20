@@ -19,10 +19,12 @@
 
 #define OUTPUT_PATH 320
 #define COPY_BUFFER (256 * 1024)
+#define BACKUP_SUFFIX ".previous"
+#define BACKUP_PATH (OUTPUT_PATH + sizeof(BACKUP_SUFFIX))
 
 typedef struct {
     char name[160], temporary[OUTPUT_PATH], destination[OUTPUT_PATH];
-    bool published;
+    bool published, backed_up;
 } ExtractedFile;
 
 typedef struct {
@@ -174,14 +176,50 @@ static bool same_output(const ExtractedFile *output, unsigned char *buffer, atom
     return same && !remaining && !atomic_load(cancel);
 }
 
-static void clean_outputs(ExtractedFile *outputs, size_t count, bool rollback) {
-    for (size_t i = 0; i < count; ++i) {
-        ExtractedFile *output = &outputs[i];
-        if (output->published) {
-            if (rollback) unlink(output->destination);
-        } else if (output->temporary[0]) unlink(output->temporary);
+static void backup_path(char path[BACKUP_PATH], const ExtractedFile *output) {
+    snprintf(path, BACKUP_PATH, "%s" BACKUP_SUFFIX, output->temporary);
+}
+
+static void clean_outputs(ExtractedFile *outputs, size_t count, const char **error, FichierJob *job) {
+    bool rollback = *error != NULL;
+    // Reverse publication order so repeated paths recover their original contents.
+    while (count) {
+        ExtractedFile *output = &outputs[--count];
+        bool removed = !rollback || !output->published ||
+                       !unlink(output->destination) || errno == ENOENT;
+        if (output->backed_up) {
+            char backup[BACKUP_PATH];
+            backup_path(backup, output);
+            if (!rollback) unlink(backup);
+            else if (!removed || rename(backup, output->destination)) {
+                *error = "Не вдалося відновити файл порту. Резервну копію збережено.";
+                entry_detail(job, "BACKUP", backup);
+            }
+        }
+        if (!output->published && output->temporary[0]) unlink(output->temporary);
     }
     free(outputs);
+}
+
+static const char *publish_port_asset(ExtractedFile *output, FichierJob *job, unsigned char *buffer) {
+    if (atomic_load(&job->cancelled)) return "Розпакування скасовано";
+    if (!port_parent_directories(output->destination)) return "Не вдалося створити папку для файлів порту";
+    struct stat existing;
+    if (!lstat(output->destination, &existing)) {
+        if (!S_ISREG(existing.st_mode)) return "Шлях файлу порту зайнятий папкою або посиланням";
+        if (same_output(output, buffer, &job->cancelled)) return NULL;
+        if (atomic_load(&job->cancelled)) return "Розпакування скасовано";
+
+        char backup[BACKUP_PATH];
+        backup_path(backup, output);
+        if (rename(output->destination, backup)) return "Не вдалося зберегти попередній файл порту";
+        output->backed_up = true;
+    } else if (errno != ENOENT) {
+        return "Не вдалося скопіювати файл порту на microSD";
+    }
+    if (rename(output->temporary, output->destination)) return "Не вдалося скопіювати файл порту на microSD";
+    output->published = true;
+    return NULL;
 }
 
 static const char *write_entry(struct archive *reader, FichierJob *job, ExtractedFile *output,
@@ -470,18 +508,7 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
     if (!error && assets.count) atomic_store(&job->copying_port_files, true);
     for (size_t i = 0; !error && i < assets.count; ++i) {
         ExtractedFile *output = &assets.files[i];
-        if (atomic_load(&job->cancelled)) {
-            error = "Розпакування скасовано";
-        } else if (!port_parent_directories(output->destination)) {
-            error = "Не вдалося створити папку для файлів порту";
-        } else if (!unused_path(output->destination)) {
-            if (same_output(output, buffer, &job->cancelled)) continue;
-            error = "Файл порту вже існує й відрізняється від файлу в архіві";
-        } else if (rename(output->temporary, output->destination)) {
-            error = "Не вдалося скопіювати файл порту на microSD";
-        } else {
-            output->published = true;
-        }
+        error = publish_port_asset(output, job, buffer);
         if (error) entry_detail(job, "SWITCH", output->destination);
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
@@ -500,8 +527,8 @@ done:
         for (size_t i = 0; i < count; ++i)
             strcpy(packages->paths[i], outputs[i].destination);
     }
-    clean_outputs(assets.files, assets.count, error != NULL);
-    clean_outputs(outputs, count, error != NULL);
+    clean_outputs(assets.files, assets.count, &error, job);
+    clean_outputs(outputs, count, &error, job);
     if (staged) rmdir(staging);
     atomic_store(&job->copying_port_files, false);
     free(buffer);

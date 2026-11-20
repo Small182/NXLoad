@@ -204,6 +204,7 @@ typedef struct {
     int update_line_count, update_details_scroll;
     char query[96], notice[192], delete_file[sizeof(((SavedFile *)0)->file)];
     char installer_file[sizeof(((SavedFile *)0)->file)];
+    char installer_reason[192];
     const char *installer_error;
     DownloadRequest active_transfer, draft_transfer, queue[DOWNLOAD_QUEUE_LIMIT];
     size_t queue_count, queue_index;
@@ -1295,9 +1296,10 @@ static void pump_index(void) {
 
 static void launch_next_transfer(void);
 
-static void offer_installer(const char *filename) {
+static void offer_installer(const char *filename, const char *reason) {
     if (app.confirm_install) return;
     snprintf(app.installer_file, sizeof(app.installer_file), "%s", filename);
+    snprintf(app.installer_reason, sizeof(app.installer_reason), "%s", reason ? tr(reason) : "");
     app.installer_error = NULL;
     app.confirm_install = true;
 }
@@ -1356,7 +1358,7 @@ static void finish_jobs(void) {
         if (app.active_transfer.app_update)
             snprintf(app.update_notice, sizeof(app.update_notice), "%s", tr(app.download.result));
         if (app.download.dbi_file[0] && !atomic_load(&app.download.cancelled))
-            offer_installer(app.download.dbi_file);
+            offer_installer(app.download.dbi_file, app.download.result);
         refresh_saved();
         if (app.queue_count && !app.active_transfer.app_update)
             snprintf(app.notice, sizeof(app.notice), tr("Попереднє: %.170s"), tr(app.download.result));
@@ -2379,7 +2381,7 @@ static void input(u64 buttons) {
         else app.saved_index = move(app.saved_index, app.saved_count, buttons);
         if ((buttons & HidNpadButton_ZL) && !app.queue_focus && app.saved_count &&
             !app.download_busy && !app.queue_count) {
-            offer_installer(app.saved[app.saved_index].file);
+            offer_installer(app.saved[app.saved_index].file, NULL);
             return;
         }
         if (buttons & HidNpadButton_X) {
@@ -2392,7 +2394,7 @@ static void input(u64 buttons) {
             const char *selected_file = app.saved[app.saved_index].file;
             if (saved_archive(selected_file)) start_saved(selected_file, true);
             else if (saved_installable(selected_file)) start_saved(selected_file, false);
-            else if (!app.download_busy && !app.queue_count) offer_installer(selected_file);
+            else if (!app.download_busy && !app.queue_count) offer_installer(selected_file, NULL);
             else strcpy(app.notice, "DBI можна відкрити після завершення черги");
         }
         return;
@@ -3101,11 +3103,12 @@ static void draw_installer_dialog(void) {
     rect(190, 200, 900, 305, selected);
     text(app.large, "Відкрити встановлювач DBI?", 224, 230, 828, white);
     text(app.normal, app.installer_file, 224, 298, 828, white);
+    text(app.small, app.installer_reason, 224, 336, 828, gray);
     char guide[148];
     snprintf(guide, sizeof(guide), "%s%s", tr("У DBI відкрий Browse SD Card → "), NXLOAD_DOWNLOAD_RELATIVE);
     const char *hint = busy ? "DBI можна відкрити після завершення черги" :
                        app.installer_error ? app.installer_error : guide;
-    text(app.small, hint, 224, 355, 828, gray);
+    text(app.small, hint, 224, app.installer_reason[0] ? 377 : 355, 828, gray);
     text(app.normal, "A  Відкрити DBI", 224, 428, 396, busy ? gray : blue);
     text(app.normal, "B  Назад", 656, 428, 390, gray);
 }

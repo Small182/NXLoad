@@ -3,6 +3,7 @@
 #include "install.h"
 
 #include <switch.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,7 +42,7 @@ typedef struct {
     u32 version;
     u8 type, platform;
     u16 extended_size, contents, dependencies;
-    u8 attributes, storage, install_type, committed;
+    u8 attributes, reserved_attributes[3];
     u32 required_download_version;
     u8 reserved[4];
 } PackagedMeta;
@@ -279,31 +280,31 @@ static Result register_content(NcmContentStorage *sd, PackageEntry *entry) {
     return rc;
 }
 
-static unsigned char *read_cnmt(NcmContentStorage *sd, const PackageEntry *meta,
-                                size_t *size, Result *rc) {
+static const char *read_cnmt(NcmContentStorage *sd, const PackageEntry *meta,
+                             unsigned char **data, size_t *size, FichierJob *job) {
     char path[FS_MAX_PATH];
-    *rc = ncmContentStorageGetPath(sd, path, sizeof(path), &meta->id);
-    if (R_FAILED(*rc)) return NULL;
+    Result rc = ncmContentStorageGetPath(sd, path, sizeof(path), &meta->id);
+    if (R_FAILED(rc)) return service_error(job, "Не вдалося прочитати CNMT", rc);
 
     FsFileSystem fs;
-    *rc = fsOpenFileSystemWithId(&fs, 0, FsFileSystemType_ContentMeta, path, FsContentAttributes_All);
-    if (R_FAILED(*rc)) return NULL;
+    rc = fsOpenFileSystemWithId(&fs, 0, FsFileSystemType_ContentMeta, path, FsContentAttributes_All);
+    if (R_FAILED(rc)) return service_error(job, "Не вдалося прочитати CNMT", rc);
 
     FsDir dir;
     FsDirectoryEntry item;
     s64 count = 0;
-    bool found = false;
-    *rc = fsFsOpenDirectory(&fs, "/", FsDirOpenMode_ReadFiles, &dir);
-    if (R_SUCCEEDED(*rc)) {
-        while (R_SUCCEEDED(*rc = fsDirRead(&dir, &count, 1, &item)) && count == 1) {
+    const char *error = NULL;
+    path[0] = 0;
+    rc = fsFsOpenDirectory(&fs, "/", FsDirOpenMode_ReadFiles, &dir);
+    if (R_SUCCEEDED(rc)) {
+        while (R_SUCCEEDED(rc = fsDirRead(&dir, &count, 1, &item)) && count == 1) {
             if (!ends_with(item.name, ".cnmt")) continue;
-            if (found) {
-                found = false;
+            if (path[0]) {
+                error = "У метаданих пакета є кілька файлів CNMT";
                 break;
             }
-            found = true;
             if (strlen(item.name) >= sizeof(path) - 1) {
-                found = false;
+                error = "Назва файлу CNMT задовга";
                 break;
             }
             path[0] = '/';
@@ -311,53 +312,64 @@ static unsigned char *read_cnmt(NcmContentStorage *sd, const PackageEntry *meta,
         }
         fsDirClose(&dir);
     }
-    unsigned char *data = NULL;
-    if (found && R_SUCCEEDED(*rc)) {
+    if (!error && R_SUCCEEDED(rc) && !path[0]) error = "У метаданих пакета немає файлу CNMT";
+    if (!error && R_SUCCEEDED(rc)) {
         FsFile f;
-        *rc = fsFsOpenFile(&fs, path, FsOpenMode_Read, &f);
-        if (R_SUCCEEDED(*rc)) {
+        rc = fsFsOpenFile(&fs, path, FsOpenMode_Read, &f);
+        if (R_SUCCEEDED(rc)) {
             s64 bytes = 0;
-            *rc = fsFileGetSize(&f, &bytes);
-            if (R_SUCCEEDED(*rc) && bytes >= (s64)sizeof(PackagedMeta) && bytes <= CNMT_LIMIT) {
-                data = malloc((size_t)bytes);
-                if (data) {
+            rc = fsFileGetSize(&f, &bytes);
+            if (R_SUCCEEDED(rc)) {
+                if (bytes < (s64)sizeof(PackagedMeta) || bytes > CNMT_LIMIT) {
+                    error = "Некоректний розмір файлу CNMT";
+                } else if (!(*data = malloc((size_t)bytes))) {
+                    error = "Бракує пам’яті для встановлення";
+                } else {
                     u64 copied = 0;
-                    *rc = fsFileRead(&f, 0, data, (u64)bytes, FsReadOption_None, &copied);
-                    if (R_FAILED(*rc) || copied != (u64)bytes) {
-                        free(data);
-                        data = NULL;
-                    } else *size = (size_t)bytes;
+                    rc = fsFileRead(&f, 0, *data, (u64)bytes, FsReadOption_None, &copied);
+                    if (R_SUCCEEDED(rc) && copied != (u64)bytes) error = "Файл CNMT неповний";
+                    *size = (size_t)copied;
                 }
             }
             fsFileClose(&f);
         }
     }
     fsFsClose(&fs);
-    return data;
+    return R_FAILED(rc) ? service_error(job, "Не вдалося прочитати CNMT", rc) : error;
 }
 
-static bool parse_cnmt(Package *pkg, const unsigned char *data, size_t size,
-                       InstallMeta *meta, const NcmPackagedContentInfo **infos, u16 *count) {
+static const char *parse_cnmt(Package *pkg, const unsigned char *data, size_t size, InstallFormat format,
+                              InstallMeta *meta, const NcmPackagedContentInfo **infos, u16 *count,
+                              FichierJob *job) {
     PackagedMeta h;
+    if (size < sizeof(h)) return "Некоректний розмір файлу CNMT";
     memcpy(&h, data, sizeof(h));
     size_t extended = sizeof(h) + h.extended_size;
     size_t dependencies = extended + (size_t)h.contents * sizeof(NcmPackagedContentInfo);
     size_t end = dependencies + (size_t)h.dependencies * sizeof(NcmContentMetaInfo);
-    if (!h.id || h.platform != NcmContentMetaPlatform_Nx || !h.contents ||
-        h.contents >= ENTRY_LIMIT || h.install_type != NcmContentInstallType_Full ||
-        end > size || h.extended_size < 16 || h.extended_size % _Alignof(NcmPackagedContentInfo) ||
-        (h.type != NcmContentMetaType_Application && h.type != NcmContentMetaType_Patch &&
-         h.type != NcmContentMetaType_AddOnContent)) return false;
+    snprintf(job->tls_detail, sizeof(job->tls_detail),
+             "CNMT · ID %016" PRIx64 " · type 0x%02x · platform %u · ext %u · %u NCA",
+             (uint64_t)h.id, (unsigned)h.type, (unsigned)h.platform,
+             (unsigned)h.extended_size, (unsigned)h.contents);
+    if (h.platform != NcmContentMetaPlatform_Nx) return "Непідтримувана платформа в CNMT";
+    if (h.type != NcmContentMetaType_Application && h.type != NcmContentMetaType_Patch &&
+        h.type != NcmContentMetaType_AddOnContent) return "Непідтримуваний тип вмісту в CNMT";
+    if (!h.contents || h.contents >= ENTRY_LIMIT || end > size || h.extended_size < 16 ||
+        h.extended_size % _Alignof(NcmPackagedContentInfo))
+        return "Некоректний заголовок або список NCA у CNMT";
     const unsigned char *extra = data + sizeof(h);
     meta->key = (NcmContentMetaKey){.id = h.id, .version = h.version, .type = h.type};
     meta->application_id = h.type == NcmContentMetaType_Application ? h.id : u64le(extra);
+    // Standalone homebrew NSPs can use the custom application ID range allowed by hacBrewPack.
+    const uint64_t max_id = format == INSTALL_NSP && h.type == NcmContentMetaType_Application ?
+        UINT64_C(0x0fffffffffffffff) : UINT64_C(0x01ffffffffffffff);
     if (meta->application_id < UINT64_C(0x0100000000010000) ||
-        meta->application_id > UINT64_C(0x01ffffffffffffff)) return false;
+        meta->application_id > max_id) return "Непідтримуваний Title ID у CNMT";
     if (h.type == NcmContentMetaType_Patch && h.id != (meta->application_id | UINT64_C(0x800)))
-        return false;
+        return "Title ID оновлення не відповідає базовій грі";
     if (h.type == NcmContentMetaType_AddOnContent &&
         (h.id & ~UINT64_C(0xfff)) != (meta->application_id | UINT64_C(0x1000)))
-        return false;
+        return "Title ID DLC не відповідає базовій грі";
 
     *infos = (const NcmPackagedContentInfo *)(data + extended);
     *count = h.contents;
@@ -368,11 +380,11 @@ static bool parse_cnmt(Package *pkg, const unsigned char *data, size_t size,
     }
     NcmContentMetaHeader header = {
         .extended_header_size = h.extended_size, .content_count = (u16)actual,
-        .content_meta_count = h.dependencies, .attributes = h.attributes, .storage_id = h.storage,
+        .content_meta_count = h.dependencies, .attributes = h.attributes,
     };
     meta->size = sizeof(header) + h.extended_size + actual * sizeof(NcmContentInfo) + (end - dependencies);
     meta->data = malloc(meta->size);
-    if (!meta->data) return false;
+    if (!meta->data) return "Бракує пам’яті для встановлення";
     NcmContentInfo self = {.content_id = pkg->meta->id, .content_type = NcmContentType_Meta};
     ncmU64ToContentInfoSize(pkg->meta->size, &self);
     unsigned char *out = meta->data;
@@ -389,7 +401,7 @@ static bool parse_cnmt(Package *pkg, const unsigned char *data, size_t size,
         out += sizeof(*info);
     }
     memcpy(out, data + dependencies, end - dependencies);
-    return true;
+    return NULL;
 }
 
 static Result add_application_record(Service *manager, const InstallMeta *meta) {
@@ -542,12 +554,13 @@ const char *install_package(FichierJob *job, const char *path, InstallFormat for
     size_t cnmt_size = 0;
     const NcmPackagedContentInfo *infos = NULL;
     u16 info_count = 0;
-    cnmt = read_cnmt(&sd, pkg.meta, &cnmt_size, &rc);
-    if (!cnmt || !parse_cnmt(&pkg, cnmt, cnmt_size, &meta, &infos, &info_count)) {
-        error = R_FAILED(rc) ? service_error(job, "Не вдалося прочитати CNMT", rc) :
-            "Невідомий формат CNMT. Підтримуються базова гра, оновлення та DLC.";
+    error = read_cnmt(&sd, pkg.meta, &cnmt, &cnmt_size, job);
+    if (!error) error = parse_cnmt(&pkg, cnmt, cnmt_size, format, &meta, &infos, &info_count, job);
+    if (error) {
+        if (format == INSTALL_NSP) snprintf(job->dbi_file, sizeof(job->dbi_file), "%s", filename);
         goto done;
     }
+    snprintf(job->tls_detail, sizeof(job->tls_detail), "%.127s", filename);
     rc = ncmContentMetaDatabaseHas(&db, &installed, &meta.key);
     if (R_FAILED(rc)) { error = service_error(job, "Не вдалося перевірити встановлені версії", rc); goto done; }
     if (installed) { error = "Ця версія вже встановлена на microSD"; goto done; }

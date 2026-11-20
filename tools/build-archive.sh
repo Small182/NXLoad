@@ -22,6 +22,10 @@ tar -xJf "$tarball" -C "$deps"
 sed -i '/^#elif defined(__CYGWIN__) || defined(__MINGW32__) || defined(__BORLANDC__)$/s/$/ || defined(__SWITCH__)/' \
     "$source_dir/libarchive/archive_write_set_format_iso9660.c"
 
+# Newlib declares fchdir even though it is unavailable at link time.
+sed -i '/^static int fchdir(int fd)$/i #define fchdir archive_fchdir_stub' \
+    "$source_dir/libarchive/archive_read_disk_posix.c"
+
 source "$DEVKITPRO/switchvars.sh"
 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$PORTLIBS_PREFIX/lib/pkgconfig"
 

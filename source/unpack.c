@@ -25,6 +25,11 @@ typedef struct {
     bool published;
 } ExtractedFile;
 
+typedef struct {
+    ExtractedFile *files;
+    size_t count, capacity;
+} PortAssets;
+
 bool package_name(const char *name) {
     const char *ext = strrchr(name, '.');
     return ext && (!strcasecmp(ext, ".nsp") || !strcasecmp(ext, ".xci") ||
@@ -112,8 +117,9 @@ static int create_staging_directory(const char *directory, char staging[OUTPUT_P
 static const char *port_path(const char *path) {
     while (path && *path) {
         size_t length = strcspn(path, "/\\");
+        if (length == 6 && !strncasecmp(path, "switch", length))
+            return path + length + (path[length] != 0);
         if (!path[length]) break;
-        if (length == 6 && !strncasecmp(path, "switch", length)) return path + length + 1;
         path += length + 1;
     }
     return NULL;
@@ -227,6 +233,111 @@ static const char *write_entry(struct archive *reader, FichierJob *job, Extracte
     return error;
 }
 
+static const char *archive_basename(const char *path) {
+    if (!path) return NULL;
+    const char *base = path;
+    for (const char *p = path; *p; ++p)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    if (!strncmp(base, "._", 2) || !strcmp(base, ".DS_Store")) return NULL;
+    return base;
+}
+
+static const char *check_archive_entry(struct archive_entry *entry, bool allow_empty) {
+    if (archive_entry_symlink(entry) || archive_entry_hardlink(entry))
+        return "В архіві пакет є посиланням";
+    if (archive_entry_filetype(entry) != AE_IFREG)
+        return "Непідтримуваний тип пакета в архіві";
+    if (archive_entry_is_encrypted(entry) > 0)
+        return "Пакет в архіві захищений паролем";
+    la_int64_t size = archive_entry_size(entry);
+    if (!archive_entry_size_is_set(entry) || size < 0 || (!allow_empty && !size))
+        return "В архіві некоректний розмір пакета";
+    return NULL;
+}
+
+static const char *stage_entry(struct archive *reader, FichierJob *job, ExtractedFile *output,
+                               const char *staging, uint64_t size, unsigned char *buffer) {
+    int n = snprintf(output->temporary, sizeof(output->temporary), "%s/file-XXXXXX", staging);
+    if (n <= 0 || (size_t)n >= sizeof(output->temporary)) {
+        output->temporary[0] = 0;
+        return "Шлях до microSD задовгий";
+    }
+    return write_entry(reader, job, output, size, buffer);
+}
+
+static const char *stage_port_asset(struct archive *reader, FichierJob *job, PortAssets *assets,
+                                    const char *staging, const char *path, const char *relative,
+                                    uint64_t size, unsigned char *buffer) {
+    if (assets->count == assets->capacity) {
+        size_t next = assets->capacity ? assets->capacity * 2 : 16;
+        ExtractedFile *files = next > assets->capacity && next <= SIZE_MAX / sizeof(*files) ?
+            realloc(assets->files, next * sizeof(*files)) : NULL;
+        if (!files) return "Не вдалося підготувати розархіватор";
+        assets->files = files;
+        assets->capacity = next;
+    }
+    ExtractedFile *output = &assets->files[assets->count++];
+    *output = (ExtractedFile){0};
+    if (!port_destination(path, relative, output->destination)) return "Неприпустимий шлях файлу порту";
+    return stage_entry(reader, job, output, staging, size, buffer);
+}
+
+static const char *unpack_port_7z(FichierJob *job, const char *path, const char *staging,
+                                  PortAssets *assets, unsigned char *buffer) {
+    struct archive *reader = archive_read_new();
+    const char *error = "Не вдалося відкрити switch.7z";
+    const size_t start = assets->count;
+    if (!reader) return error;
+    if (archive_read_support_format_7zip(reader) != ARCHIVE_OK ||
+        archive_read_open_filename(reader, path, COPY_BUFFER) != ARCHIVE_OK) goto done;
+
+    struct archive_entry *entry;
+    int status = ARCHIVE_OK;
+    bool wrapped = false;
+    error = NULL;
+    while (!atomic_load(&job->cancelled) &&
+           (status = archive_read_next_header(reader, &entry)) == ARCHIVE_OK) {
+        const char *name = archive_entry_pathname(entry);
+        if (!archive_basename(name)) continue;
+        const char *relative = port_path(name);
+        bool directory = archive_entry_filetype(entry) == AE_IFDIR;
+        if (!wrapped && relative && (directory || *relative)) {
+            // An explicit switch directory takes precedence over loose files.
+            while (assets->count > start && !unlink(assets->files[assets->count - 1].temporary))
+                --assets->count;
+            if (assets->count > start) {
+                error = "Не вдалося прибрати тимчасовий файл порту";
+                break;
+            }
+            wrapped = true;
+        }
+        if (directory || (wrapped && (!relative || !*relative))) continue;
+        if (!wrapped) {
+            relative = name;
+            while (relative[0] == '.' && (relative[1] == '/' || relative[1] == '\\')) relative += 2;
+        }
+        error = check_archive_entry(entry, true);
+        if (!error) error = stage_port_asset(reader, job, assets, staging, name, relative,
+                                             (uint64_t)archive_entry_size(entry), buffer);
+        if (error) {
+            const char *detail = archive_error_string(reader);
+            entry_detail(job, "switch.7z", detail && *detail ? detail : name);
+            break;
+        }
+    }
+    if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
+    if (!error && status != ARCHIVE_EOF) error = "Не вдалося розпакувати switch.7z";
+    if (!error && assets->count == start) error = "У switch.7z немає файлів порту";
+
+done:
+    if (error && !job->tls_detail[0]) {
+        const char *detail = archive_error_string(reader);
+        if (detail && *detail) entry_detail(job, "switch.7z", detail);
+    }
+    archive_read_free(reader);
+    return error;
+}
+
 const char *unpack_archive(FichierJob *job, const char *path, const char *directory,
                        UnpackedPackages *packages) {
     job->tls_detail[0] = 0;
@@ -236,10 +347,10 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
     atomic_store(&job->unpacking, true);
     struct archive *reader = archive_read_new();
     ExtractedFile *outputs = calloc(ARCHIVE_PACKAGE_LIMIT, sizeof(*outputs));
-    ExtractedFile *assets = NULL;
+    PortAssets assets = {0};
     unsigned char *buffer = malloc(COPY_BUFFER);
     const char *error = "Не вдалося підготувати розархіватор";
-    size_t count = 0, asset_count = 0, asset_capacity = 0;
+    size_t count = 0;
     bool inspect_port = job->homebrew_port || job->local_unpack;
     bool has_port_files = false;
     char staging[OUTPUT_PATH];
@@ -272,98 +383,68 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
     while (!atomic_load(&job->cancelled) &&
            (status = archive_read_next_header(reader, &entry)) == ARCHIVE_OK) {
         const char *path_in_archive = archive_entry_pathname(entry);
-        unsigned type = archive_entry_filetype(entry);
+        const char *base = archive_basename(path_in_archive);
+        if (!base || archive_entry_filetype(entry) == AE_IFDIR) continue;
         const char *relative = inspect_port ? port_path(path_in_archive) : NULL;
-        const char *base = path_in_archive;
-        if (base) {
-            for (const char *part = base; *part; ++part)
-                if (*part == '/' || *part == '\\') base = part + 1;
-            if (!strncmp(base, "._", 2) || !strcmp(base, ".DS_Store")) continue;
-        }
-        bool package = base && package_name(base);
-        bool asset = relative && *relative && type != AE_IFDIR && !package;
-        if (asset) {
+        bool package = package_name(base);
+        bool asset = relative && *relative && !package;
+        bool port_archive = inspect_port && !strcasecmp(base, "switch.7z");
+        if (asset || port_archive) {
             has_port_files = true;
             if (!job->install_after_download) continue;
         } else if (!package) continue;
-        if (archive_entry_symlink(entry) || archive_entry_hardlink(entry)) {
-            error = "В архіві пакет є посиланням";
-            entry_detail(job, "ARCHIVE LINK", path_in_archive);
+
+        error = check_archive_entry(entry, asset && !port_archive);
+        if (error) {
+            entry_detail(job, "ARCHIVE", path_in_archive);
             break;
         }
-        if (type == AE_IFDIR) continue;
-        if (type != AE_IFREG) {
-            error = "Непідтримуваний тип пакета в архіві";
-            char reason[32];
-            snprintf(reason, sizeof(reason), "ARCHIVE TYPE %o", type);
-            entry_detail(job, reason, path_in_archive);
-            break;
+        uint64_t size = (uint64_t)archive_entry_size(entry);
+        if (port_archive) {
+            ExtractedFile nested = {0};
+            error = stage_entry(reader, job, &nested, staging, size, buffer);
+            if (!error) error = unpack_port_7z(job, nested.temporary, staging, &assets, buffer);
+            if (nested.temporary[0] && unlink(nested.temporary) && !error)
+                error = "Не вдалося прибрати тимчасовий файл порту";
+            if (error && !job->tls_detail[0] && !archive_error_string(reader))
+                entry_detail(job, "ARCHIVE", path_in_archive);
+            if (error) break;
+            continue;
         }
-        if (archive_entry_is_encrypted(entry) > 0) {
-            error = "Пакет в архіві захищений паролем";
-            break;
+        if (asset) {
+            error = stage_port_asset(reader, job, &assets, staging, path_in_archive, relative, size, buffer);
+            if (error && !archive_error_string(reader)) entry_detail(job, "SWITCH PATH", path_in_archive);
+            if (error) break;
+            continue;
         }
-        if (!asset && count >= ARCHIVE_PACKAGE_LIMIT) {
+        if (count >= ARCHIVE_PACKAGE_LIMIT) {
             error = "Забагато пакетів в одному архіві";
             break;
         }
-        la_int64_t entry_size = archive_entry_size(entry);
-        if (!archive_entry_size_is_set(entry) || entry_size < 0 || (!asset && !entry_size)) {
-            error = "В архіві некоректний розмір пакета";
-            break;
-        }
-
-        if (asset && asset_count == asset_capacity) {
-            size_t next = asset_capacity ? asset_capacity * 2 : 16;
-            ExtractedFile *resized = next > asset_capacity && next <= SIZE_MAX / sizeof(*assets) ?
-                realloc(assets, next * sizeof(*assets)) : NULL;
-            if (!resized) {
-                error = "Не вдалося підготувати розархіватор";
-                break;
-            }
-            assets = resized;
-            asset_capacity = next;
-        }
-        ExtractedFile *output = asset ? &assets[asset_count] : &outputs[count];
-        *output = (ExtractedFile){0};
-        int size;
-        if (asset) {
-            if (!port_destination(path_in_archive, relative, output->destination)) {
-                error = "Неприпустимий шлях файлу порту";
-                entry_detail(job, "SWITCH PATH", path_in_archive);
-                break;
-            }
-        } else if (!entry_name(path_in_archive, output->name, sizeof(output->name))) {
+        ExtractedFile *output = &outputs[count];
+        if (!entry_name(path_in_archive, output->name, sizeof(output->name))) {
             error = "Неприпустимий шлях пакета в архіві";
             entry_detail(job, "ARCHIVE PATH", path_in_archive);
             break;
-        } else {
-            size = snprintf(output->destination, sizeof(output->destination), "%s/%s", directory, output->name);
-            if (size <= 0 || (size_t)size >= sizeof(output->destination) ||
-                (!inspect_port && !unused_path(output->destination))) {
-                error = "Пакет із такою назвою вже є або шлях недоступний";
-                break;
-            }
-            for (size_t i = 0; i < count; ++i)
-                if (!strcasecmp(outputs[i].name, output->name)) error = "В архіві повторюється назва пакета";
-            if (error) break;
         }
-
-        size = snprintf(output->temporary, sizeof(output->temporary), "%s/file-XXXXXX", staging);
-        if (size <= 0 || (size_t)size >= sizeof(output->temporary)) {
-            error = "Шлях до microSD задовгий";
+        int n = snprintf(output->destination, sizeof(output->destination), "%s/%s", directory, output->name);
+        if (n <= 0 || (size_t)n >= sizeof(output->destination) ||
+            (!inspect_port && !unused_path(output->destination))) {
+            error = "Пакет із такою назвою вже є або шлях недоступний";
             break;
         }
-        if (asset) ++asset_count;
-        else ++count;
-        error = write_entry(reader, job, output, (uint64_t)entry_size, buffer);
+        for (size_t i = 0; i < count; ++i)
+            if (!strcasecmp(outputs[i].name, output->name)) error = "В архіві повторюється назва пакета";
+        if (error) break;
+        ++count;
+        error = stage_entry(reader, job, output, staging, size, buffer);
         if (error && !archive_error_string(reader)) entry_detail(job, "ARCHIVE", path_in_archive);
         if (error) break;
     }
     if (atomic_load(&job->cancelled)) error = "Розпакування скасовано";
     if (!error && status != ARCHIVE_EOF) error = "Архів пошкоджений, неповний або захищений";
     if (!error && !count) error = "В архіві немає пакета NSP, XCI, NSZ або XCZ";
-    for (size_t i = 0; !error && asset_count && i < count; ++i) {
+    for (size_t i = 0; !error && assets.count && i < count; ++i) {
         const char *ext = strrchr(outputs[i].name, '.');
         if (strcasecmp(ext, ".nsp") && strcasecmp(ext, ".xci"))
             error = "Для встановлення порту потрібен пакет NSP або XCI";
@@ -379,9 +460,9 @@ const char *unpack_archive(FichierJob *job, const char *path, const char *direct
             output->published = true;
         }
     }
-    if (!error && asset_count) atomic_store(&job->copying_port_files, true);
-    for (size_t i = 0; !error && i < asset_count; ++i) {
-        ExtractedFile *output = &assets[i];
+    if (!error && assets.count) atomic_store(&job->copying_port_files, true);
+    for (size_t i = 0; !error && i < assets.count; ++i) {
+        ExtractedFile *output = &assets.files[i];
         if (atomic_load(&job->cancelled)) {
             error = "Розпакування скасовано";
         } else if (!port_parent_directories(output->destination)) {
@@ -412,7 +493,7 @@ done:
         for (size_t i = 0; i < count; ++i)
             strcpy(packages->paths[i], outputs[i].destination);
     }
-    clean_outputs(assets, asset_count, error != NULL);
+    clean_outputs(assets.files, assets.count, error != NULL);
     clean_outputs(outputs, count, error != NULL);
     if (staged) rmdir(staging);
     atomic_store(&job->copying_port_files, false);

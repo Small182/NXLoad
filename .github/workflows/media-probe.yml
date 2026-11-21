@@ -33,6 +33,13 @@ jobs:
             "instance-invidious-privatecoffee":"https://invidious.private.coffee/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
             "instance-iv-melmac":"https://iv.melmac.space/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
             "instance-iv-nerdvpn":"https://invidious.nerdvpn.de/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "piped-pipedapi.kavin.rocks":"https://pipedapi.kavin.rocks/streams/5kcdRBHM7kM",
+            "piped-pipedapi.leptons.xyz":"https://pipedapi.leptons.xyz/streams/5kcdRBHM7kM",
+            "piped-pipedapi.nosebs.ru":"https://pipedapi.nosebs.ru/streams/5kcdRBHM7kM",
+            "piped-pipedapi.adminforge.de":"https://pipedapi.adminforge.de/streams/5kcdRBHM7kM",
+            "piped-api.piped.yt":"https://api.piped.yt/streams/5kcdRBHM7kM",
+            "piped-piped-api.codespace.cz":"https://piped-api.codespace.cz/streams/5kcdRBHM7kM",
+            "piped-api.piped.private.coffee":"https://api.piped.private.coffee/streams/5kcdRBHM7kM",
           }
           for name,url in urls.items():
             print("\n=== "+name+" ===",flush=True)

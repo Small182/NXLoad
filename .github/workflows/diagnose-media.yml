@@ -1,7 +1,6 @@
 name: Diagnose media providers
 on:
-  push:
-    branches: [fix/media-recovery-1.0.50]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

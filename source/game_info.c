@@ -746,7 +746,7 @@ static bool trailer_probe_stream(const char *url, atomic_bool *cancel,
     snprintf(alternate, sizeof(alternate), "%s", url);
     char *local = strstr(alternate, "&local=true");
     if (!local) return false;
-    memcpy(local, "&local=false", sizeof("&local=false") - 1);
+    snprintf(local, sizeof(alternate) - (size_t)(local - alternate), "&local=false");
     return trailer_probe_url(alternate, cancel, status);
 }
 

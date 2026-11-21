@@ -55,6 +55,10 @@ jobs:
                   print("ARTICLES",re.findall(r'<a[^>]{0,500}href=["\\x27](https?://[^"\\x27]+)["\\x27][^>]{0,200}>([^<]+)',page,re.I)[:8])
                   print("MEDIA_IMAGE",re.findall(r'https?://[^"\\x27 <]+\\.(?:jpg|jpeg|png|webp)',page,re.I)[:15])
                   if name.startswith("gematsu"):
+                      if "date" in name:
+                          image_start=page.find('bytes-image__link')
+                          print("IMAGE_HTML",repr(page[max(0,image_start-260):image_start+1500]))
+                          print("SCREENSHOT_LINK_COUNT",len(re.findall(r'class="[^"]*bytes-image__link[^"]*"',page)))
                       gallery_start=page.find('class="gematsu-gallery')
                       print("GALLERY_CLASS_START",gallery_start,repr(page[max(0,gallery_start-120):gallery_start+900]) if gallery_start>=0 else "")
                       for pat in (r'(?:id|class)="[^"]*(?:gallery|image|media)[^"]*"',r'(?:href|src|data-src|data-srcset)="[^"]*(?:wp-content/uploads|wp\.com)[^"]*"',r'<h1[^>]*>.*?</h1>'):

@@ -419,7 +419,7 @@ static void extract_gallery(xmlNodePtr node, GameGallery *gallery, bool in_galle
 }
 
 static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, const char *alternate,
-                          CatalogFetchStatus *status) {
+                          CatalogFetchStatus *status, bool trusted_url) {
     size_t size;
     unsigned char *data = catalog_fetch_document(url, &job->cancel, &size, status);
     if (!data) return false;
@@ -428,7 +428,7 @@ static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, con
     free(data);
     if (!page) return false;
     xmlNodePtr root = xmlDocGetRootElement(page);
-    if (match_heading(root, key, alternate)) extract_gallery(root, &job->result, false);
+    if (trusted_url || match_heading(root, key, alternate)) extract_gallery(root, &job->result, false);
     xmlFreeDoc(page);
     return job->result.count != 0;
 }
@@ -472,19 +472,50 @@ static void titledb_gallery(GalleryJob *job) {
 /* Nintendo Store image paths are embedded in its product HTML as
  * store/software/switch/<14-digit NSUID>/<64-character asset ID>. Unlike
  * Nintendo Life's section markup, this also works if the page layout changes. */
+/* Resolve media from the product for the currently opened game. The Apollo
+ * cache also embeds recommended games; scanning the whole HTML accidentally
+ * shows unrelated screenshots and trailers. */
+static Json nintendo_product(const char *html) {
+    const char *script = strstr(html, "<script id=\"__NEXT_DATA__\"");
+    const char *start = script ? strchr(script, '>') : NULL;
+    const char *end = start ? strstr(++start, "</script>") : NULL;
+    if (!end) return (Json){0};
+
+    Json root = {start, end};
+    Json props = field(field(root, "props"), "pageProps");
+    Json current = field(field(props, "analytics"), "product");
+    char sku[24];
+    if (!string_field(current, "sku", sku, sizeof(sku)) ||
+        !sku[0] || sku[strspn(sku, "0123456789")]) return (Json){0};
+    char key[64];
+    snprintf(key, sizeof(key), "Product:{\\\"sku\\\":\\\"%s\\\"}", sku);
+    Json product = field(field(props, "initialApolloState"), key);
+    return literal(field(field(product, "platform"), "code"), "\"NINTENDO_SWITCH\"") ?
+           product : (Json){0};
+}
+
 static bool store_gallery_ids(const char *html, GameGallery *gallery) {
-    const char *cursor = html;
-    while (gallery->count < GALLERY_LIMIT &&
-           (cursor = strstr(cursor, STORE_SCREENSHOTS_PATH)) != NULL) {
-        const char *id = cursor + sizeof(STORE_SCREENSHOTS_PATH) - 1;
-        cursor = id;
-        if (strspn(id, "0123456789") != 14 || id[14] != '/') continue;
-        const char *hash = id + 15;
-        if (strspn(hash, "0123456789abcdefABCDEF") != 64 ||
-            isxdigit((unsigned char)hash[64])) continue;
+    Json product = nintendo_product(html);
+    char nsuid[24];
+    if (!string_field(product, "nsuid", nsuid, sizeof(nsuid)) ||
+        strlen(nsuid) != 14 || nsuid[strspn(nsuid, "0123456789")]) return false;
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), STORE_SCREENSHOTS_PATH "%s/", nsuid);
+    size_t prefix_size = strlen(prefix);
+    Json assets = field(product, "productGallery");
+    const char *cursor = NULL;
+    while (gallery->count < GALLERY_LIMIT) {
+        Json asset = next_object(assets, &cursor);
+        if (!asset.begin) break;
+        char id[160];
+        if (!literal(field(asset, "resourceType"), "\"image\"") ||
+            !literal(field(asset, "type"), "\"upload\"") ||
+            !string_field(asset, "publicId", id, sizeof(id))) continue;
+        const char *path = id + (id[0] == '/');
+        if (!begins(path, prefix) || strlen(path + prefix_size) != 64 ||
+            strspn(path + prefix_size, "0123456789abcdefABCDEF") != 64) continue;
         char url[CATALOG_URL];
-        int n = snprintf(url, sizeof(url), STORE_SCREENSHOTS_CDN
-                         STORE_SCREENSHOTS_PATH "%.14s/%.64s", id, hash);
+        int n = snprintf(url, sizeof(url), STORE_SCREENSHOTS_CDN "%s", path);
         if (n < 0 || (size_t)n >= sizeof(url)) continue;
         bool duplicate = false;
         for (size_t i = 0; i < gallery->count; ++i)
@@ -563,7 +594,7 @@ void load_game_gallery(GalleryJob *job) {
     if (job->nintendo_life[0] && !atomic_load(&job->cancel)) {
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NL "%.*s", (int)(sizeof(url) - sizeof(NL)), job->nintendo_life);
-        if (fetch_gallery(job, url, key, alternate, &status)) return;
+        if (fetch_gallery(job, url, key, alternate, &status, true)) return;
         titledb_gallery(job);
         if (!job->result.count && !atomic_load(&job->cancel)) store_gallery(job);
         if (!job->result.count && !atomic_load(&job->cancel))
@@ -592,7 +623,7 @@ void load_game_gallery(GalleryJob *job) {
         for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
             char url[CATALOG_URL];
             snprintf(url, sizeof(url), NL "%s%s", platforms[j], slugs[i]);
-            if (fetch_gallery(job, url, key, alternate, &status)) return;
+            if (fetch_gallery(job, url, key, alternate, &status, false)) return;
             if (status.curl) {
                 snprintf(job->result.issue, sizeof(job->result.issue),
                          "Nintendo Life · cURL %d", status.curl);
@@ -618,21 +649,8 @@ void load_game_gallery(GalleryJob *job) {
 #define TRAILER_MP4 "c_limit,w_854,h_480,vc_h264/"
 
 static bool nintendo_trailers(const char *html, GameTrailers *result) {
-    const char *script = strstr(html, "<script id=\"__NEXT_DATA__\"");
-    const char *start = script ? strchr(script, '>') : NULL;
-    const char *end = start ? strstr(++start, "</script>") : NULL;
-    if (!end) return false;
-
-    Json root = {start, end};
-    Json props = field(field(root, "props"), "pageProps");
-    Json current = field(field(props, "analytics"), "product");
-    char sku[24];
-    if (!string_field(current, "sku", sku, sizeof(sku)) ||
-        !sku[0] || sku[strspn(sku, "0123456789")]) return false;
-    char key[64];
-    snprintf(key, sizeof(key), "Product:{\\\"sku\\\":\\\"%s\\\"}", sku);
-    Json product = field(field(props, "initialApolloState"), key);
-    if (!literal(field(field(product, "platform"), "code"), "\"NINTENDO_SWITCH\"")) return false;
+    Json product = nintendo_product(html);
+    if (!product.begin) return false;
 
     char nsuid[24];
     if (!string_field(product, "nsuid", nsuid, sizeof(nsuid)) ||
@@ -662,30 +680,6 @@ static bool nintendo_trailers(const char *html, GameTrailers *result) {
     return true;
 }
 
-
-/* A fallback for Nintendo pages that embed asset paths but no longer expose
- * them through the old Next.js/Apollo shape. */
-static void scan_video_paths(const char *html, GameTrailers *result) {
-    const char *cursor = html;
-    while (result->count < TRAILER_LIMIT &&
-           (cursor = strstr(cursor, SWITCH_VIDEO_PATH)) != NULL) {
-        const char *nsuid = cursor + sizeof(SWITCH_VIDEO_PATH) - 1;
-        cursor = nsuid;
-        if (strspn(nsuid, "0123456789") != 14 ||
-            strncmp(nsuid + 14, "/Video/", 7)) continue;
-        const char *hash = nsuid + 21;
-        if (strspn(hash, "0123456789abcdefABCDEF") != 64 ||
-            isxdigit((unsigned char)hash[64])) continue;
-        char url[CATALOG_URL];
-        int n = snprintf(url, sizeof(url), NINTENDO_VIDEO TRAILER_MP4
-                         SWITCH_VIDEO_PATH "%.14s/Video/%.64s.mp4", nsuid, hash);
-        if (n < 0 || (size_t)n >= sizeof(url)) continue;
-        bool duplicate = false;
-        for (size_t i = 0; i < result->count; ++i)
-            if (!strcmp(result->urls[i], url)) duplicate = true;
-        if (!duplicate) strcpy(result->urls[result->count++], url);
-    }
-}
 
 void load_game_trailers(TrailerJob *job) {
     char name[CATALOG_TEXT], slugs[2][CATALOG_TEXT] = {{0}};
@@ -722,7 +716,6 @@ void load_game_trailers(TrailerJob *job) {
         last_curl = status.curl;
         if (!body) continue;
         nintendo_trailers((const char *)body, &job->result);
-        if (!job->result.count) scan_video_paths((const char *)body, &job->result);
         free(body);
         if (job->result.count) break;
     }

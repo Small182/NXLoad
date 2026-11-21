@@ -137,6 +137,8 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     }
     CURL *curl = stream->connection;
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    // Switch networks may fail to reach the IPv6 addresses for Nintendo CDN.
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, (long)CURL_IPRESOLVE_V4);
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 4L);

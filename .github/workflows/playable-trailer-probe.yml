@@ -39,3 +39,53 @@ jobs:
             except Exception as e:
               print('ERROR',type(e).__name__,str(e)[:230],flush=True)
           PY
+      - name: Test HTTP Range and trailer discovery
+        run: |
+          python3 - <<'PY'
+          import urllib.request,urllib.error,re,json
+          urls=[
+            "https://media.gamereactor.eu/default/t_HollowKnight_383543.mp4",
+            "https://media.gamereactor.eu/default/t_SuperMarioOdyssey_340253.mp4",
+            "https://media.gamereactor.eu/default/t_The_Legend_of_Zelda_Tears_of_the_Kingdom_Rediscover_your_sense_of_adventure_643033.mp4",
+          ]
+          for url in urls:
+            print("== MEDIA ==",url,flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"Range":"bytes=0-15","User-Agent":"NXLoad/1.0.50"})
+              with urllib.request.urlopen(req,timeout=12) as r:
+                data=r.read(32)
+                print("STATUS",r.status,"CONTENT",r.headers.get('Content-Type'),
+                      "RANGE",r.headers.get('Content-Range'),
+                      "LENGTH",r.headers.get('Content-Length'),
+                      "MAGIC",data.hex(),"FTYP",data[4:8],flush=True)
+            except Exception as e: print("ERROR",repr(e),flush=True)
+          discovery={
+            "wp-search":"https://www.gamereactor.eu/wp-json/wp/v2/search?search=Hollow%20Knight&per_page=25",
+            "wp-search-video":"https://www.gamereactor.eu/wp-json/wp/v2/search?search=Hollow%20Knight&per_page=25&subtype=video",
+            "wp-search-gr_video":"https://www.gamereactor.eu/wp-json/wp/v2/search?search=Hollow%20Knight&per_page=25&subtype=gr_video",
+            "wp-grtv":"https://www.gamereactor.eu/wp-json/wp/v2/gr_video?search=Hollow%20Knight",
+            "wp-video":"https://www.gamereactor.eu/wp-json/wp/v2/video?search=Hollow%20Knight",
+            "site-search":"https://www.gamereactor.eu/video/?s=Hollow+Knight",
+            "site-search2":"https://www.gamereactor.eu/video/?search=Hollow+Knight",
+            "site-search3":"https://www.gamereactor.eu/video/?q=Hollow+Knight",
+            "site-search4":"https://www.gamereactor.eu/video/?query=Hollow+Knight",
+            "site-search5":"https://www.gamereactor.eu/?s=Hollow+Knight&post_type=gr_video",
+            "site-search6":"https://www.gamereactor.eu/video/?s=Super+Mario+Odyssey",
+          }
+          for name,url in discovery.items():
+            print("== SEARCH ==",name,url,flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"})
+              with urllib.request.urlopen(req,timeout=9) as r:
+                data=r.read(550000);ctype=r.headers.get('content-type','');real=r.url
+                print("HTTP",r.status,"CT",ctype,"BYTES",len(data),"FINAL",real,flush=True)
+              v=data.decode('utf-8','replace')
+              if 'json' in ctype:print("JSON",repr(v[:1800]),flush=True)
+              else:
+                print("TITLE",re.findall(r'<title[^>]*>([^<]+)',v,re.I)[:2],flush=True)
+                print("VIDEOLINK",re.findall(r'<a[^>]*href=["\\x27]([^"\\x27]*(?:/video/|/grtv/)[^"\\x27]*)["\\x27][^>]*>',v,re.I)[:10],flush=True)
+                for word in ['Hollow Knight - Nintendo Switch Launch Trailer','Hollow Knight','Super Mario Odyssey']:
+                  print("HAS",word,word.lower() in v.lower(),flush=True)
+                for tag in re.findall(r'<form[^>]*>.*?</form>',v,re.I|re.S)[:4]: print("FORM",re.sub(r'\\s+',' ',tag)[:550],flush=True)
+            except Exception as e:print("ERROR",repr(e),flush=True)
+          PY

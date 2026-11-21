@@ -1163,9 +1163,121 @@ static bool trailer_probe_stream(const char *url, atomic_bool *cancel,
     return trailer_probe_url(alternate, cancel, status);
 }
 
+/* Gamereactor serves independently hosted MP4 trailers. Its public
+ * WordPress REST catalog supplies the original filename of each video.
+ * We validate game titles, file names and the HTTP Range response before
+ * exposing anything to the player. No Nintendo or YouTube DNS is needed. */
+#define GR_VIDEO_API "https://www.gamereactor.eu/wp-json/wp/v2/gr_video?search="
+#define GR_MEDIA "https://media.gamereactor.eu/default/"
+
+static int gamereactor_trailer_score(const char *title, const char *wanted) {
+    char movie[CATALOG_TEXT], game[CATALOG_TEXT];
+    title_key(movie, title);
+    title_key(game, wanted);
+    size_t size = strlen(game);
+    if (!size || strncmp(movie, game, size)) return 0;
+    if (strcasestr(title, "switch 2") || strcasestr(title, "playstation") ||
+        strcasestr(title, "ps5") || strcasestr(title, "xbox") ||
+        strcasestr(title, "GRTV News") || strcasestr(title, "review") ||
+        strcasestr(title, "livestream") || strcasestr(title, "interview"))
+        return 0;
+    const char *after = movie + size;
+    const char *promos[] = {
+        "nintendoswitch", "switchlaunch", "switchtrailer",
+        "official", "launch", "release", "announcement", "overview",
+        "trailer", "teaser", "gameplay", "nintendodirect",
+        "e3", "firstgameplay", "cinematic", "story", "coopmode",
+        "captureyourimagination", "myway", "rediscoveryoursense",
+        "jumpupsuperstar", "final", "reveal", "collectorsedition"
+    };
+    bool relevant = false;
+    for (size_t i = 0; i < sizeof(promos)/sizeof(*promos); ++i)
+        if (!strncmp(after, promos[i], strlen(promos[i]))) relevant = true;
+    if (!relevant) return 0;
+    if (strcasestr(title, "Nintendo Switch") && strcasestr(title, "Trailer")) return 4;
+    if (strcasestr(title, "Official Trailer") ||
+        strcasestr(title, "Launch Trailer") ||
+        strcasestr(title, "Release Date Trailer")) return 3;
+    if (strcasestr(title, "Trailer") || strcasestr(title, "Overview") ||
+        strcasestr(title, "Nintendo Switch")) return 2;
+    return 1;
+}
+
+static bool gamereactor_valid_asset(const char *asset) {
+    size_t n = strlen(asset);
+    return n > 5 && n < CATALOG_URL - sizeof(GR_MEDIA) &&
+           !strcasecmp(asset + n - 4, ".mp4") &&
+           strspn(asset,
+                  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") == n;
+}
+
+static bool gamereactor_trailers(TrailerJob *job, CatalogFetchStatus *status) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        status->curl = CURLE_FAILED_INIT;
+        return false;
+    }
+    char *encoded = curl_easy_escape(curl, job->title, 0);
+    curl_easy_cleanup(curl);
+    if (!encoded) return false;
+    char url[CATALOG_URL];
+    int n = snprintf(url, sizeof(url), GR_VIDEO_API "%s&per_page=75&_fields=id,title,acf,link", encoded);
+    curl_free(encoded);
+    if (n <= 0 || n >= (int)sizeof(url)) return false;
+
+    size_t length = 0;
+    unsigned char *data = catalog_fetch_document(url, &job->cancel, &length, status);
+    if (!data || atomic_load(&job->cancel)) {
+        free(data);
+        return false;
+    }
+    Json items = {(char *)data, (char *)data + length};
+    if (*items.begin != '[') {
+        free(data);
+        return false;
+    }
+
+    /* Four passes prefer Nintendo Switch trailers over generic promotional
+     * material while avoiding unrelated news, reviews and sequel releases. */
+    for (int rank = 4; rank >= 1 && job->result.count < TRAILER_LIMIT &&
+                        !atomic_load(&job->cancel); --rank) {
+        const char *cursor = NULL;
+        for (;;) {
+            Json video = next_object(items, &cursor);
+            if (!video.begin || job->result.count == TRAILER_LIMIT ||
+                atomic_load(&job->cancel)) break;
+            char title[CATALOG_TEXT], asset[CATALOG_URL];
+            if (!string_field(field(video, "title"), "rendered", title, sizeof(title)) ||
+                gamereactor_trailer_score(title, job->title) != rank ||
+                !string_field(field(video, "acf"), "_gr_video_asset", asset, sizeof(asset)) ||
+                !gamereactor_valid_asset(asset))
+                continue;
+            char media[CATALOG_URL];
+            int m = snprintf(media, sizeof(media), GR_MEDIA "%s", asset);
+            if (m <= 0 || m >= (int)sizeof(media)) continue;
+            bool duplicate = false;
+            for (size_t i = 0; i < job->result.count; ++i)
+                if (!strcmp(job->result.urls[i], media)) duplicate = true;
+            if (duplicate) continue;
+            CatalogFetchStatus video_status = {0};
+            if (!trailer_probe_url(media, &job->cancel, &video_status))
+                continue;
+            strcpy(job->result.urls[job->result.count++], media);
+        }
+    }
+    free(data);
+    if (job->result.count) {
+        job->result.issue[0] = 0;
+        return true;
+    }
+    return false;
+}
+
 void load_game_trailers(TrailerJob *job) {
     if (atomic_load(&job->cancel)) return;
     CatalogFetchStatus status = {0};
+    if (gamereactor_trailers(job, &status)) return;
+    if (atomic_load(&job->cancel)) return;
     if (switch_videos_from_instance(job, SWITCH_VIDEO_API_1, &status)) {
         size_t discovered = job->result.count;
         CatalogFetchStatus video_status = {0};

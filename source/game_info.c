@@ -5,7 +5,6 @@
 #include "trailers.h"
 
 #include <curl/curl.h>
-#include <ctype.h>
 #include <libxml/HTMLparser.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +28,7 @@
 #define NL_SWITCH "/games/nintendo-switch/"
 #define NL_ESHOP "/games/switch-eshop/"
 #define NL_IMAGE "https://images.nintendolife.com/screenshots/"
+#define TITLEDB_IMAGE "https://img-eshop.cdn.nintendo.net/i/"
 #define SOURCE_PAGE "https://nsroms.net/roms/"
 
 static bool begins(const char *value, const char *prefix) {
@@ -374,6 +374,21 @@ static void make_slug(char slug[CATALOG_TEXT], const char *title) {
     slug[used] = 0;
 }
 
+static bool match_title_key(const char *actual, const char *expected) {
+    if (!expected[0]) return false;
+    if (!strcmp(actual, expected)) return true;
+    // Nintendo Life appends platform badges inside some H1 elements.
+    // Ignore only a recognised trailing badge, never a differing title.
+    static const char *const badges[] = {"nintendoswitch", "switch2", "switch"};
+    size_t length = strlen(actual), wanted = strlen(expected);
+    for (size_t i = 0; i < sizeof(badges) / sizeof(*badges); ++i) {
+        size_t suffix = strlen(badges[i]);
+        if (length == wanted + suffix && !memcmp(actual, expected, wanted) &&
+            !strcmp(actual + wanted, badges[i])) return true;
+    }
+    return false;
+}
+
 static bool match_heading(xmlNodePtr node, const char *key, const char *alternate) {
     for (; node; node = node->next) {
         if (node->type == XML_ELEMENT_NODE && !xmlStrcmp(node->name, BAD_CAST "h1")) {
@@ -381,7 +396,7 @@ static bool match_heading(xmlNodePtr node, const char *key, const char *alternat
             char actual[CATALOG_TEXT];
             title_key(actual, content ? (char *)content : "");
             xmlFree(content);
-            if (actual[0] && (!strcmp(actual, key) || !strcmp(actual, alternate))) return true;
+            if (actual[0] && (match_title_key(actual, key) || match_title_key(actual, alternate))) return true;
         }
         if (match_heading(node->children, key, alternate)) return true;
     }
@@ -418,7 +433,7 @@ static void extract_gallery(xmlNodePtr node, GameGallery *gallery, bool in_galle
 }
 
 static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, const char *alternate,
-                          CatalogFetchStatus *status, bool trusted_url) {
+                          CatalogFetchStatus *status) {
     size_t size;
     unsigned char *data = catalog_fetch_document(url, &job->cancel, &size, status);
     if (!data) return false;
@@ -427,7 +442,7 @@ static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, con
     free(data);
     if (!page) return false;
     xmlNodePtr root = xmlDocGetRootElement(page);
-    if (trusted_url || match_heading(root, key, alternate)) extract_gallery(root, &job->result, false);
+    if (match_heading(root, key, alternate)) extract_gallery(root, &job->result, false);
     xmlFreeDoc(page);
     return job->result.count != 0;
 }
@@ -449,98 +464,18 @@ static bool bundled_gallery(const char *key, GameGallery *gallery) {
     return gallery->count != 0;
 }
 
-#define STORE_SCREENSHOTS_PAGE "https://www.nintendo.com/us/store/products/"
-#define STORE_SCREENSHOTS_CDN "https://assets.nintendo.com/image/upload/c_limit,w_1280,h_720,f_jpg,q_80/"
-#define STORE_SCREENSHOTS_PATH "store/software/switch/"
-
-/* Nintendo Store image paths are embedded in its product HTML as
- * store/software/switch/<14-digit NSUID>/<64-character asset ID>. Unlike
- * Nintendo Life's section markup, this also works if the page layout changes. */
-/* Resolve media from the product for the currently opened game. The Apollo
- * cache also embeds recommended games; scanning the whole HTML accidentally
- * shows unrelated screenshots and trailers. */
-static Json nintendo_product(const char *html) {
-    const char *script = strstr(html, "<script id=\"__NEXT_DATA__\"");
-    const char *start = script ? strchr(script, '>') : NULL;
-    const char *end = start ? strstr(++start, "</script>") : NULL;
-    if (!end) return (Json){0};
-
-    Json root = {start, end};
-    Json props = field(field(root, "props"), "pageProps");
-    Json current = field(field(props, "analytics"), "product");
-    char sku[24];
-    if (!string_field(current, "sku", sku, sizeof(sku)) ||
-        !sku[0] || sku[strspn(sku, "0123456789")]) return (Json){0};
-    char key[64];
-    snprintf(key, sizeof(key), "Product:{\\\"sku\\\":\\\"%s\\\"}", sku);
-    Json product = field(field(props, "initialApolloState"), key);
-    return literal(field(field(product, "platform"), "code"), "\"NINTENDO_SWITCH\"") ?
-           product : (Json){0};
-}
-
-static bool store_gallery_ids(const char *html, GameGallery *gallery) {
-    Json product = nintendo_product(html);
-    char nsuid[24];
-    if (!string_field(product, "nsuid", nsuid, sizeof(nsuid)) ||
-        strlen(nsuid) != 14 || nsuid[strspn(nsuid, "0123456789")]) return false;
-    char prefix[64];
-    snprintf(prefix, sizeof(prefix), STORE_SCREENSHOTS_PATH "%s/", nsuid);
-    size_t prefix_size = strlen(prefix);
-    Json assets = field(product, "productGallery");
-    const char *cursor = NULL;
-    while (gallery->count < GALLERY_LIMIT) {
-        Json asset = next_object(assets, &cursor);
-        if (!asset.begin) break;
-        char id[160];
-        if (!literal(field(asset, "resourceType"), "\"image\"") ||
-            !literal(field(asset, "type"), "\"upload\"") ||
-            !string_field(asset, "publicId", id, sizeof(id))) continue;
-        const char *path = id + (id[0] == '/');
-        if (!begins(path, prefix) || strlen(path + prefix_size) != 64 ||
-            strspn(path + prefix_size, "0123456789abcdefABCDEF") != 64) continue;
-        char url[CATALOG_URL];
-        int n = snprintf(url, sizeof(url), STORE_SCREENSHOTS_CDN "%s", path);
-        if (n < 0 || (size_t)n >= sizeof(url)) continue;
-        bool duplicate = false;
-        for (size_t i = 0; i < gallery->count; ++i)
-            if (!strcmp(gallery->screenshots[i], url)) duplicate = true;
-        if (!duplicate) strcpy(gallery->screenshots[gallery->count++], url);
+static void titledb_gallery(GalleryJob *job) {
+    GameGallery *gallery = &job->result;
+    const char *hashes = job->fallback_hashes;
+    size_t digits = strspn(hashes, "0123456789abcdef");
+    if (digits % 64 || hashes[digits]) return;
+    for (size_t offset = 0; offset < digits && gallery->count < GALLERY_LIMIT; offset += 64)
+        snprintf(gallery->screenshots[gallery->count++], CATALOG_URL,
+                 TITLEDB_IMAGE "%.64s.jpg", hashes + offset);
+    if (gallery->count) {
+        gallery->from_titledb = true;
+        gallery->issue[0] = 0;
     }
-    if (gallery->count) gallery->issue[0] = 0;
-    return gallery->count != 0;
-}
-
-static bool store_gallery(GalleryJob *job, CatalogFetchStatus *last_status) {
-    *last_status = (CatalogFetchStatus){0};
-    const char *titles[] = {job->title, job->catalog_title};
-    char previous[CATALOG_TEXT] = {0};
-    for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
-        if (!titles[i][0]) continue;
-        char name[CATALOG_TEXT], slug[CATALOG_TEXT], url[CATALOG_URL];
-        snprintf(name, sizeof(name), "%s", titles[i]);
-        clean_heading(name);
-        remove_suffix(name, "nintendo switch");
-        remove_suffix(name, "switch");
-        make_slug(slug, name);
-        // Nintendo Life uses underscores, but Nintendo Store uses hyphens.
-        for (char *p = slug; *p; ++p)
-            if (*p == '_') *p = '-';
-        if (!slug[0] || !strcmp(slug, previous)) continue;
-        strcpy(previous, slug);
-        snprintf(url, sizeof(url), STORE_SCREENSHOTS_PAGE "%s-switch/", slug);
-        CatalogFetchStatus status = {0};
-        size_t size = 0;
-        unsigned char *html = catalog_fetch_document(url, &job->cancel, &size, &status);
-        *last_status = status;
-        if (!html) {
-            if (status.curl || (status.http && status.http != 404)) break;
-            continue;
-        }
-        bool found = store_gallery_ids((const char *)html, &job->result);
-        free(html);
-        if (found) return true;
-    }
-    return false;
 }
 
 unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes,
@@ -570,9 +505,9 @@ void load_game_gallery(GalleryJob *job) {
     if (job->romsns_page[0]) {
         bool loaded = catalog_read_romsns_media(job->romsns_page, &job->cancel, job->port_description,
                                                 job->result.screenshots, &job->result.count);
-        if (!loaded || !job->result.count)
-            strcpy(job->result.issue, "Скриншоти ROMsNS недоступні");
-        return;
+        if (loaded && job->result.count) return;
+        // Ports can have no ROMsNS carousel: retain the description and try
+        // bundled, Nintendo Life and TitleDB artwork before giving up.
     }
     char name[CATALOG_TEXT], key[CATALOG_TEXT], alternate[CATALOG_TEXT] = {0};
     snprintf(name, sizeof(name), "%s", job->title[0] ? job->title :
@@ -580,66 +515,59 @@ void load_game_gallery(GalleryJob *job) {
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
     if (bundled_gallery(key, &job->result)) return;
-
-    /* TitleDB's old img-eshop.cdn.nintendo.net/i/<hash>.jpg links fail on
-     * some Switch networks (cURL 7). They are metadata, not confirmed
-     * images. Never let them displace galleries from live providers. */
-    CatalogFetchStatus nl_status = {0};
+    if (job->prefer_titledb) {
+        titledb_gallery(job);
+        if (job->result.count) return;
+    }
+    CatalogFetchStatus status = {0};
     if (job->nintendo_life[0] && !atomic_load(&job->cancel)) {
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NL "%.*s", (int)(sizeof(url) - sizeof(NL)), job->nintendo_life);
-        if (fetch_gallery(job, url, key, alternate, &nl_status, true)) return;
-    } else {
-        char slugs[2][CATALOG_TEXT] = {{0}};
-        make_slug(slugs[0], name);
-        if (!job->title[0]) {
-            if (remove_suffix(name, "nintendo switch") || remove_suffix(name, "switch")) {
-                title_key(alternate, name);
-                make_slug(slugs[1], name);
-            }
-        } else if (begins(job->page, SOURCE_PAGE)) {
-            const char *slug = job->page + sizeof(SOURCE_PAGE) - 1;
-            size_t size = strspn(slug, "abcdefghijklmnopqrstuvwxyz0123456789-");
-            if (size >= sizeof("-switch") && size < sizeof(slugs[1]) &&
-                !memcmp(slug + size - (sizeof("-switch") - 1), "-switch", sizeof("-switch") - 1))
-                snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)(size - (sizeof("-switch") - 1)), slug);
+        if (fetch_gallery(job, url, key, alternate, &status)) return;
+        titledb_gallery(job);
+        if (!job->result.count && !atomic_load(&job->cancel))
+            snprintf(job->result.issue, sizeof(job->result.issue),
+                     tr("Галерея Nintendo Life недоступна · HTTP %ld"), status.http);
+        return;
+    }
+    char slugs[2][CATALOG_TEXT] = {{0}};
+    make_slug(slugs[0], name);
+    if (!job->title[0]) {
+        if (remove_suffix(name, "nintendo switch") || remove_suffix(name, "switch")) {
+            title_key(alternate, name);
+            make_slug(slugs[1], name);
         }
-        const char *platforms[] = {NL_SWITCH, NL_ESHOP};
-        for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
-            if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
-            for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
-                char url[CATALOG_URL];
-                snprintf(url, sizeof(url), NL "%s%s", platforms[j], slugs[i]);
-                if (fetch_gallery(job, url, key, alternate, &nl_status, false)) return;
-                /* Connection errors mean this host is unreachable right now;
-                 * do not retry several more URL variations on the same host. */
-                if (nl_status.curl) break;
+    } else if (begins(job->page, SOURCE_PAGE)) {
+        const char *slug = job->page + sizeof(SOURCE_PAGE) - 1;
+        size_t size = strspn(slug, "abcdefghijklmnopqrstuvwxyz0123456789-");
+        if (size >= sizeof("-switch") && size < sizeof(slugs[1]) &&
+            !memcmp(slug + size - (sizeof("-switch") - 1), "-switch", sizeof("-switch") - 1))
+            snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)(size - (sizeof("-switch") - 1)), slug);
+    }
+
+    const char *platforms[] = {NL_SWITCH, NL_ESHOP};
+    for (size_t i = 0; i < 2 && !job->result.issue[0] && !atomic_load(&job->cancel); ++i) {
+        if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
+        for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
+            char url[CATALOG_URL];
+            snprintf(url, sizeof(url), NL "%s%s", platforms[j], slugs[i]);
+            if (fetch_gallery(job, url, key, alternate, &status)) return;
+            if (status.curl) {
+                snprintf(job->result.issue, sizeof(job->result.issue),
+                         "Nintendo Life · cURL %d", status.curl);
+                break;
             }
-            if (nl_status.curl) break;
+            if (status.http && status.http != 200 && status.http != 404) {
+                snprintf(job->result.issue, sizeof(job->result.issue),
+                         "Nintendo Life · HTTP %ld", status.http);
+                break;
+            }
         }
     }
     if (atomic_load(&job->cancel)) return;
-
-    /* Prefer Nintendo's current Cloudinary product gallery to the obsolete
-     * eShop image CDN. Use store_gallery's own title checks and NSUID. */
-    CatalogFetchStatus store_status = {0};
-    if (store_gallery(job, &store_status)) return;
-    if (atomic_load(&job->cancel)) return;
-
-    if (store_status.curl)
-        snprintf(job->result.issue, sizeof(job->result.issue),
-                 "Nintendo Store · cURL %d", store_status.curl);
-    else if (store_status.http && store_status.http != 200 && store_status.http != 404)
-        snprintf(job->result.issue, sizeof(job->result.issue),
-                 "Nintendo Store · HTTP %ld", store_status.http);
-    else if (nl_status.curl)
-        snprintf(job->result.issue, sizeof(job->result.issue),
-                 "Nintendo Life · cURL %d; Nintendo Store: немає галереї", nl_status.curl);
-    else if (nl_status.http && nl_status.http != 200 && nl_status.http != 404)
-        snprintf(job->result.issue, sizeof(job->result.issue),
-                 "Nintendo Life · HTTP %ld; Nintendo Store: немає галереї", nl_status.http);
-    else
-        strcpy(job->result.issue, "Скриншоти не знайдено в Nintendo Life та Nintendo Store");
+    titledb_gallery(job);
+    if (!job->result.count && !job->result.issue[0])
+        strcpy(job->result.issue, "Скриншоти гри в Nintendo Life не знайдено");
 }
 
 #define NINTENDO_PRODUCTS "https://www.nintendo.com/us/store/products/"
@@ -648,8 +576,22 @@ void load_game_gallery(GalleryJob *job) {
 #define TRAILER_MP4 "c_limit,w_854,h_480,vc_h264/"
 
 static bool nintendo_trailers(const char *html, GameTrailers *result) {
-    Json product = nintendo_product(html);
-    if (!product.begin) return false;
+    // The site can change script attribute order without changing its JSON.
+    const char *script = strstr(html, "__NEXT_DATA__");
+    const char *start = script ? strchr(script, '>') : NULL;
+    const char *end = start ? strstr(++start, "</script>") : NULL;
+    if (!end) return false;
+
+    Json root = {start, end};
+    Json props = field(field(root, "props"), "pageProps");
+    Json current = field(field(props, "analytics"), "product");
+    char sku[24];
+    if (!string_field(current, "sku", sku, sizeof(sku)) ||
+        !sku[0] || sku[strspn(sku, "0123456789")]) return false;
+    char key[64];
+    snprintf(key, sizeof(key), "Product:{\\\"sku\\\":\\\"%s\\\"}", sku);
+    Json product = field(field(props, "initialApolloState"), key);
+    if (!literal(field(field(product, "platform"), "code"), "\"NINTENDO_SWITCH\"")) return false;
 
     char nsuid[24];
     if (!string_field(product, "nsuid", nsuid, sizeof(nsuid)) ||
@@ -664,11 +606,17 @@ static bool nintendo_trailers(const char *html, GameTrailers *result) {
         if (!asset.begin) break;
         char id[160];
         if (!literal(field(asset, "resourceType"), "\"video\"") ||
-            !literal(field(asset, "type"), "\"upload\"") ||
-            !string_field(asset, "publicId", id, sizeof(id))) continue;
+            !literal(field(asset, "type"), "\"upload\"")) continue;
+        Json public_id = field(asset, "publicId");
+        const char *id_cursor = public_id.begin;
+        if (!id_cursor || !read_json_string(&id_cursor, id, sizeof(id))) continue;
         const char *path = id + (id[0] == '/');
-        if (!begins(path, prefix) || strlen(path + prefix_size) != 64 ||
-            strspn(path + prefix_size, "0123456789abcdef") != 64) continue;
+        if (!begins(path, prefix)) continue;
+        const char *asset_id = path + prefix_size;
+        size_t id_length = strlen(asset_id);
+        if (id_length < 8 || id_length > 100 ||
+            strspn(asset_id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != id_length)
+            continue;
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NINTENDO_VIDEO "%s%s.mp4", TRAILER_MP4, path);
         bool duplicate = false;
@@ -678,7 +626,6 @@ static bool nintendo_trailers(const char *html, GameTrailers *result) {
     }
     return true;
 }
-
 
 void load_game_trailers(TrailerJob *job) {
     char name[CATALOG_TEXT], slugs[2][CATALOG_TEXT] = {{0}};
@@ -702,28 +649,22 @@ void load_game_trailers(TrailerJob *job) {
             snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)n, path);
     }
 
-    long last_http = 0;
-    int last_curl = 0;
+    CatalogFetchStatus last = {0};
     for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
         if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NINTENDO_PRODUCTS "%s-switch/", slugs[i]);
-        CatalogFetchStatus status = {0};
         size_t size;
-        unsigned char *body = catalog_fetch_document(url, &job->cancel, &size, &status);
-        last_http = status.http;
-        last_curl = status.curl;
+        unsigned char *body = catalog_fetch_document(url, &job->cancel, &size, &last);
         if (!body) continue;
         nintendo_trailers((const char *)body, &job->result);
         free(body);
-        if (job->result.count) break;
+        if (job->result.count) return;
     }
-    if (!job->result.count && !atomic_load(&job->cancel)) {
-        if (last_curl) snprintf(job->result.issue, sizeof(job->result.issue),
-                                "Nintendo Store · cURL %d", last_curl);
-        else if (last_http && last_http != 200)
-            snprintf(job->result.issue, sizeof(job->result.issue),
-                     "Nintendo Store · HTTP %ld", last_http);
-        else strcpy(job->result.issue, "Трейлерів у Nintendo Store не знайдено");
-    }
+    if (atomic_load(&job->cancel)) return;
+    if (last.curl)
+        snprintf(job->result.issue, sizeof(job->result.issue), "Nintendo Store · cURL %d", last.curl);
+    else if (last.http && last.http != 200)
+        snprintf(job->result.issue, sizeof(job->result.issue), "Nintendo Store · HTTP %ld", last.http);
+    else strcpy(job->result.issue, "Трейлери Nintendo Store не знайдено");
 }

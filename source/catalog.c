@@ -88,9 +88,14 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, thumbnail ? 3L : 8L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, thumbnail ? 7L : 16L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    // Nintendo Store serves its product pages differently to non-browser clients.
+    // Nintendo endpoints can advertise unreachable IPv6 addresses on Switch.
+    // Use IPv4 for both the Store HTML and Nintendo's screenshot CDN.
     const bool nintendo_store = !strncmp(url, "https://www.nintendo.com/",
                                          sizeof("https://www.nintendo.com/") - 1);
+    const bool nintendo_assets = !strncmp(url, "https://assets.nintendo.com/",
+                                          sizeof("https://assets.nintendo.com/") - 1);
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE,
+                     (long)(nintendo_store || nintendo_assets ? CURL_IPRESOLVE_V4 : CURL_IPRESOLVE_WHATEVER));
     curl_easy_setopt(curl, CURLOPT_USERAGENT, nintendo_store ?
                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" : "NXLoad/1.0.3");

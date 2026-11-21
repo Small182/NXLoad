@@ -22,6 +22,16 @@ jobs:
             "gamefaqs-search":"https://gamefaqs.gamespot.com/search?game=Hollow+Knight",
             "nintendolife-search":"https://www.nintendolife.com/search?query=Hollow%20Knight",
             "romshq-zelda":"https://romshq.com/?s=Zelda+Tears+of+the+Kingdom",
+            "nintendolife-search-zelda":"https://www.nintendolife.com/search?query=The%20Legend%20of%20Zelda%20Tears%20of%20the%20Kingdom",
+            "nintendolife-search-mario":"https://www.nintendolife.com/search?query=Super%20Mario%20Odyssey",
+            "nintendolife-search-hades":"https://www.nintendolife.com/search?query=Hades",
+            "nintendolife-slug-hades":"https://www.nintendolife.com/games/nintendo-switch/hades",
+            "nxbrew-rest":"https://nxbrew.net/wp-json/wp/v2/posts?search=Hollow+Knight&per_page=2",
+            "mobygames-search":"https://www.mobygames.com/search/?q=Hollow+Knight",
+            "gematsu-search":"https://www.gematsu.com/games/hollow-knight",
+            "gamespot-search":"https://www.gamespot.com/search/?q=Hollow+Knight",
+            "gamepressure-search":"https://www.gamepressure.com/games/search.asp?search=Hollow+Knight",
+            "igdb-search":"https://www.igdb.com/search?type=1&q=Hollow%20Knight",
           }
           for name,url in urls.items():
               print("\n=== SOURCE",name,url,flush=True)
@@ -33,6 +43,7 @@ jobs:
                   page=raw.decode("utf-8","replace")
                   print("TITLE",re.findall(r"<title[^>]*>([^<]*)",page,re.I)[:2])
                   print("OGIMAGE",re.findall(r'<meta[^>]+(?:property|name)=["\\x27]og:image["\\x27][^>]{0,500}',page,re.I)[:2])
+                  print("GAME_LINKS",re.findall(r'(?s)<a[^>]*href=["\\x27]([^"\\x27]*(?:/games/|/game/)[^"\\x27]*)["\\x27][^>]*>(.{0,120}?)</a>',page,re.I)[:12])
                   print("ARTICLES",re.findall(r'<a[^>]{0,500}href=["\\x27](https?://[^"\\x27]+)["\\x27][^>]{0,200}>([^<]+)',page,re.I)[:8])
                   print("MEDIA_IMAGE",re.findall(r'https?://[^"\\x27 <]+\\.(?:jpg|jpeg|png|webp)',page,re.I)[:15])
                   print("SCREENSHOTS",re.findall(r'.{0,80}(?:screenshots|gallery|gameplay|wp-content/uploads).{0,120}',page,re.I)[:7])

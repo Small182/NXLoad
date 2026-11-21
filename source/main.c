@@ -64,7 +64,7 @@ typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
 typedef enum {
     SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG,
     SETTINGS_NSROMS, SETTINGS_ROMSHQ, SETTINGS_ROMSNS, SETTINGS_THEME, SETTINGS_LANGUAGE,
-    SETTINGS_REFRESH_CATALOG, SETTINGS_UPDATE, SETTINGS_ROWS
+    SETTINGS_REFRESH_CATALOG, SETTINGS_TEST_CHANNEL, SETTINGS_UPDATE_BRANCH, SETTINGS_UPDATE, SETTINGS_ROWS
 } SettingRow;
 
 #define TAB_Y 96
@@ -1309,9 +1309,13 @@ static void finish_jobs(void) {
         threadWaitForExit(&app.update_thread);
         threadClose(&app.update_thread);
         app.update_checking = false;
-        app.update_offered = app.update_check.build.id[0] != 0;
+        bool stale_channel = app.update_check.test_channel != app.settings.test_updates ||
+            (app.settings.test_updates &&
+             strcmp(app.update_check.branch, app.settings.update_branch));
+        app.update_offered = !stale_channel && app.update_check.build.id[0] != 0;
         app.update_details_open = false;
         snprintf(app.update_notice, sizeof(app.update_notice), "%s",
+                 stale_channel ? "Канал змінився — перевір оновлення ще раз" :
                  app.update_check.error ? app.update_check.error : app.update_offered ?
                  "Доступне оновлення NXLoad" : "Вже встановлено актуальну збірку NXLoad");
     }
@@ -1506,6 +1510,8 @@ static void start_update_check(bool manual) {
         if (manual) strcpy(app.update_notice, "Для оновлення запусти NXLoad.nro з microSD");
         return;
     }
+    app.update_check.test_channel = app.settings.test_updates;
+    snprintf(app.update_check.branch, sizeof(app.update_check.branch), "%s", app.settings.update_branch);
     atomic_init(&app.update_check.cancelled, false);
     app.update_checking = start_worker(&app.update_thread, update_check_worker, &app.update_check);
     strcpy(app.update_notice, app.update_checking ? "Перевірка оновлення NXLoad…" :
@@ -1762,6 +1768,30 @@ static void change_setting(size_t row, bool activate) {
         case SETTINGS_ROMSNS: value = &app.settings.source_enabled[CATALOG_ROMSNS]; break;
         case SETTINGS_THEME: value = &app.settings.light_theme; break;
         case SETTINGS_LANGUAGE: value = &app.settings.english; break;
+        case SETTINGS_TEST_CHANNEL: value = &app.settings.test_updates; break;
+        case SETTINGS_UPDATE_BRANCH: {
+            if (!activate) return;
+            char chosen[UPDATE_BRANCH_MAX];
+            snprintf(chosen, sizeof(chosen), "%s", app.settings.update_branch);
+            if (!keyboard(chosen, sizeof(chosen), "Гілка тестових збірок",
+                          "Наприклад: native-1fichier або fix/media-recovery-1.0.50", "Зберегти")) return;
+            if (!valid_update_branch(chosen)) {
+                strcpy(app.settings_notice, "Некоректна назва гілки GitHub");
+                return;
+            }
+            char old[UPDATE_BRANCH_MAX];
+            strcpy(old, app.settings.update_branch);
+            strcpy(app.settings.update_branch, chosen);
+            if (!save_settings(&app.settings)) {
+                strcpy(app.settings.update_branch, old);
+                strcpy(app.settings_notice, "Не вдалося зберегти гілку на microSD");
+                return;
+            }
+            app.update_offered = false;
+            app.update_notice[0] = 0;
+            strcpy(app.settings_notice, "Гілку збережено. Перевір оновлення NXLoad.");
+            return;
+        }
         case SETTINGS_REFRESH_CATALOG:
             if (activate) {
                 refresh_catalogs();
@@ -1777,6 +1807,11 @@ static void change_setting(size_t row, bool activate) {
     if (save_settings(&app.settings)) {
         app.settings_notice[0] = 0;
         app.background_check_at = 0;
+        if (row == SETTINGS_TEST_CHANNEL) {
+            app.update_offered = false;
+            app.update_notice[0] = 0;
+            strcpy(app.settings_notice, "Канал змінено. Перевір оновлення NXLoad.");
+        }
         apply_theme();
         set_english(app.settings.english);
         if (row >= SETTINGS_NSROMS && row <= SETTINGS_ROMSNS) {
@@ -2654,7 +2689,8 @@ static void draw_settings(void) {
         "Дія з файлом за замовчуванням", "Видаляти архів після розпакування",
         "Видаляти NSP після встановлення", "Щоденне оновлення каталогів",
         "Джерело NSRoms", "Джерело ROMsHQ", "Джерело ROMsNS", "Тема", "Мова",
-        "Оновити каталоги зараз", "Перевірити оновлення NXLoad",
+        "Оновити каталоги зараз", "Канал оновлень", "Гілка тестових збірок",
+        "Перевірити оновлення NXLoad",
     };
     const char *const on = "Увімкнено", *const off = "Вимкнено";
     const char *const values[] = {
@@ -2665,7 +2701,9 @@ static void draw_settings(void) {
         app.settings.source_enabled[CATALOG_ROMSHQ] ? on : off,
         app.settings.source_enabled[CATALOG_ROMSNS] ? on : off,
         app.settings.light_theme ? "Світла" : "Темна",
-        app.settings.english ? "English" : "Українська", "", "",
+        app.settings.english ? "English" : "Українська", "",
+        app.settings.test_updates ? "Тестовий" : "Стабільний",
+        app.settings.update_branch, "",
     };
     text(app.large, "Налаштування", 195, 89, 920, white);
     size_t first = first_visible(app.settings_row, SETTINGS_VISIBLE);
@@ -3017,8 +3055,13 @@ static void draw_update_dialog(void) {
     rect(190, 200, 900, 305, selected);
     text(app.large, "Доступне оновлення NXLoad", 224, 230, 828, white);
     text(app.normal, line, 224, 298, 828, gray);
-    text(app.small, "Оновлення встановиться автоматично після завершення черги.", 224, 343, 828, gray);
-    text(app.small, app.update_target, 224, 374, 828, gray);
+    char channel[150];
+    if (app.update_check.test_channel)
+        snprintf(channel, sizeof(channel), "Тестовий канал · %s", app.update_check.branch);
+    else strcpy(channel, "Стабільний канал · GitHub Releases");
+    text(app.small, channel, 224, 337, 828, blue);
+    text(app.small, "Встановиться після підтвердження й завершення черги.", 224, 364, 828, gray);
+    text(app.small, app.update_target, 224, 391, 828, gray);
     text(app.normal, "A  Встановити", 224, 428, 262, blue);
     text(app.normal, "X  Деталі", 500, 428, 277, blue);
     text(app.normal, "B  Пізніше", 793, 428, 255, gray);

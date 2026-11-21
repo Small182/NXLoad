@@ -433,7 +433,7 @@ static void extract_gallery(xmlNodePtr node, GameGallery *gallery, bool in_galle
 }
 
 static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, const char *alternate,
-                          CatalogFetchStatus *status) {
+                          CatalogFetchStatus *status, bool trusted_screenshots_page) {
     size_t size;
     unsigned char *data = catalog_fetch_document(url, &job->cancel, &size, status);
     if (!data) return false;
@@ -442,7 +442,13 @@ static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, con
     free(data);
     if (!page) return false;
     xmlNodePtr root = xmlDocGetRootElement(page);
-    if (match_heading(root, key, alternate)) extract_gallery(root, &job->result, false);
+    // The standalone Nintendo Life /screenshots page has no
+    // <section id="screenshots">: its screenshot anchors are in <figure>s.
+    // Only trust it when the URL comes from the verified built-in NL index.
+    if (trusted_screenshots_page)
+        extract_gallery(root, &job->result, true);
+    else if (match_heading(root, key, alternate))
+        extract_gallery(root, &job->result, false);
     xmlFreeDoc(page);
     return job->result.count != 0;
 }
@@ -507,7 +513,13 @@ void load_game_gallery(GalleryJob *job) {
     if (job->nintendo_life[0] && !atomic_load(&job->cancel)) {
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NL "%.*s", (int)(sizeof(url) - sizeof(NL)), job->nintendo_life);
-        if (fetch_gallery(job, url, key, alternate, &status)) return;
+        // The dedicated page lists more artwork than the overview carousel.
+        char gallery_url[CATALOG_URL];
+        int n = snprintf(gallery_url, sizeof(gallery_url), "%s/screenshots", url);
+        if (n > 0 && n < (int)sizeof(gallery_url) &&
+            fetch_gallery(job, gallery_url, key, alternate, &status, true)) return;
+        if (!atomic_load(&job->cancel) &&
+            fetch_gallery(job, url, key, alternate, &status, false)) return;
     }
     if (!atomic_load(&job->cancel) && !status.curl) {
         char slugs[2][CATALOG_TEXT] = {{0}};
@@ -528,7 +540,7 @@ void load_game_gallery(GalleryJob *job) {
             for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
                 char url[CATALOG_URL];
                 snprintf(url, sizeof(url), NL "%s%s", platforms[j], slugs[i]);
-                if (fetch_gallery(job, url, key, alternate, &status)) return;
+                if (fetch_gallery(job, url, key, alternate, &status, false)) return;
                 if (status.curl) break;
             }
         }

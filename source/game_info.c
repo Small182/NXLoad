@@ -510,7 +510,8 @@ static bool store_gallery_ids(const char *html, GameGallery *gallery) {
     return gallery->count != 0;
 }
 
-static bool store_gallery(GalleryJob *job) {
+static bool store_gallery(GalleryJob *job, CatalogFetchStatus *last_status) {
+    *last_status = (CatalogFetchStatus){0};
     const char *titles[] = {job->title, job->catalog_title};
     char previous[CATALOG_TEXT] = {0};
     for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
@@ -530,7 +531,11 @@ static bool store_gallery(GalleryJob *job) {
         CatalogFetchStatus status = {0};
         size_t size = 0;
         unsigned char *html = catalog_fetch_document(url, &job->cancel, &size, &status);
-        if (!html) continue;
+        *last_status = status;
+        if (!html) {
+            if (status.curl || (status.http && status.http != 404)) break;
+            continue;
+        }
         bool found = store_gallery_ids((const char *)html, &job->result);
         free(html);
         if (found) return true;
@@ -617,10 +622,17 @@ void load_game_gallery(GalleryJob *job) {
 
     /* Prefer Nintendo's current Cloudinary product gallery to the obsolete
      * eShop image CDN. Use store_gallery's own title checks and NSUID. */
-    if (store_gallery(job)) return;
+    CatalogFetchStatus store_status = {0};
+    if (store_gallery(job, &store_status)) return;
     if (atomic_load(&job->cancel)) return;
 
-    if (nl_status.curl)
+    if (store_status.curl)
+        snprintf(job->result.issue, sizeof(job->result.issue),
+                 "Nintendo Store · cURL %d", store_status.curl);
+    else if (store_status.http && store_status.http != 200 && store_status.http != 404)
+        snprintf(job->result.issue, sizeof(job->result.issue),
+                 "Nintendo Store · HTTP %ld", store_status.http);
+    else if (nl_status.curl)
         snprintf(job->result.issue, sizeof(job->result.issue),
                  "Nintendo Life · cURL %d; Nintendo Store: немає галереї", nl_status.curl);
     else if (nl_status.http && nl_status.http != 200 && nl_status.http != 404)

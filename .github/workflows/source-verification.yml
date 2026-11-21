@@ -1,0 +1,45 @@
+name: Probe suggested media sources
+on:
+  push:
+    paths:
+      - .github/workflows/source-verification.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect HTTP access and screenshot metadata
+        run: |
+          python3 - <<'PY'
+          import re,json,urllib.request,urllib.error
+          checks={
+            "yuumi-com":"https://yuumijungle.com/en/",
+            "yuumi-games":"https://yuumijungle.games/en/",
+            "romslab":"https://romslab.com/",
+            "romslab-search":"https://romslab.com/?s=Hollow+Knight",
+            "nswpedia":"https://nswpedia.com/",
+            "nswpedia-search":"https://nswpedia.com/?s=Hollow+Knight",
+            "nlib-zelda":"https://api.nlib.cc/nx/0100F2C0115B6000/screens",
+            "nlib-hollow":"https://api.nlib.cc/nx/0100633007D48000/screens",
+            "nlib-zelda-detail":"https://api.nlib.cc/nx/0100F2C0115B6000?fields=name,screens",
+            "nlib-zelda-image":"https://api.nlib.cc/nx/0100F2C0115B6000/screen/1",
+          }
+          for name,url in checks.items():
+            print("=== "+name+" ===",flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (NXLoad media compatibility test)","Accept":"application/json,text/html,image/jpeg,*/*;q=0.8"})
+              with urllib.request.urlopen(req,timeout=13) as r:
+                typ=r.headers.get("content-type","");status=r.status;end=r.url;body=r.read(280000)
+              print("RESULT",status,typ,"BYTES",len(body),"FINAL",end,"JPEG",body[:3].hex(),flush=True)
+              if "json" in typ.lower():
+                print("JSON",repr(body[:1200]),flush=True)
+              elif "html" in typ.lower():
+                html=body.decode("utf-8","replace")
+                print("TITLE",re.findall(r'<title[^>]*>([^<]+)',html,re.I)[:2],flush=True)
+                print("OG_IMAGES",re.findall(r'<meta[^>]*property=["\\x27]og:image["\\x27][^>]*>',html,re.I)[:2],flush=True)
+                print("GAME_URLS",re.findall(r'href=["\\x27](https?://[^"\\x27]*?(?:hollow-knight|zelda)[^"\\x27]*)',html,re.I)[:6],flush=True)
+                print("SCREENSHOTS",re.findall(r'.{0,70}(?:screenshots?|gameplay).{0,70}',html,re.I)[:4],flush=True)
+            except Exception as e:
+              print("ERROR",repr(e),flush=True)
+          PY

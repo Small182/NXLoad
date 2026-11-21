@@ -374,6 +374,21 @@ static void make_slug(char slug[CATALOG_TEXT], const char *title) {
     slug[used] = 0;
 }
 
+static bool match_title_key(const char *actual, const char *expected) {
+    if (!expected[0]) return false;
+    if (!strcmp(actual, expected)) return true;
+    // Nintendo Life appends platform badges inside some H1 elements.
+    // Ignore only a recognised trailing badge, never a differing title.
+    static const char *const badges[] = {"nintendoswitch", "switch2", "switch"};
+    size_t length = strlen(actual), wanted = strlen(expected);
+    for (size_t i = 0; i < sizeof(badges) / sizeof(*badges); ++i) {
+        size_t suffix = strlen(badges[i]);
+        if (length == wanted + suffix && !memcmp(actual, expected, wanted) &&
+            !strcmp(actual + wanted, badges[i])) return true;
+    }
+    return false;
+}
+
 static bool match_heading(xmlNodePtr node, const char *key, const char *alternate) {
     for (; node; node = node->next) {
         if (node->type == XML_ELEMENT_NODE && !xmlStrcmp(node->name, BAD_CAST "h1")) {
@@ -381,7 +396,7 @@ static bool match_heading(xmlNodePtr node, const char *key, const char *alternat
             char actual[CATALOG_TEXT];
             title_key(actual, content ? (char *)content : "");
             xmlFree(content);
-            if (actual[0] && (!strcmp(actual, key) || !strcmp(actual, alternate))) return true;
+            if (actual[0] && (match_title_key(actual, key) || match_title_key(actual, alternate))) return true;
         }
         if (match_heading(node->children, key, alternate)) return true;
     }
@@ -488,9 +503,9 @@ void load_game_gallery(GalleryJob *job) {
     if (job->romsns_page[0]) {
         bool loaded = catalog_read_romsns_media(job->romsns_page, &job->cancel, job->port_description,
                                                 job->result.screenshots, &job->result.count);
-        if (!loaded || !job->result.count)
-            strcpy(job->result.issue, "Скриншоти ROMsNS недоступні");
-        return;
+        if (loaded && job->result.count) return;
+        // Ports can have no ROMsNS carousel: retain the description and try
+        // bundled, Nintendo Life and TitleDB artwork before giving up.
     }
     char name[CATALOG_TEXT], key[CATALOG_TEXT], alternate[CATALOG_TEXT] = {0};
     snprintf(name, sizeof(name), "%s", job->title[0] ? job->title :
@@ -559,7 +574,8 @@ void load_game_gallery(GalleryJob *job) {
 #define TRAILER_MP4 "c_limit,w_854,h_480,vc_h264/"
 
 static bool nintendo_trailers(const char *html, GameTrailers *result) {
-    const char *script = strstr(html, "<script id=\"__NEXT_DATA__\"");
+    // The site can change script attribute order without changing its JSON.
+    const char *script = strstr(html, "__NEXT_DATA__");
     const char *start = script ? strchr(script, '>') : NULL;
     const char *end = start ? strstr(++start, "</script>") : NULL;
     if (!end) return false;
@@ -588,11 +604,17 @@ static bool nintendo_trailers(const char *html, GameTrailers *result) {
         if (!asset.begin) break;
         char id[160];
         if (!literal(field(asset, "resourceType"), "\"video\"") ||
-            !literal(field(asset, "type"), "\"upload\"") ||
-            !string_field(asset, "publicId", id, sizeof(id))) continue;
+            !literal(field(asset, "type"), "\"upload\"")) continue;
+        Json public_id = field(asset, "publicId");
+        const char *id_cursor = public_id.begin;
+        if (!id_cursor || !read_json_string(&id_cursor, id, sizeof(id))) continue;
         const char *path = id + (id[0] == '/');
-        if (!begins(path, prefix) || strlen(path + prefix_size) != 64 ||
-            strspn(path + prefix_size, "0123456789abcdef") != 64) continue;
+        if (!begins(path, prefix)) continue;
+        const char *asset_id = path + prefix_size;
+        size_t id_length = strlen(asset_id);
+        if (id_length < 8 || id_length > 100 ||
+            strspn(asset_id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != id_length)
+            continue;
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NINTENDO_VIDEO "%s%s.mp4", TRAILER_MP4, path);
         bool duplicate = false;
@@ -625,19 +647,22 @@ void load_game_trailers(TrailerJob *job) {
             snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)n, path);
     }
 
+    CatalogFetchStatus last = {0};
     for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
         if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NINTENDO_PRODUCTS "%s-switch/", slugs[i]);
-        CatalogFetchStatus status;
         size_t size;
-        unsigned char *body = catalog_fetch_document(url, &job->cancel, &size, &status);
-        if (!body) {
-            if (status.http != 404) break;
-            continue;
-        }
-        bool matched = nintendo_trailers((const char *)body, &job->result);
+        unsigned char *body = catalog_fetch_document(url, &job->cancel, &size, &last);
+        if (!body) continue;
+        nintendo_trailers((const char *)body, &job->result);
         free(body);
-        if (matched) break;
+        if (job->result.count) return;
     }
+    if (atomic_load(&job->cancel)) return;
+    if (last.curl)
+        snprintf(job->result.issue, sizeof(job->result.issue), "Nintendo Store · cURL %d", last.curl);
+    else if (last.http && last.http != 200)
+        snprintf(job->result.issue, sizeof(job->result.issue), "Nintendo Store · HTTP %ld", last.http);
+    else strcpy(job->result.issue, "Трейлери Nintendo Store не знайдено");
 }

@@ -1185,6 +1185,8 @@ static void pump_trailers(void) {
     strcpy(job->title, title);
     app.trailer_requested = true;
     app.trailer_busy = start_worker(&app.trailer_thread, trailer_worker, job);
+    if (!app.trailer_busy)
+        strcpy(app.trailers.issue, "Не вдалося запустити запит трейлерів");
 }
 
 static int file_compare(const void *a, const void *b) {
@@ -2881,6 +2883,11 @@ static void draw_game(void) {
             snprintf(label, sizeof(label), tr("X  Трейлери · %zu"), app.trailers.count);
             rect(945, 595, 259, 34, selected);
             text(app.small, label, 960, 603, 230, blue);
+        } else {
+            const char *status = app.trailer_busy || !app.trailer_requested ?
+                "Пошук трейлерів…" : app.trailers.issue[0] ?
+                app.trailers.issue : "Трейлери недоступні";
+            text(app.small, status, 945, 603, 259, gray);
         }
     }
     else draw_game_files();

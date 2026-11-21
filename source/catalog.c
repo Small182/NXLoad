@@ -88,7 +88,12 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, thumbnail ? 3L : 8L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, thumbnail ? 7L : 16L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.3");
+    // Nintendo Store serves its product pages differently to non-browser clients.
+    const bool nintendo_store = !strncmp(url, "https://www.nintendo.com/",
+                                         sizeof("https://www.nintendo.com/") - 1);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, nintendo_store ?
+                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" : "NXLoad/1.0.3");
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive);
@@ -136,7 +141,10 @@ unsigned char *catalog_fetch_thumbnail(CURL *connection, const char *url, atomic
 
 unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
                                       CatalogFetchStatus *status) {
-    return fetch_resource(url, cancel, PAGE_BYTES, bytes, status);
+    // Nintendo Store's server-rendered product metadata can exceed 4 MiB.
+    const bool nintendo_store = !strncmp(url, "https://www.nintendo.com/",
+                                         sizeof("https://www.nintendo.com/") - 1);
+    return fetch_resource(url, cancel, nintendo_store ? 12 * 1024 * 1024 : PAGE_BYTES, bytes, status);
 }
 
 static htmlDocPtr fetch_page(CURL *curl, atomic_bool *cancel, const char *url, CatalogFetchStatus *status, bool redirects) {

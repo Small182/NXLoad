@@ -20,6 +20,10 @@ jobs:
             "romslab-search":"https://romslab.com/?s=Hollow+Knight",
             "nswpedia":"https://nswpedia.com/",
             "nswpedia-search":"https://nswpedia.com/?s=Hollow+Knight",
+            "yuumi-zelda":"https://yuumijungle.com/en/the-legend-of-zelda-tears-of-the-kingdom-rom-free-download-for-nintendo-4/",
+            "romslab-hollow":"https://romslab.com/hollow-knight-switch-nsp-free-download-1/",
+            "nswpedia-hollow":"https://nswpedia.com/nintendo-switch-roms/action/hollow-knight",
+            "nswpedia-zelda":"https://nswpedia.com/nintendo-switch-roms/action/the-legend-of-zelda-tears-of-the-kingdom-totk",
             "nlib-zelda":"https://api.nlib.cc/nx/0100F2C0115B6000/screens",
             "nlib-hollow":"https://api.nlib.cc/nx/0100633007D48000/screens",
             "nlib-zelda-detail":"https://api.nlib.cc/nx/0100F2C0115B6000?fields=name,screens",
@@ -39,6 +43,14 @@ jobs:
                 print("TITLE",re.findall(r'<title[^>]*>([^<]+)',html,re.I)[:2],flush=True)
                 print("OG_IMAGES",re.findall(r'<meta[^>]*property=["\\x27]og:image["\\x27][^>]*>',html,re.I)[:2],flush=True)
                 print("GAME_URLS",re.findall(r'href=["\\x27](https?://[^"\\x27]*?(?:hollow-knight|zelda)[^"\\x27]*)',html,re.I)[:6],flush=True)
+                for match in re.finditer(r'(?i)screenshot|gameplay|gallery',html):
+                  point=match.start()
+                  if point>200000:break
+                  if len(str(point))<1:break
+                  print("MEDIA_CONTEXT",repr(html[max(0,point-170):point+380]),flush=True)
+                  if point>50000:break
+                print("IMG_ATTRS",re.findall(r'<img[^>]{0,900}>',html,re.I)[:14],flush=True)
+                print("LINKED_IMAGES",re.findall(r'https?://[^"\\x27 <>]+?\\.(?:jpg|jpeg|webp|png)',html,re.I)[:22],flush=True)
                 print("SCREENSHOTS",re.findall(r'.{0,70}(?:screenshots?|gameplay).{0,70}',html,re.I)[:4],flush=True)
             except Exception as e:
               print("ERROR",repr(e),flush=True)

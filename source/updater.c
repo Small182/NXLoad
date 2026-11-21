@@ -369,7 +369,7 @@ void check_update(UpdateCheck *check) {
         goto done;
     }
 
-    snprintf(runs, sizeof(runs), ACTIONS "runs?branch=%s&event=push&status=success&per_page=10",
+    snprintf(runs, sizeof(runs), ACTIONS "workflows/build.yml/runs?branch=%s&event=push&status=success&per_page=10",
              check->branch);
     if (!request(runs, token, &r, &status)) {
         check->error = http_error(status);

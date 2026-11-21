@@ -29,6 +29,11 @@ jobs:
             "nxbrew-rest":"https://nxbrew.net/wp-json/wp/v2/posts?search=Hollow+Knight&per_page=2",
             "mobygames-search":"https://www.mobygames.com/search/?q=Hollow+Knight",
             "gematsu-search":"https://www.gematsu.com/games/hollow-knight",
+            "gematsu-zelda-game":"https://www.gematsu.com/games/the-legend-of-zelda-tears-of-the-kingdom",
+            "gematsu-zelda-gallery":"https://www.gematsu.com/gallery/the-legend-of-zelda-tears-of-the-kingdom",
+            "gematsu-hollow-gallery":"https://www.gematsu.com/gallery/hollow-knight",
+            "gematsu-silksong-gallery":"https://www.gematsu.com/gallery/hollow-knight-silksong",
+            "gematsu-pikmin-gallery":"https://www.gematsu.com/gallery/pikmin-4",
             "gamespot-search":"https://www.gamespot.com/search/?q=Hollow+Knight",
             "gamepressure-search":"https://www.gamepressure.com/games/search.asp?search=Hollow+Knight",
             "igdb-search":"https://www.igdb.com/search?type=1&q=Hollow%20Knight",
@@ -46,6 +51,9 @@ jobs:
                   print("GAME_LINKS",re.findall(r'(?s)<a[^>]*href=["\\x27]([^"\\x27]*(?:/games/|/game/)[^"\\x27]*)["\\x27][^>]*>(.{0,120}?)</a>',page,re.I)[:12])
                   print("ARTICLES",re.findall(r'<a[^>]{0,500}href=["\\x27](https?://[^"\\x27]+)["\\x27][^>]{0,200}>([^<]+)',page,re.I)[:8])
                   print("MEDIA_IMAGE",re.findall(r'https?://[^"\\x27 <]+\\.(?:jpg|jpeg|png|webp)',page,re.I)[:15])
+                  if name.startswith("gematsu"):
+                      for pattern in [r'.{0,200}(?:gallery-item|gallery-item__img|gallery-category|gallery-card|screenshots?).{0,350}',r'<img[^>]{0,650}>',r'<a[^>]{0,650}href=["\\x27][^"\\x27]*gallery[^"\\x27]*["\\x27][^>]*>',r'https://www\\.gematsu\\.com/wp-content/uploads/[^"\\x27 <]+']:
+                          print("GEMATSU_PATTERN",pattern,"MATCHES",re.findall(pattern,page,re.I)[:10])
                   print("SCREENSHOTS",re.findall(r'.{0,80}(?:screenshots|gallery|gameplay|wp-content/uploads).{0,120}',page,re.I)[:7])
                   print("SAMPLE",repr(page[:180]))
               except Exception as e:

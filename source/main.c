@@ -133,6 +133,7 @@ typedef struct {
     SDL_Surface *image;
     Thread thread;
     CURL *connection;
+    CatalogFetchStatus screenshot_status;
     bool screenshot, busy;
 } CoverJob;
 
@@ -890,7 +891,8 @@ static void cover_worker(void *arg) {
     CoverJob *job = arg;
     size_t count = 0;
     if (job->screenshot) {
-        unsigned char *bytes = load_gallery_image(job->url, &job->cancel, &count);
+        unsigned char *bytes = load_gallery_image(job->url, &job->cancel, &count,
+                                                  &job->screenshot_status);
         if (!atomic_load(&job->cancel)) job->image = decode_cover(bytes, count, true);
         free(bytes);
         return;
@@ -1018,6 +1020,20 @@ static void finish_cover(CoverJob *job) {
     job->busy = false;
     if (!atomic_load(&job->cancel)) {
         SDL_Texture *texture = job->image ? SDL_CreateTextureFromSurface(app.renderer, job->image) : NULL;
+        if (job->screenshot && app.screen == GAME && app.gallery.count &&
+            !strcmp(job->url, app.gallery.screenshots[app.screenshot_index])) {
+            const char *source = strstr(job->url, "nintendolife.com") ? "Nintendo Life" :
+                                 strstr(job->url, "assets.nintendo.com") ? "Nintendo CDN" :
+                                 strstr(job->url, "cdn.nintendo.net") ? "eShop CDN" : "Зображення";
+            if (texture) app.gallery.issue[0] = 0;
+            else if (job->screenshot_status.curl)
+                snprintf(app.gallery.issue, sizeof(app.gallery.issue),
+                         "%s · cURL %d", source, job->screenshot_status.curl);
+            else if (job->screenshot_status.http)
+                snprintf(app.gallery.issue, sizeof(app.gallery.issue),
+                         "%s · HTTP %ld", source, job->screenshot_status.http);
+            else strcpy(app.gallery.issue, "Помилка декодування скриншота");
+        }
         CachedCover *entry = &app.covers[0];
         for (size_t i = 0; i < COVER_SLOTS; ++i) {
             CachedCover *candidate = &app.covers[i];
@@ -1098,6 +1114,7 @@ static bool pump_covers(void) {
         strcpy(job->url, url);
         atomic_init(&job->cancel, false);
         job->image = NULL;
+        job->screenshot_status = (CatalogFetchStatus){0};
         job->busy = start_worker(&job->thread, cover_worker, job);
     }
     return finished;
@@ -2795,7 +2812,8 @@ static void draw_game_screenshots(void) {
             SDL_RenderCopy(app.renderer, texture, &src, &dst);
         }
     } else {
-        text(app.normal, shot ? "Скриншот недоступний" : "Завантаження скриншота…",
+        const char *failure = app.gallery.issue[0] ? app.gallery.issue : "Скриншот недоступний";
+        text(app.normal, shot ? failure : "Завантаження скриншота…",
              app.fullscreen_shot ? 40 : 430, 281, 724, gray);
     }
     if (!app.fullscreen_shot) {

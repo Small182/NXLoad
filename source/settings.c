@@ -3,11 +3,25 @@
 #include "storage.h"
 
 #include <stdio.h>
+#include <ctype.h>
+#include <string.h>
 #include <unistd.h>
 
 #define PATH NXLOAD_APP_DIR "/settings.cfg"
 #define BACKUP PATH ".prev"
 #define TEMP PATH ".tmp"
+
+bool valid_update_branch(const char *branch) {
+    size_t n = strlen(branch);
+    if (!n || n >= UPDATE_BRANCH_MAX || branch[0] == '/' || branch[n - 1] == '/' ||
+        strstr(branch, "..") || strstr(branch, "//")) return false;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)branch[i];
+        if (!isalnum(c) && c != '_' && c != '.' && c != '-' && c != '/') return false;
+    }
+    return true;
+}
+
 
 static bool read_settings(const char *path, Settings *s) {
     FILE *file = fopen(path, "rb");
@@ -35,35 +49,48 @@ static bool read_settings(const char *path, Settings *s) {
             }
         }
     }
+    unsigned test_updates = 0;
+    char update_branch[UPDATE_BRANCH_MAX] = "native-1fichier";
+    unsigned selected = 0;
+    char candidate[UPDATE_BRANCH_MAX];
+    if (fscanf(file, "%u %79s", &selected, candidate) == 2 && selected <= 1 &&
+        valid_update_branch(candidate)) {
+        test_updates = selected;
+        strcpy(update_branch, candidate);
+    }
     fclose(file);
     if (!ok || install > 1 || rar > 1 || nsp > 1 || legacy_auto_update > 1 || catalogs > 1 ||
         legacy_update_checked < 0 || nsroms < 0 || romshq < 0) return false;
     *s = (Settings){
         .install_default = install, .delete_rar = rar, .delete_nsp = nsp,
         .auto_catalog = catalogs, .source_enabled = {ns_enabled, roms_enabled, romsns_enabled},
-        .light_theme = light, .english = english, .catalog_checked = {(time_t)nsroms, (time_t)romshq, (time_t)romsns_checked},
+        .light_theme = light, .english = english, .test_updates = test_updates,
+        .catalog_checked = {(time_t)nsroms, (time_t)romshq, (time_t)romsns_checked},
     };
+    strcpy(s->update_branch, update_branch);
     return true;
 }
 
 Settings load_settings(void) {
-    Settings s = {.delete_rar = true, .auto_catalog = true, .source_enabled = {true, true, true}};
+    Settings s = {.delete_rar = true, .auto_catalog = true, .source_enabled = {true, true, true},
+                  .update_branch = "native-1fichier"};
     if (!read_settings(PATH, &s)) read_settings(BACKUP, &s);
     return s;
 }
 
 bool save_settings(const Settings *s) {
-    if (!nxload_ensure_storage()) return false;
+    if (!nxload_ensure_storage() || !valid_update_branch(s->update_branch)) return false;
     FILE *file = fopen(TEMP, "wb");
     if (!file) return false;
     // Retain the old file layout so a rollback can read these settings.
-    bool ok = fprintf(file, "NXLOAD1\n%u %u %u 0 %u 0 %lld %lld\n%u %u %u %u\n%u %lld\n",
+    bool ok = fprintf(file, "NXLOAD1\n%u %u %u 0 %u 0 %lld %lld\n%u %u %u %u\n%u %lld\n%u %s\n",
                       (unsigned)s->install_default, (unsigned)s->delete_rar, (unsigned)s->delete_nsp,
                       (unsigned)s->auto_catalog, (long long)s->catalog_checked[0],
                       (long long)s->catalog_checked[1], (unsigned)s->source_enabled[0],
                       (unsigned)s->source_enabled[1], (unsigned)s->light_theme, (unsigned)s->english,
                       (unsigned)s->source_enabled[CATALOG_ROMSNS],
-                      (long long)s->catalog_checked[CATALOG_ROMSNS]) > 0 &&
+                      (long long)s->catalog_checked[CATALOG_ROMSNS],
+                      (unsigned)s->test_updates, s->update_branch) > 0 &&
               !fflush(file) && !fsync(fileno(file));
     if (fclose(file)) ok = false;
 

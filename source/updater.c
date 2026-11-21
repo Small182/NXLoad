@@ -24,7 +24,6 @@
 #define NXLOAD_BUILD_RUN ""
 #endif
 
-#define UPDATE_BRANCH "native-1fichier"
 #define BUILD_WORKFLOW ".github/workflows/build.yml"
 #define REPOSITORY "https://api.github.com/repos/Small182/NXLoad/"
 #define ACTIONS REPOSITORY "actions/"
@@ -203,24 +202,26 @@ static uint64_t build_number(Json run) {
     return strtoull(value.begin, NULL, 10);
 }
 
-static bool read_run(Json run, UpdateBuild *build, char id[24]) {
+static bool read_run(Json run, const char *branch, UpdateBuild *build, char id[24]) {
+    char head_branch[80];
     build->run = build_number(run);
     return build->run && literal(field(run, "event"), "\"push\"") &&
-           literal(field(run, "head_branch"), "\"" UPDATE_BRANCH "\"") &&
+           string_field(run, "head_branch", head_branch, sizeof(head_branch)) &&
+           !strcmp(head_branch, branch) &&
            literal(field(run, "path"), "\"" BUILD_WORKFLOW "\"") &&
            literal(field(run, "conclusion"), "\"success\"") &&
            id_field(run, id) && string_field(run, "head_sha", build->sha, sizeof(build->sha)) &&
            strlen(build->sha) == 40 && strspn(build->sha, "0123456789abcdef") == 40;
 }
 
-static bool newest_run(Response *r, UpdateBuild *latest, char run_id[24], Json *head_commit) {
+static bool newest_run(Response *r, const char *branch, UpdateBuild *latest, char run_id[24], Json *head_commit) {
     Json body = {r->json, r->json + r->size};
     Json runs = field(body, "workflow_runs");
     const char *cursor = NULL;
     for (Json run = next_object(runs, &cursor); run.begin; run = next_object(runs, &cursor)) {
         UpdateBuild candidate = {0};
         char id[24];
-        if (read_run(run, &candidate, id) && candidate.run > latest->run) {
+        if (read_run(run, branch, &candidate, id) && candidate.run > latest->run) {
             *latest = candidate;
             strcpy(run_id, id);
             if (head_commit) *head_commit = field(run, "head_commit");
@@ -341,7 +342,7 @@ static const char *check_release(Response *r, UpdateCheck *check) {
 
 void check_update(UpdateCheck *check) {
     static const char no_build[] = "GitHub ще не повернув файл останньої збірки NXLoad";
-    char token[512], run_id[24], url[320];
+    char token[512], run_id[24], url[320], runs[320];
     long status = 0;
     UpdateBuild candidate = {0};
     check->build = (UpdateBuild){0};
@@ -352,38 +353,55 @@ void check_update(UpdateCheck *check) {
         check->error = "Бракує пам’яті для перевірки оновлення";
         return;
     }
-    if (!read_token(token)) {
+
+    /* The presence of a token must not silently change the update channel. */
+    if (!check->test_channel) {
         check->error = check_release(&r, check);
         goto done;
     }
-    const char *runs = ACTIONS "runs?branch=" UPDATE_BRANCH "&event=push&status=success&per_page=10";
+    if (!check->branch[0] || strchr(check->branch, '?') || strchr(check->branch, '&') ||
+        strchr(check->branch, '#')) {
+        check->error = "Некоректна гілка тестового оновлення";
+        goto done;
+    }
+    if (!read_token(token)) {
+        check->error = "Для тестового каналу потрібен switch/nxload/github-token.txt (Actions: Read)";
+        goto done;
+    }
+
+    snprintf(runs, sizeof(runs), ACTIONS "runs?branch=%s&event=push&status=success&per_page=10",
+             check->branch);
     if (!request(runs, token, &r, &status)) {
         check->error = http_error(status);
         goto done;
     }
     Json head_commit = {0};
-    if (!newest_run(&r, &candidate, run_id, &head_commit)) {
-        check->error = no_build;
+    if (!newest_run(&r, check->branch, &candidate, run_id, &head_commit)) {
+        check->error = "У вибраній гілці немає успішної збірки NXLoad";
         goto done;
     }
     if (!strcmp(candidate.sha, NXLOAD_BUILD_SHA)) goto done;
     read_update_details(head_commit, "message", check->details);
-    uint64_t installed = strtoull(NXLOAD_BUILD_RUN, NULL, 10);
-    if (!installed) {
-        // A build without the CI run number can still identify itself by its commit.
-        if (strlen(NXLOAD_BUILD_SHA) == 40 && strspn(NXLOAD_BUILD_SHA, "0123456789abcdef") == 40) {
-            snprintf(url, sizeof(url), "%s&head_sha=%s", runs, NXLOAD_BUILD_SHA);
-            UpdateBuild current = {0};
-            char current_id[24];
-            if (request(url, token, &r, &status) && newest_run(&r, &current, current_id, NULL)
-                && !strcmp(current.sha, NXLOAD_BUILD_SHA)) installed = current.run;
-        }
-        if (!installed) {
-            check->error = "Номер цієї збірки невідомий. Встанови актуальний NXLoad.nro вручну.";
-            goto done;
+    if (!check->details[0]) {
+        snprintf(url, sizeof(url), REPOSITORY "commits/%s", candidate.sha);
+        if (request(url, token, &r, &status)) {
+            Json commit = field((Json){r.json, r.json + r.size}, "commit");
+            read_update_details(commit, "message", check->details);
         }
     }
+
+    /* Compare run numbers only when the installed SHA is actually on this
+     * branch. A build from another branch may have a higher run number. */
+    snprintf(url, sizeof(url), "%s&head_sha=%s", runs, NXLOAD_BUILD_SHA);
+    uint64_t installed = 0;
+    if (request(url, token, &r, &status)) {
+        UpdateBuild current = {0};
+        char current_id[24];
+        if (newest_run(&r, check->branch, &current, current_id, NULL) &&
+            !strcmp(current.sha, NXLOAD_BUILD_SHA)) installed = current.run;
+    }
     if (candidate.run <= installed) goto done;
+
     snprintf(url, sizeof(url), ACTIONS "runs/%s/artifacts?per_page=30", run_id);
     if (!request(url, token, &r, &status)) check->error = http_error(status);
     else if (!read_artifact(&r, &candidate)) check->error = no_build;

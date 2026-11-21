@@ -1029,10 +1029,10 @@ static void finish_cover(CoverJob *job) {
             else if (job->screenshot_status.curl)
                 snprintf(app.gallery.issue, sizeof(app.gallery.issue),
                          "%s · cURL %d", source, job->screenshot_status.curl);
-            else if (job->screenshot_status.http)
+            else if (job->screenshot_status.http && job->screenshot_status.http != 200)
                 snprintf(app.gallery.issue, sizeof(app.gallery.issue),
                          "%s · HTTP %ld", source, job->screenshot_status.http);
-            else strcpy(app.gallery.issue, "Помилка декодування скриншота");
+            else strcpy(app.gallery.issue, "Зображення отримане, але не декодоване");
         }
         CachedCover *entry = &app.covers[0];
         for (size_t i = 0; i < COVER_SLOTS; ++i) {

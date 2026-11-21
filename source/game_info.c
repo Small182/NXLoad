@@ -782,6 +782,150 @@ static bool nlib_gallery(GalleryJob *job) {
     return false;
 }
 
+/* NSWpedia exposes a stable lightgallery with direct JPEG links. Match the
+ * canonical game slug from its search page, not the first search result:
+ * "Hollow Knight" must not resolve to "Hollow Knight: Silksong". */
+#define NSWPEDIA "https://nswpedia.com"
+#define NSWPEDIA_SEARCH NSWPEDIA "/?s="
+#define NSWPEDIA_GAME NSWPEDIA "/nintendo-switch-roms/"
+#define NSWPEDIA_IMAGE NSWPEDIA "/wp-content/uploads/"
+
+static bool nswpedia_slug_match(const char *candidate, const char *wanted) {
+    size_t length = strlen(wanted);
+    if (!length || strncmp(candidate, wanted, length)) return false;
+    if (!candidate[length]) return true;
+    const char *suffix = candidate + length;
+    static const char *const allowed[] = {
+        "-nsp", "-xci", "-rom", "-switch", "-totk", "-v", "-game",
+        "-free-download", "-download"
+    };
+    if (suffix[0] == '-' && suffix[1] >= '0' && suffix[1] <= '9')
+        return true;
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(*allowed); ++i)
+        if (!strncmp(suffix, allowed[i], strlen(allowed[i]))) return true;
+    return false;
+}
+
+static void nswpedia_images(const char *html, GameGallery *gallery) {
+    const char *start = strstr(html, "<div id=\"lightgallery\"");
+    if (!start) return;
+    const char *stop = strstr(start, "</div>");
+    if (!stop) return;
+    static const char marker[] = "href=\"" NSWPEDIA_IMAGE;
+    const char *cursor = start;
+    while ((cursor = strstr(cursor, marker)) && cursor < stop &&
+           gallery->count < GALLERY_LIMIT) {
+        const char *image = cursor + sizeof("href=\"") - 1;
+        const char *end = strchr(image, '"');
+        if (!end || end >= stop) break;
+        const char *tag_end = strchr(end, '>');
+        if (!tag_end || tag_end >= stop) break;
+        const char *type = strstr(end, "screen_shot");
+        cursor = tag_end + 1;
+        if (!type || type >= tag_end) continue;
+        size_t length = (size_t)(end - image);
+        if (!length || length >= CATALOG_URL) continue;
+        char url[CATALOG_URL];
+        memcpy(url, image, length);
+        url[length] = 0;
+        const char *dot = strrchr(url, '.');
+        if (!dot || (strcasecmp(dot, ".jpg") && strcasecmp(dot, ".jpeg") &&
+                     strcasecmp(dot, ".png"))) continue;
+        bool repeated = false;
+        for (size_t i = 0; i < gallery->count; ++i)
+            if (!strcmp(url, gallery->screenshots[i])) repeated = true;
+        if (!repeated)
+            strcpy(gallery->screenshots[gallery->count++], url);
+    }
+    if (gallery->count) gallery->issue[0] = 0;
+}
+
+static bool nswpedia_confirm_title(const char *html, const char *wanted) {
+    const char *begin = strstr(html, "<title>");
+    if (!begin) return false;
+    begin += sizeof("<title>") - 1;
+    const char *end = strstr(begin, "</title>");
+    if (!end || end - begin >= CATALOG_TEXT) return false;
+    char actual[CATALOG_TEXT], key[CATALOG_TEXT], expected[CATALOG_TEXT];
+    memcpy(actual, begin, (size_t)(end - begin));
+    actual[end - begin] = 0;
+    title_key(key, actual);
+    title_key(expected, wanted);
+    size_t n = strlen(expected);
+    if (!n || strncmp(key, expected, n)) return false;
+    const char *suffix = key + n;
+    return !*suffix || !strncmp(suffix, "nsp", 3) ||
+           !strncmp(suffix, "xci", 3) || !strncmp(suffix, "rom", 3) ||
+           !strncmp(suffix, "switch", 6) || !strncmp(suffix, "v", 1);
+}
+
+static bool nswpedia_gallery(GalleryJob *job) {
+    const char *names[] = {job->title, job->catalog_title};
+    char last[CATALOG_TEXT] = {0};
+    for (size_t attempt = 0; attempt < 2 && !atomic_load(&job->cancel); ++attempt) {
+        if (!names[attempt][0]) continue;
+        char name[CATALOG_TEXT], slug[CATALOG_TEXT];
+        snprintf(name, sizeof(name), "%s", names[attempt]);
+        clean_heading(name);
+        remove_suffix(name, "nintendo switch");
+        remove_suffix(name, "switch");
+        make_slug(slug, name);
+        for (char *p = slug; *p; ++p)
+            if (*p == '_') *p = '-';
+        if (!slug[0] || !strcmp(last, slug)) continue;
+        strcpy(last, slug);
+        CURL *curl = curl_easy_init();
+        if (!curl) break;
+        char *encoded = curl_easy_escape(curl, name, 0);
+        curl_easy_cleanup(curl);
+        if (!encoded) break;
+        char search_url[CATALOG_URL];
+        int n = snprintf(search_url, sizeof(search_url), NSWPEDIA_SEARCH "%s", encoded);
+        curl_free(encoded);
+        if (n <= 0 || n >= (int)sizeof(search_url)) continue;
+        size_t size = 0;
+        CatalogFetchStatus status = {0};
+        unsigned char *results = catalog_fetch_document(search_url, &job->cancel, &size, &status);
+        if (!results) {
+            if (status.curl) break;
+            continue;
+        }
+        static const char prefix[] = "href=\"" NSWPEDIA_GAME;
+        const char *cursor = (const char *)results;
+        char candidate[CATALOG_URL] = {0};
+        while ((cursor = strstr(cursor, prefix)) && !atomic_load(&job->cancel)) {
+            const char *begin = cursor + sizeof("href=\"") - 1;
+            const char *end = strchr(begin, '"');
+            if (!end) break;
+            cursor = end + 1;
+            size_t length = (size_t)(end - begin);
+            if (!length || length >= CATALOG_URL) continue;
+            const char *lastslash = end;
+            while (lastslash > begin && lastslash[-1] != '/') --lastslash;
+            size_t suffix_size = (size_t)(end - lastslash);
+            if (!suffix_size || suffix_size >= CATALOG_TEXT) continue;
+            char article_slug[CATALOG_TEXT];
+            memcpy(article_slug, lastslash, suffix_size);
+            article_slug[suffix_size] = 0;
+            if (!nswpedia_slug_match(article_slug, slug)) continue;
+            memcpy(candidate, begin, length);
+            candidate[length] = 0;
+            break;
+        }
+        free(results);
+        if (!candidate[0] || atomic_load(&job->cancel)) continue;
+        size = 0;
+        unsigned char *page = catalog_fetch_document(candidate, &job->cancel, &size, &status);
+        if (page) {
+            if (nswpedia_confirm_title((const char *)page, name))
+                nswpedia_images((const char *)page, &job->result);
+            free(page);
+            if (job->result.count) return true;
+        }
+    }
+    return false;
+}
+
 void load_game_gallery(GalleryJob *job) {
     if (job->romsns_page[0]) {
         bool loaded = catalog_read_romsns_media(job->romsns_page, &job->cancel, job->port_description,
@@ -845,6 +989,8 @@ void load_game_gallery(GalleryJob *job) {
     // A separately hosted gallery avoids Nintendo's blocked domains and
     // also covers Switch exclusives that are not available on Steam.
     if (gematsu_gallery(job)) return;
+    if (atomic_load(&job->cancel)) return;
+    if (nswpedia_gallery(job)) return;
     if (atomic_load(&job->cancel)) return;
 
     /* Steam is a last resort, using only media from an exact title match. */

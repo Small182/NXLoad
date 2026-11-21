@@ -3,6 +3,7 @@
 #include "game_info.h"
 #include "trailers.h"
 #include "steam_media.h"
+#include "json.h"
 
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
@@ -564,32 +565,94 @@ void load_game_gallery(GalleryJob *job) {
     free(media);
 }
 
+
+#define SWITCH_VIDEO_API_1 "https://inv.nadeko.net"
+#define SWITCH_VIDEO_API_2 "https://yewtu.be"
+
+/* A Switch-only trailer lookup. Nintendo Store can be blocked by DNS.mitm,
+ * but official Switch launch/announcement trailers are also published
+ * independently. Do not substitute the Steam/PC edition's trailer. */
+static bool switch_video_id(const char *id) {
+    if (strlen(id) != 11) return false;
+    return strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == 11;
+}
+
+static bool switch_video_title(const char *title, const char *wanted) {
+    char video[CATALOG_TEXT], game[CATALOG_TEXT];
+    title_key(video, title);
+    title_key(game, wanted);
+    if (!game[0] || !strstr(video, game)) return false;
+    /* Require an explicit Switch label so PC/PS/Xbox footage is not mixed in. */
+    bool has_switch = strcasestr(title, "Nintendo Switch") ||
+                      strcasestr(title, "Switch Launch") ||
+                      strcasestr(title, "Switch Trailer") ||
+                      strcasestr(title, "Switch Gameplay");
+    bool has_trailer = strcasestr(title, "Trailer") ||
+                       strcasestr(title, "Overview") ||
+                       strcasestr(title, "Gameplay") ||
+                       strcasestr(title, "Announcement") ||
+                       strcasestr(title, "Preview");
+    return has_switch && has_trailer;
+}
+
+static bool switch_videos_from_instance(TrailerJob *job, const char *instance,
+                                        CatalogFetchStatus *last) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return false;
+    char query[CATALOG_TEXT + 32];
+    snprintf(query, sizeof(query), "%s Nintendo Switch trailer", job->title);
+    char *encoded = curl_easy_escape(curl, query, 0);
+    curl_easy_cleanup(curl);
+    if (!encoded) return false;
+    char url[CATALOG_URL];
+    int n = snprintf(url, sizeof(url), "%s/api/v1/search?q=%s&type=video", instance, encoded);
+    curl_free(encoded);
+    if (n <= 0 || n >= (int)sizeof(url)) return false;
+
+    size_t bytes = 0;
+    unsigned char *body = catalog_fetch_document(url, &job->cancel, &bytes, last);
+    if (!body || atomic_load(&job->cancel)) {
+        free(body);
+        return false;
+    }
+    Json list = {(char *)body, (char *)body + bytes};
+    const char *cursor = NULL;
+    unsigned examined = 0;
+    while (job->result.count < TRAILER_LIMIT && examined++ < 25) {
+        Json item = next_object(list, &cursor);
+        if (!item.begin) break;
+        if (!literal(field(item, "type"), "\"video\"")) continue;
+        char title[CATALOG_TEXT], id[32];
+        if (!string_field(item, "title", title, sizeof(title)) ||
+            !string_field(item, "videoId", id, sizeof(id)) ||
+            !switch_video_id(id) || !switch_video_title(title, job->title)) continue;
+        bool duplicate = false;
+        for (size_t i = 0; i < job->result.count; ++i)
+            if (strstr(job->result.urls[i], id)) duplicate = true;
+        if (duplicate) continue;
+        char uri[CATALOG_URL];
+        n = snprintf(uri, sizeof(uri),
+                     "%s/latest_version?id=%s&itag=18&local=true", instance, id);
+        if (n > 0 && n < (int)sizeof(uri))
+            strcpy(job->result.urls[job->result.count++], uri);
+    }
+    free(body);
+    return job->result.count != 0;
+}
+
 void load_game_trailers(TrailerJob *job) {
     if (atomic_load(&job->cancel)) return;
-    SteamMedia *media = calloc(1, sizeof(*media));
-    if (!media) {
-        strcpy(job->result.issue, "Не вистачає пам'яті для трейлерів");
-        return;
-    }
-    char name[CATALOG_TEXT];
-    snprintf(name, sizeof(name), "%s", job->title);
-    clean_heading(name);
-    remove_suffix(name, "nintendo switch");
-    remove_suffix(name, "switch");
-    steam_media_lookup(name, &job->cancel, media);
-    if (!atomic_load(&job->cancel)) {
-        job->result.count = media->trailer_count;
-        if (job->result.count)
-            memcpy(job->result.urls, media->trailers,
-                   job->result.count * sizeof(job->result.urls[0]));
-        else if (media->curl_error)
-            snprintf(job->result.issue, sizeof(job->result.issue), "Steam · cURL %d", media->curl_error);
-        else if (media->http_error && media->http_error != 200)
-            snprintf(job->result.issue, sizeof(job->result.issue), "Steam · HTTP %ld", media->http_error);
-        else if (!media->matched)
-            strcpy(job->result.issue, "Цю гру не знайдено в Steam");
-        else
-            strcpy(job->result.issue, "Трейлерів Steam для цієї гри немає");
-    }
-    free(media);
+    CatalogFetchStatus status = {0};
+    if (switch_videos_from_instance(job, SWITCH_VIDEO_API_1, &status)) return;
+    if (atomic_load(&job->cancel)) return;
+    if (switch_videos_from_instance(job, SWITCH_VIDEO_API_2, &status)) return;
+    if (atomic_load(&job->cancel)) return;
+    if (status.curl)
+        snprintf(job->result.issue, sizeof(job->result.issue),
+                 "Switch-трейлери: відеошлюз cURL %d", status.curl);
+    else if (status.http && status.http != 200)
+        snprintf(job->result.issue, sizeof(job->result.issue),
+                 "Switch-трейлери: відеошлюз HTTP %ld", status.http);
+    else
+        strcpy(job->result.issue, "Switch-трейлери не знайдено");
 }

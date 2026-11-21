@@ -119,13 +119,36 @@ static void video_cancel(void *arg) {
 
 static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     (void)unused;
-    static const char prefix[] = TRAILER_SCHEME "://" TRAILER_HOST TRAILER_480;
-    if (strncmp(uri, prefix, sizeof(prefix) - 1)) return MPV_ERROR_LOADING_FAILED;
-    const char *path = uri + sizeof(prefix) - 1;
-    size_t length = strlen(path);
-    if (length < 5 || strcmp(path + length - 4, ".mp4") ||
-        strspn(path, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/") != length - 4)
-        return MPV_ERROR_LOADING_FAILED;
+    static const char scheme[] = TRAILER_SCHEME "://";
+    static const char nintendo[] = TRAILER_HOST TRAILER_480;
+    static const char *const steam_hosts[] = {
+        "video.akamai.steamstatic.com/store_trailers/",
+        "video.cloudflare.steamstatic.com/store_trailers/",
+        "video.fastly.steamstatic.com/store_trailers/",
+    };
+    if (strncmp(uri, scheme, sizeof(scheme) - 1)) return MPV_ERROR_LOADING_FAILED;
+    const char *source = uri + sizeof(scheme) - 1;
+    bool nintendo_video = !strncmp(source, nintendo, sizeof(nintendo) - 1);
+    const char *path = NULL;
+    if (nintendo_video) {
+        path = source + sizeof(nintendo) - 1;
+        size_t length = strlen(path);
+        if (length < 5 || strcmp(path + length - 4, ".mp4") ||
+            strspn(path, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/") != length - 4)
+            return MPV_ERROR_LOADING_FAILED;
+    } else {
+        for (size_t i = 0; i < sizeof(steam_hosts) / sizeof(*steam_hosts); ++i) {
+            size_t prefix = strlen(steam_hosts[i]);
+            if (!strncmp(source, steam_hosts[i], prefix)) {
+                path = source + prefix;
+                break;
+            }
+        }
+        if (!path) return MPV_ERROR_LOADING_FAILED;
+        size_t digits = strspn(path, "0123456789");
+        if (digits < 5 || digits > 16 || strcmp(path + digits, "/movie480.mp4"))
+            return MPV_ERROR_LOADING_FAILED;
+    }
 
     VideoStream *stream = calloc(1, sizeof(*stream));
     if (!stream) return MPV_ERROR_NOMEM;
@@ -137,11 +160,14 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     }
     CURL *curl = stream->connection;
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 2L);
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 4L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 14L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.50");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, video_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, stream);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, video_header);
@@ -150,17 +176,34 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, video_progress);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, stream);
 
-    int n = snprintf(stream->url, sizeof(stream->url), "https://" TRAILER_HOST TRAILER_480 "%s", path);
+    int n = snprintf(stream->url, sizeof(stream->url), "https://%s", source);
     if (n < 0 || (size_t)n >= sizeof(stream->url)) {
         video_close(stream);
         return MPV_ERROR_LOADING_FAILED;
     }
     if (!fetch_video_block(stream, 0)) {
-        // The original asset can support seeking before a resized rendition is cached.
-        snprintf(stream->url, sizeof(stream->url), "https://" TRAILER_HOST "%s", path);
-        if (!fetch_video_block(stream, 0)) {
-            video_close(stream);
-            return MPV_ERROR_LOADING_FAILED;
+        if (nintendo_video) {
+            /* Older Nintendo videos sometimes need their unscaled rendition. */
+            snprintf(stream->url, sizeof(stream->url), "https://" TRAILER_HOST "%s", path);
+            if (!fetch_video_block(stream, 0)) {
+                video_close(stream);
+                return MPV_ERROR_LOADING_FAILED;
+            }
+        } else {
+            /* Steam provides mirrored CDN hosts; try the other host if a
+             * particular endpoint is unreachable from Switch. */
+            bool recovered = false;
+            for (size_t i = 0; i < sizeof(steam_hosts) / sizeof(*steam_hosts); ++i) {
+                snprintf(stream->url, sizeof(stream->url), "https://%s%s", steam_hosts[i], path);
+                if (fetch_video_block(stream, 0)) {
+                    recovered = true;
+                    break;
+                }
+            }
+            if (!recovered) {
+                video_close(stream);
+                return MPV_ERROR_LOADING_FAILED;
+            }
         }
     }
 

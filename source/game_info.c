@@ -25,6 +25,7 @@
 #define CATALOG_META_PATH "romfs:/catalog-meta.tsv"
 #endif
 
+#define NLIB_SCREEN_API "https://api.nlib.cc/nx/"
 #define NL "https://www.nintendolife.com"
 #define NL_SWITCH "/games/nintendo-switch/"
 #define NL_ESHOP "/games/switch-eshop/"
@@ -304,8 +305,18 @@ static bool read_metadata_record(FILE *file, GameMetadata *metadata) {
     }
     if (available) {
         const char *end = memchr(inputs, 0, available);
-        if (end && (size_t)(end - inputs) < sizeof(result.developer))
-            memcpy(result.developer, inputs, (size_t)(end - inputs) + 1);
+        if (end && (size_t)(end - inputs) < sizeof(result.developer)) {
+            size_t n = (size_t)(end - inputs) + 1;
+            memcpy(result.developer, inputs, n);
+            inputs += n;
+            available -= n;
+        }
+    }
+    if (available) {
+        const char *end = memchr(inputs, 0, available);
+        if (end && end - inputs == 16 &&
+            strspn(inputs, "0123456789abcdefABCDEF") == 16)
+            memcpy(result.title_id, inputs, 17);
     }
     *metadata = result;
     return metadata->title[0] != 0;
@@ -690,6 +701,87 @@ static bool gematsu_gallery(GalleryJob *job) {
     return false;
 }
 
+/* TitleDB supplies canonical Switch Title IDs. Nlib serves independent,
+ * version-specific JPEG screenshots without Nintendo's blocked DNS hosts.
+ * Its JSON uses http:// image links, but HTTPS works; reconstruct URLs
+ * explicitly rather than following insecure redirects or trusting the host. */
+static bool nlib_gallery(GalleryJob *job) {
+    const char *tid = job->title_id;
+    if (strlen(tid) != 16 ||
+        strspn(tid, "0123456789abcdefABCDEF") != 16) return false;
+
+    char url[CATALOG_URL];
+    snprintf(url, sizeof(url), NLIB_SCREEN_API "%s/screens", tid);
+    CatalogFetchStatus status = {0};
+    size_t len = 0;
+    unsigned char *data = catalog_fetch_document(url, &job->cancel, &len, &status);
+    if (!data || atomic_load(&job->cancel)) {
+        free(data);
+        return false;
+    }
+
+    Json root = {(const char *)data, (const char *)data + len};
+    Json screen_list = field(root, "screenshots");
+    Json count_field = field(root, "count");
+    if (!screen_list.begin || *screen_list.begin != '[' || !count_field.begin) {
+        free(data);
+        return false;
+    }
+    size_t count_size = (size_t)(count_field.end - count_field.begin);
+    if (!count_size || count_size > 3 ||
+        strspn(count_field.begin, "0123456789") != count_size) {
+        free(data);
+        return false;
+    }
+    unsigned promised = (unsigned)atoi(count_field.begin);
+    if (!promised || promised > GALLERY_LIMIT) promised = GALLERY_LIMIT;
+
+    const char *cursor = whitespace(screen_list.begin + 1, screen_list.end);
+    while (job->result.count < promised &&
+           cursor < screen_list.end && *cursor == '"' &&
+           !atomic_load(&job->cancel)) {
+        const char *end = value_end(cursor, screen_list.end, 0);
+        if (!end) break;
+        char link[CATALOG_URL];
+        size_t bytes = (size_t)(end - cursor - 2);
+        if (bytes && bytes < sizeof(link)) {
+            memcpy(link, cursor + 1, bytes);
+            link[bytes] = 0;
+            /* URLs must match the exact Title ID, no foreign hosts,
+             * arbitrary paths, query parameters or redirect targets. */
+            const char *path = strstr(link, "/nx/");
+            if (path && (!strncmp(link, "http://api.nlib.cc/nx/", 22) ||
+                         !strncmp(link, "https://api.nlib.cc/nx/", 23))) {
+                char expected[80];
+                snprintf(expected, sizeof(expected), "/nx/%s/screen/", tid);
+                if (!strncmp(path, expected, strlen(expected))) {
+                    const char *suffix = path + strlen(expected);
+                    size_t digits = strspn(suffix, "0123456789");
+                    if (digits && digits <= 3 && !suffix[digits]) {
+                        unsigned index = (unsigned)atoi(suffix);
+                        if (index >= 1 && index <= GALLERY_LIMIT) {
+                            snprintf(job->result.screenshots[job->result.count],
+                                     CATALOG_URL, NLIB_SCREEN_API "%s/screen/%u", tid, index);
+                            ++job->result.count;
+                        }
+                    }
+                }
+            }
+        }
+        cursor = whitespace(end, screen_list.end);
+        if (cursor < screen_list.end && *cursor == ',')
+            cursor = whitespace(cursor + 1, screen_list.end);
+        else
+            break;
+    }
+    free(data);
+    if (job->result.count) {
+        job->result.issue[0] = 0;
+        return true;
+    }
+    return false;
+}
+
 void load_game_gallery(GalleryJob *job) {
     if (job->romsns_page[0]) {
         bool loaded = catalog_read_romsns_media(job->romsns_page, &job->cancel, job->port_description,
@@ -702,6 +794,8 @@ void load_game_gallery(GalleryJob *job) {
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
     if (bundled_gallery(key, &job->result)) return;
+    if (nlib_gallery(job)) return;
+    if (atomic_load(&job->cancel)) return;
 
     /* ROMsHQ screenshots are installed by finish_jobs() when available.
      * Never generate img-eshop.cdn.nintendo.net URLs: DNS.mitm can block them.

@@ -578,8 +578,9 @@ void load_game_gallery(GalleryJob *job) {
 }
 
 
-#define SWITCH_VIDEO_API_1 "https://inv.nadeko.net"
-#define SWITCH_VIDEO_API_2 "https://yewtu.be"
+// Verified to return structured Nintendo Switch trailer search results.
+// Public media relaying is best-effort and may reject individual streams.
+#define SWITCH_VIDEO_API_1 "https://iv.catgirl.cloud"
 
 /* A Switch-only trailer lookup. Nintendo Store can be blocked by DNS.mitm,
  * but official Switch launch/announcement trailers are also published
@@ -656,8 +657,6 @@ void load_game_trailers(TrailerJob *job) {
     if (atomic_load(&job->cancel)) return;
     CatalogFetchStatus status = {0};
     if (switch_videos_from_instance(job, SWITCH_VIDEO_API_1, &status)) return;
-    if (atomic_load(&job->cancel)) return;
-    if (switch_videos_from_instance(job, SWITCH_VIDEO_API_2, &status)) return;
     if (atomic_load(&job->cancel)) return;
     if (status.curl)
         snprintf(job->result.issue, sizeof(job->result.issue),

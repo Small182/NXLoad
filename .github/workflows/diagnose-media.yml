@@ -11,7 +11,7 @@ jobs:
       - name: Inspect accessible HTML and gallery markers
         run: |
           python3 - <<'PY'
-          import re, urllib.request, urllib.error
+          import re, json, urllib.request, urllib.error
           urls=[
             "https://www.nintendolife.com/games/nintendo-switch/super_mario_odyssey",
             "https://www.nintendo.com/us/store/products/super-mario-odyssey-switch/",
@@ -44,5 +44,19 @@ jobs:
                   print("NL_SCREEN_ANCHORS",len(shots),[x[:110].decode(errors="replace") for x in shots[:3]],flush=True)
                   videos=re.findall(rb'[^\\x22\\x27 <>]{0,120}/Video/[^\\x22\\x27 <>]{0,120}',data,re.I)
                   print("VIDEO_PATH_SAMPLES",[x[:200].decode(errors="replace") for x in videos[:3]],flush=True)
+                  if "nintendo.com/us/store" in url:
+                    m=re.search(rb'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',data,re.S)
+                    try:
+                      root=json.loads(m.group(1)) if m else {}
+                      props=root.get("props",{}).get("pageProps",{})
+                      current=props.get("analytics",{}).get("product",{})
+                      sku=str(current.get("sku",""))
+                      apollo=props.get("initialApolloState",{})
+                      key='Product:{"sku":"'+sku+'"}'
+                      product=apollo.get(key,{})
+                      print("PRODUCT_DEBUG","sku",sku,"keys",list(current.keys())[:8],"apollo",len(apollo),"found",bool(product),"nsuid",product.get("nsuid"),"gallery",len(product.get("productGallery",[])),flush=True)
+                      print("MAIN_GALLERY_FIRST",repr(product.get("productGallery",[])[:2])[:650],flush=True)
+                    except Exception as e: print("PRODUCT_PARSE_ERROR",repr(e),flush=True)
+
               except Exception as e: print("ERROR",type(e).__name__,str(e)[:200],flush=True)
           PY

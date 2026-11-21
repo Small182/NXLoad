@@ -1,0 +1,42 @@
+name: Probe fallback screenshot sites
+on:
+  push:
+    paths:
+      - .github/workflows/screenshots-provider-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check provider access and game screenshot markup
+        run: |
+          python3 - <<'PY'
+          import re,urllib.request,urllib.error,html
+          urls={
+            "nxbrew.net-home":"https://nxbrew.net/",
+            "nxbrew.net-search":"https://nxbrew.net/?s=Hollow+Knight",
+            "nxbrew.net-zelda":"https://nxbrew.net/?s=zelda+tears+of+the+kingdom",
+            "nxbrew.io-home":"https://nxbrew.io/",
+            "nxbrew.io-search":"https://nxbrew.io/?s=Hollow+Knight",
+            "gamefaqs-search":"https://gamefaqs.gamespot.com/search?game=Hollow+Knight",
+            "nintendolife-search":"https://www.nintendolife.com/search?query=Hollow%20Knight",
+            "romshq-zelda":"https://romshq.com/?s=Zelda+Tears+of+the+Kingdom",
+          }
+          for name,url in urls.items():
+              print("\n=== SOURCE",name,url,flush=True)
+              try:
+                  req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36","Accept":"text/html,*/*;q=0.8"})
+                  with urllib.request.urlopen(req,timeout=8) as response:
+                      raw=response.read(400000)
+                      print("HTTP",response.status,"CONTENT_TYPE",response.headers.get("Content-Type"),"FINAL",response.url,"BYTES",len(raw),flush=True)
+                  page=raw.decode("utf-8","replace")
+                  print("TITLE",re.findall(r"<title[^>]*>([^<]*)",page,re.I)[:2])
+                  print("OGIMAGE",re.findall(r'<meta[^>]+(?:property|name)=["\\x27]og:image["\\x27][^>]{0,500}',page,re.I)[:2])
+                  print("ARTICLES",re.findall(r'<a[^>]{0,500}href=["\\x27](https?://[^"\\x27]+)["\\x27][^>]{0,200}>([^<]+)',page,re.I)[:8])
+                  print("MEDIA_IMAGE",re.findall(r'https?://[^"\\x27 <]+\\.(?:jpg|jpeg|png|webp)',page,re.I)[:15])
+                  print("SCREENSHOTS",re.findall(r'.{0,80}(?:screenshots|gallery|gameplay|wp-content/uploads).{0,120}',page,re.I)[:7])
+                  print("SAMPLE",repr(page[:180]))
+              except Exception as e:
+                  print("ERROR",type(e).__name__,str(e)[:200],flush=True)
+          PY

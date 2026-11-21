@@ -42,11 +42,19 @@ def build_catalog_metadata(database, nintendo_life):
                    if isinstance(categories, list) and genre in categories)
         if mask & (1 << 6):
             mask |= 1 << 13
-        icon = item.get("iconUrl") or ""
-        if not isinstance(icon, str) or not ESHOP_ICON.fullmatch(icon):
-            icon = ""
+        # Nlib provides independently hosted HTTPS JPEG icons by canonical
+        # Switch Title ID. Older eShop CDN icons may be blocked by DNS.mitm
+        # on updated Switch firmware, leaving otherwise valid catalog games
+        # with a blank cover. Prefer Nlib without changing screenshot sources.
+        title_id = item.get("id", "")
+        if isinstance(title_id, str) and re.fullmatch(r"[0-9a-fA-F]{16}", title_id):
+            icon = f"https://api.nlib.cc/nx/{title_id.upper()}/icon/256"
         else:
-            icon += "?w=256&h=256"
+            icon = item.get("iconUrl") or ""
+            if not isinstance(icon, str) or not ESHOP_ICON.fullmatch(icon):
+                icon = ""
+            else:
+                icon += "?w=256&h=256"
         rows[encoded_key.decode()] = (cell(name, 191), icon, "", "", released_on(item.get("releaseDate")), mask, 0)
 
     matches = defaultdict(list)

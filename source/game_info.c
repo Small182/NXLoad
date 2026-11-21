@@ -554,8 +554,10 @@ static bool store_gallery(GalleryJob *job) {
     return false;
 }
 
-unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes) {
-    if (!begins(url, BUILTIN_GALLERY_PATH)) return catalog_fetch_cover(url, cancel, bytes);
+unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *bytes,
+                                  CatalogFetchStatus *status) {
+    *status = (CatalogFetchStatus){0};
+    if (!begins(url, BUILTIN_GALLERY_PATH)) return catalog_fetch_cover_status(url, cancel, bytes, status);
     *bytes = 0;
     if (atomic_load(cancel)) return NULL;
     FILE *file = fopen(url, "rb");

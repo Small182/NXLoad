@@ -537,6 +537,9 @@ static bool store_gallery(GalleryJob *job) {
         remove_suffix(name, "nintendo switch");
         remove_suffix(name, "switch");
         make_slug(slug, name);
+        // Nintendo Life uses underscores, but Nintendo Store uses hyphens.
+        for (char *p = slug; *p; ++p)
+            if (*p == '_') *p = '-';
         if (!slug[0] || !strcmp(slug, previous)) continue;
         strcpy(previous, slug);
         snprintf(url, sizeof(url), STORE_SCREENSHOTS_PAGE "%s-switch/", slug);

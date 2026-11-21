@@ -686,10 +686,96 @@ static bool switch_videos_from_instance(TrailerJob *job, const char *instance,
     return job->result.count != 0;
 }
 
+/* Do not advertise YouTube/Invidious search hits as playable trailers
+ * until a 16-byte ranged MP4 request actually succeeds. Public gateways
+ * often return HTTP 500 after successful /api/v1/search responses. */
+typedef struct {
+    unsigned char bytes[16];
+    size_t count;
+} TrailerProbe;
+
+static size_t trailer_probe_write(char *data, size_t size, size_t count, void *arg) {
+    TrailerProbe *probe = arg;
+    if (count && size > SIZE_MAX / count) return 0;
+    size_t n = size * count;
+    if (n > sizeof(probe->bytes) - probe->count) return 0;
+    memcpy(probe->bytes + probe->count, data, n);
+    probe->count += n;
+    return n;
+}
+
+static bool trailer_probe_url(const char *url, atomic_bool *cancel,
+                              CatalogFetchStatus *status) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        *status = (CatalogFetchStatus){.curl = CURLE_FAILED_INIT};
+        return false;
+    }
+    TrailerProbe probe = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-15");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 7L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 4L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, trailer_probe_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &probe);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.50");
+    if (atomic_load(cancel)) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+    status->curl = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status->http);
+    bool works = !status->curl && status->http == 206 &&
+                 probe.count == sizeof(probe.bytes) &&
+                 !memcmp(probe.bytes + 4, "ftyp", 4);
+    curl_easy_cleanup(curl);
+    return works;
+}
+
+static bool trailer_probe_stream(const char *url, atomic_bool *cancel,
+                                 CatalogFetchStatus *status) {
+    if (trailer_probe_url(url, cancel, status)) return true;
+    if (atomic_load(cancel)) return false;
+    char alternate[CATALOG_URL];
+    snprintf(alternate, sizeof(alternate), "%s", url);
+    char *local = strstr(alternate, "&local=true");
+    if (!local) return false;
+    memcpy(local, "&local=false", sizeof("&local=false") - 1);
+    return trailer_probe_url(alternate, cancel, status);
+}
+
 void load_game_trailers(TrailerJob *job) {
     if (atomic_load(&job->cancel)) return;
     CatalogFetchStatus status = {0};
-    if (switch_videos_from_instance(job, SWITCH_VIDEO_API_1, &status)) return;
+    if (switch_videos_from_instance(job, SWITCH_VIDEO_API_1, &status)) {
+        size_t discovered = job->result.count;
+        CatalogFetchStatus video_status = {0};
+        bool streamable = false;
+        for (size_t i = 0; i < discovered && i < 2 && !atomic_load(&job->cancel); ++i) {
+            if (trailer_probe_stream(job->result.urls[i], &job->cancel, &video_status)) {
+                streamable = true;
+                break;
+            }
+        }
+        if (streamable) return;
+        job->result.count = 0;
+        if (atomic_load(&job->cancel)) return;
+        if (video_status.http >= 400)
+            snprintf(job->result.issue, sizeof(job->result.issue),
+                     "Трейлери · HTTP %ld", video_status.http);
+        else if (video_status.curl)
+            snprintf(job->result.issue, sizeof(job->result.issue),
+                     "Трейлери · cURL %d", video_status.curl);
+        else
+            strcpy(job->result.issue, "Трейлери знайдено, потік недоступний");
+        return;
+    }
     if (atomic_load(&job->cancel)) return;
     if (status.curl)
         snprintf(job->result.issue, sizeof(job->result.issue),

@@ -9,6 +9,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
+      - uses: actions/checkout@v4
+      - name: Inspect Zelda catalog link
+        run: |
+          python3 - <<'PY'
+          import gzip,json,re
+          with gzip.open('tools/nintendo-life.json.gz','rt') as f: data=json.load(f)
+          for path,info in data.items():
+              if 'zelda' in path and 'kingdom' in path and ('switch/' in path):
+                  print('INDEX PATH',path,'TITLE',repr(info[0]),flush=True)
+          PY
       - name: Check actual provider responses
         run: |
           python3 - <<'PY'
@@ -16,6 +26,9 @@ jobs:
           urls={
             "nintendolife-overview":"https://www.nintendolife.com/games/nintendo-switch/super_mario_odyssey",
             "nintendolife-screenshots":"https://www.nintendolife.com/games/nintendo-switch/super_mario_odyssey/screenshots",
+            "zelda-overview":"https://www.nintendolife.com/games/nintendo-switch/legend_of_zelda_tears_of_the_kingdom",
+            "zelda-screenshots":"https://www.nintendolife.com/games/nintendo-switch/legend_of_zelda_tears_of_the_kingdom/screenshots",
+            "zelda-alternate":"https://www.nintendolife.com/games/nintendo-switch/the_legend_of_zelda_tears_of_the_kingdom/screenshots",
             "steam-search":"https://store.steampowered.com/api/storesearch/?term=Hollow%20Knight&l=english&cc=US",
             "invidious-nadeko":"https://inv.nadeko.net/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
             "invidious-yewtu":"https://yewtu.be/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
@@ -49,7 +62,7 @@ jobs:
                 body=f.read(4096 if name.startswith("invidious-stream") else 1024*1024)
                 print("status",f.status,"bytes",len(body),"mime",f.headers.get("content-type"),"content-range",f.headers.get("content-range"),"url",f.url)
               text=body.decode("utf-8","replace")
-              if name.startswith("nintendolife"):
+              if name.startswith("nintendolife") or name.startswith("zelda"):
                 for patt in (r'images\.nintendolife\.com/screenshots/\d+/(?:large|small)\.jpg',
                              r'/(?:games|screenshots)/[^"< ]+',r'(?i)<section[^>]{0,200}screenshots[^>]*>',
                              r'(?i)<img[^>]{0,500}>'):

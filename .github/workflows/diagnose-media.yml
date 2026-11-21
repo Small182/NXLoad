@@ -37,5 +37,12 @@ jobs:
                   ]:
                     print(name, len(re.findall(pat,data,re.I)),flush=True)
                   print("FIRST_100",repr(data[:100]),flush=True)
+                  for marker in [b'id="screenshots"',b'screenshots/',b'productGallery',b'/Video/',b'store/software/switch/',b'"publicId"']:
+                    p=data.find(marker)
+                    if p>=0: print("SNIP",marker.decode(),repr(data[max(0,p-90):p+280])[:450],flush=True)
+                  shots=re.findall(rb'<a\\b[^>]*href=[\\x22\\x27]([^\\x22\\x27]*screenshots/[^\\x22\\x27]+)',data,re.I)
+                  print("NL_SCREEN_ANCHORS",len(shots),[x[:110].decode(errors="replace") for x in shots[:3]],flush=True)
+                  videos=re.findall(rb'[^\\x22\\x27 <>]{0,120}/Video/[^\\x22\\x27 <>]{0,120}',data,re.I)
+                  print("VIDEO_PATH_SAMPLES",[x[:200].decode(errors="replace") for x in videos[:3]],flush=True)
               except Exception as e: print("ERROR",type(e).__name__,str(e)[:200],flush=True)
           PY

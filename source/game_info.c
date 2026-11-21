@@ -29,7 +29,6 @@
 #define NL_SWITCH "/games/nintendo-switch/"
 #define NL_ESHOP "/games/switch-eshop/"
 #define NL_IMAGE "https://images.nintendolife.com/screenshots/"
-#define TITLEDB_IMAGE "https://img-eshop.cdn.nintendo.net/i/"
 #define SOURCE_PAGE "https://nsroms.net/roms/"
 
 static bool begins(const char *value, const char *prefix) {
@@ -450,21 +449,6 @@ static bool bundled_gallery(const char *key, GameGallery *gallery) {
     return gallery->count != 0;
 }
 
-static void titledb_gallery(GalleryJob *job) {
-    GameGallery *gallery = &job->result;
-    const char *hashes = job->fallback_hashes;
-    size_t digits = strspn(hashes, "0123456789abcdef");
-    if (digits % 64 || hashes[digits]) return;
-    for (size_t offset = 0; offset < digits && gallery->count < GALLERY_LIMIT; offset += 64)
-        snprintf(gallery->screenshots[gallery->count++], CATALOG_URL,
-                 TITLEDB_IMAGE "%.64s.jpg", hashes + offset);
-    if (gallery->count) {
-        gallery->from_titledb = true;
-        gallery->issue[0] = 0;
-    }
-}
-
-
 #define STORE_SCREENSHOTS_PAGE "https://www.nintendo.com/us/store/products/"
 #define STORE_SCREENSHOTS_CDN "https://assets.nintendo.com/image/upload/c_limit,w_1280,h_720,f_jpg,q_80/"
 #define STORE_SCREENSHOTS_PATH "store/software/switch/"
@@ -591,61 +575,59 @@ void load_game_gallery(GalleryJob *job) {
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
     if (bundled_gallery(key, &job->result)) return;
-    if (job->prefer_titledb) {
-        titledb_gallery(job);
-        if (job->result.count) return;
-    }
-    CatalogFetchStatus status = {0};
+
+    /* TitleDB's old img-eshop.cdn.nintendo.net/i/<hash>.jpg links fail on
+     * some Switch networks (cURL 7). They are metadata, not confirmed
+     * images. Never let them displace galleries from live providers. */
+    CatalogFetchStatus nl_status = {0};
     if (job->nintendo_life[0] && !atomic_load(&job->cancel)) {
         char url[CATALOG_URL];
         snprintf(url, sizeof(url), NL "%.*s", (int)(sizeof(url) - sizeof(NL)), job->nintendo_life);
-        if (fetch_gallery(job, url, key, alternate, &status, true)) return;
-        titledb_gallery(job);
-        if (!job->result.count && !atomic_load(&job->cancel)) store_gallery(job);
-        if (!job->result.count && !atomic_load(&job->cancel))
-            snprintf(job->result.issue, sizeof(job->result.issue),
-                     tr("Галерея Nintendo Life недоступна · HTTP %ld"), status.http);
-        return;
-    }
-    char slugs[2][CATALOG_TEXT] = {{0}};
-    make_slug(slugs[0], name);
-    if (!job->title[0]) {
-        if (remove_suffix(name, "nintendo switch") || remove_suffix(name, "switch")) {
-            title_key(alternate, name);
-            make_slug(slugs[1], name);
+        if (fetch_gallery(job, url, key, alternate, &nl_status, true)) return;
+    } else {
+        char slugs[2][CATALOG_TEXT] = {{0}};
+        make_slug(slugs[0], name);
+        if (!job->title[0]) {
+            if (remove_suffix(name, "nintendo switch") || remove_suffix(name, "switch")) {
+                title_key(alternate, name);
+                make_slug(slugs[1], name);
+            }
+        } else if (begins(job->page, SOURCE_PAGE)) {
+            const char *slug = job->page + sizeof(SOURCE_PAGE) - 1;
+            size_t size = strspn(slug, "abcdefghijklmnopqrstuvwxyz0123456789-");
+            if (size >= sizeof("-switch") && size < sizeof(slugs[1]) &&
+                !memcmp(slug + size - (sizeof("-switch") - 1), "-switch", sizeof("-switch") - 1))
+                snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)(size - (sizeof("-switch") - 1)), slug);
         }
-    } else if (begins(job->page, SOURCE_PAGE)) {
-        const char *slug = job->page + sizeof(SOURCE_PAGE) - 1;
-        size_t size = strspn(slug, "abcdefghijklmnopqrstuvwxyz0123456789-");
-        if (size >= sizeof("-switch") && size < sizeof(slugs[1]) &&
-            !memcmp(slug + size - (sizeof("-switch") - 1), "-switch", sizeof("-switch") - 1))
-            snprintf(slugs[1], sizeof(slugs[1]), "%.*s", (int)(size - (sizeof("-switch") - 1)), slug);
-    }
-
-    const char *platforms[] = {NL_SWITCH, NL_ESHOP};
-    for (size_t i = 0; i < 2 && !job->result.issue[0] && !atomic_load(&job->cancel); ++i) {
-        if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
-        for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
-            char url[CATALOG_URL];
-            snprintf(url, sizeof(url), NL "%s%s", platforms[j], slugs[i]);
-            if (fetch_gallery(job, url, key, alternate, &status, false)) return;
-            if (status.curl) {
-                snprintf(job->result.issue, sizeof(job->result.issue),
-                         "Nintendo Life · cURL %d", status.curl);
-                break;
+        const char *platforms[] = {NL_SWITCH, NL_ESHOP};
+        for (size_t i = 0; i < 2 && !atomic_load(&job->cancel); ++i) {
+            if (!slugs[i][0] || (i && !strcmp(slugs[0], slugs[1]))) continue;
+            for (size_t j = 0; j < 2 && !atomic_load(&job->cancel); ++j) {
+                char url[CATALOG_URL];
+                snprintf(url, sizeof(url), NL "%s%s", platforms[j], slugs[i]);
+                if (fetch_gallery(job, url, key, alternate, &nl_status, false)) return;
+                /* Connection errors mean this host is unreachable right now;
+                 * do not retry several more URL variations on the same host. */
+                if (nl_status.curl) break;
             }
-            if (status.http && status.http != 200 && status.http != 404) {
-                snprintf(job->result.issue, sizeof(job->result.issue),
-                         "Nintendo Life · HTTP %ld", status.http);
-                break;
-            }
+            if (nl_status.curl) break;
         }
     }
     if (atomic_load(&job->cancel)) return;
-    titledb_gallery(job);
-    if (!job->result.count && !atomic_load(&job->cancel)) store_gallery(job);
-    if (!job->result.count && !job->result.issue[0])
-        strcpy(job->result.issue, "Скриншоти гри в Nintendo Life та Nintendo Store не знайдено");
+
+    /* Prefer Nintendo's current Cloudinary product gallery to the obsolete
+     * eShop image CDN. Use store_gallery's own title checks and NSUID. */
+    if (store_gallery(job)) return;
+    if (atomic_load(&job->cancel)) return;
+
+    if (nl_status.curl)
+        snprintf(job->result.issue, sizeof(job->result.issue),
+                 "Nintendo Life · cURL %d; Nintendo Store: немає галереї", nl_status.curl);
+    else if (nl_status.http && nl_status.http != 200 && nl_status.http != 404)
+        snprintf(job->result.issue, sizeof(job->result.issue),
+                 "Nintendo Life · HTTP %ld; Nintendo Store: немає галереї", nl_status.http);
+    else
+        strcpy(job->result.issue, "Скриншоти не знайдено в Nintendo Life та Nintendo Store");
 }
 
 #define NINTENDO_PRODUCTS "https://www.nintendo.com/us/store/products/"

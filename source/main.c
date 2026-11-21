@@ -1174,6 +1174,7 @@ static void pump_gallery(void) {
                app.details[CATALOG_NSROMS].title : app.details[CATALOG_ROMSHQ].title);
         strcpy(job->catalog_title, app.active_game.title);
         strcpy(job->fallback_hashes, app.metadata.fallback_hashes);
+        strcpy(job->title_id, app.metadata.title_id);
         job->prefer_titledb = app.download_busy && transfer_stage() != 0;
         app.gallery_requested = true;
         app.gallery_busy = start_worker(&app.gallery_thread, gallery_worker, job);

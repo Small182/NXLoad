@@ -117,37 +117,44 @@ static void video_cancel(void *arg) {
     atomic_store(&((VideoStream *)arg)->cancelled, true);
 }
 
+/* Invidious exposes YouTube's muxed H.264/AAC itag 18 in a stream
+ * addressed by video ID. Restrict hosts and URL grammar before fetching. */
+static bool switch_trailer_url(const char *source, char id[12]) {
+    static const char *const hosts[] = {"inv.nadeko.net", "yewtu.be"};
+    for (size_t i = 0; i < sizeof(hosts)/sizeof(*hosts); ++i) {
+        char prefix[96];
+        snprintf(prefix, sizeof(prefix), "%s/latest_version?id=", hosts[i]);
+        size_t prefix_len = strlen(prefix);
+        if (strncmp(source, prefix, prefix_len)) continue;
+        const char *p = source + prefix_len;
+        if (strlen(p) != 11 + strlen("&itag=18&local=true")) continue;
+        if (strcmp(p + 11, "&itag=18&local=true")) continue;
+        if (strspn(p, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != 11)
+            continue;
+        memcpy(id, p, 11);
+        id[11] = 0;
+        return true;
+    }
+    return false;
+}
+
 static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     (void)unused;
     static const char scheme[] = TRAILER_SCHEME "://";
     static const char nintendo[] = TRAILER_HOST TRAILER_480;
-    static const char *const steam_hosts[] = {
-        "video.akamai.steamstatic.com/store_trailers/",
-        "video.cloudflare.steamstatic.com/store_trailers/",
-        "video.fastly.steamstatic.com/store_trailers/",
-    };
     if (strncmp(uri, scheme, sizeof(scheme) - 1)) return MPV_ERROR_LOADING_FAILED;
     const char *source = uri + sizeof(scheme) - 1;
     bool nintendo_video = !strncmp(source, nintendo, sizeof(nintendo) - 1);
     const char *path = NULL;
+    char video_id[12];
     if (nintendo_video) {
         path = source + sizeof(nintendo) - 1;
         size_t length = strlen(path);
         if (length < 5 || strcmp(path + length - 4, ".mp4") ||
             strspn(path, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/") != length - 4)
             return MPV_ERROR_LOADING_FAILED;
-    } else {
-        for (size_t i = 0; i < sizeof(steam_hosts) / sizeof(*steam_hosts); ++i) {
-            size_t prefix = strlen(steam_hosts[i]);
-            if (!strncmp(source, steam_hosts[i], prefix)) {
-                path = source + prefix;
-                break;
-            }
-        }
-        if (!path) return MPV_ERROR_LOADING_FAILED;
-        size_t digits = strspn(path, "0123456789");
-        if (digits < 5 || digits > 16 || strcmp(path + digits, "/movie480.mp4"))
-            return MPV_ERROR_LOADING_FAILED;
+    } else if (!switch_trailer_url(source, video_id)) {
+        return MPV_ERROR_LOADING_FAILED;
     }
 
     VideoStream *stream = calloc(1, sizeof(*stream));
@@ -162,12 +169,12 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 2L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 14L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NXLoad/1.0.50");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 NXLoad/1.0.50");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, video_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, stream);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, video_header);
@@ -183,30 +190,24 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     }
     if (!fetch_video_block(stream, 0)) {
         if (nintendo_video) {
-            /* Older Nintendo videos sometimes need their unscaled rendition. */
             snprintf(stream->url, sizeof(stream->url), "https://" TRAILER_HOST "%s", path);
             if (!fetch_video_block(stream, 0)) {
                 video_close(stream);
                 return MPV_ERROR_LOADING_FAILED;
             }
         } else {
-            /* Steam provides mirrored CDN hosts; try the other host if a
-             * particular endpoint is unreachable from Switch. */
-            bool recovered = false;
-            for (size_t i = 0; i < sizeof(steam_hosts) / sizeof(*steam_hosts); ++i) {
-                snprintf(stream->url, sizeof(stream->url), "https://%s%s", steam_hosts[i], path);
-                if (fetch_video_block(stream, 0)) {
-                    recovered = true;
-                    break;
-                }
-            }
-            if (!recovered) {
+            /* A failed public gateway must not prevent use of the other. */
+            const char *alternate = !strncmp(source, "inv.nadeko.net/", 15) ?
+                "yewtu.be" : "inv.nadeko.net";
+            snprintf(stream->url, sizeof(stream->url),
+                     "https://%s/latest_version?id=%s&itag=18&local=true",
+                     alternate, video_id);
+            if (!fetch_video_block(stream, 0)) {
                 video_close(stream);
                 return MPV_ERROR_LOADING_FAILED;
             }
         }
     }
-
     *info = (mpv_stream_cb_info){
         .cookie = stream, .read_fn = video_read, .seek_fn = video_seek,
         .size_fn = video_size, .close_fn = video_close, .cancel_fn = video_cancel

@@ -83,6 +83,15 @@ static bool steam_movie(const char *url, char result[CATALOG_URL]) {
     return n > 0 && n < CATALOG_URL;
 }
 
+/* Steam encodes URLs as https:\\/\\/..., which the strict unescaped
+ * string_field helper intentionally rejects. Decode JSON escapes here. */
+static bool steam_string(Json object, const char *key, char *out, size_t capacity) {
+    Json value = field(object, key);
+    if (!value.begin || *value.begin != '"') return false;
+    const char *p = value.begin;
+    return read_json_string(&p, out, capacity) && p == value.end;
+}
+
 static bool app_id(Json item, char result[24]) {
     Json id = field(item, "id");
     if (!id.begin) return false;
@@ -133,7 +142,7 @@ bool steam_media_lookup(const char *title, atomic_bool *cancel, SteamMedia *medi
     for (;;) {
         Json item = next_object(items, &cursor);
         if (!item.begin) break;
-        if (!string_field(item, "name", name, sizeof(name))) continue;
+        if (!steam_string(item, "name", name, sizeof(name))) continue;
         name_key(name, candidate);
         if (strcmp(candidate, wanted)) continue;
         if (app_id(item, id)) break;
@@ -155,7 +164,7 @@ bool steam_media_lookup(const char *title, atomic_bool *cancel, SteamMedia *medi
     Json data = field(app, "data");
     char confirmed[CATALOG_TEXT], confirmed_key[CATALOG_TEXT];
     if (!literal(field(app, "success"), "true") ||
-        !string_field(data, "name", confirmed, sizeof(confirmed))) {
+        !steam_string(data, "name", confirmed, sizeof(confirmed))) {
         free(body);
         return false;
     }
@@ -172,9 +181,9 @@ bool steam_media_lookup(const char *title, atomic_bool *cancel, SteamMedia *medi
         Json shot = next_object(screenshots, &cursor);
         if (!shot.begin) break;
         char image[CATALOG_URL];
-        if ((!string_field(shot, "path_full", image, sizeof(image)) ||
+        if ((!steam_string(shot, "path_full", image, sizeof(image)) ||
              !steam_screenshot(image)) &&
-            (!string_field(shot, "path_thumbnail", image, sizeof(image)) ||
+            (!steam_string(shot, "path_thumbnail", image, sizeof(image)) ||
              !steam_screenshot(image))) continue;
         strcpy(media->screenshots[media->screenshot_count++], image);
     }
@@ -184,7 +193,7 @@ bool steam_media_lookup(const char *title, atomic_bool *cancel, SteamMedia *medi
         Json movie = next_object(movies, &cursor);
         if (!movie.begin) break;
         char source[CATALOG_URL], normalized[CATALOG_URL];
-        if (!string_field(field(movie, "mp4"), "480", source, sizeof(source)) ||
+        if (!steam_string(field(movie, "mp4"), "480", source, sizeof(source)) ||
             !steam_movie(source, normalized)) continue;
         bool duplicate = false;
         for (size_t i = 0; i < media->trailer_count; ++i)

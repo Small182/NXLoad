@@ -5,6 +5,7 @@
 #include "trailers.h"
 
 #include <curl/curl.h>
+#include <ctype.h>
 #include <libxml/HTMLparser.h>
 #include <stdint.h>
 #include <stdio.h>

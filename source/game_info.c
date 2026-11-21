@@ -432,24 +432,53 @@ static void extract_gallery(xmlNodePtr node, GameGallery *gallery, bool in_galle
     }
 }
 
+/* Nintendo Life pages contain stable screenshot URLs in their HTML. Scanning
+ * the actual URL pattern is independent of changes to section/figure markup
+ * and avoids libxml parser discrepancies between Eden and Switch. */
+static void scan_nl_screenshots(const char *html, GameGallery *gallery) {
+    const char *cursor = html;
+    while (gallery->count < GALLERY_LIMIT &&
+           (cursor = strstr(cursor, NL_IMAGE)) != NULL) {
+        const char *digits = cursor + sizeof(NL_IMAGE) - 1;
+        size_t n = strspn(digits, "0123456789");
+        if (n > 0 && n <= 12 && !strncmp(digits + n, "/large.jpg", 10)) {
+            size_t len = (size_t)(digits - cursor) + n + 10;
+            if (len < CATALOG_URL) {
+                char candidate[CATALOG_URL];
+                memcpy(candidate, cursor, len);
+                candidate[len] = 0;
+                bool duplicate = false;
+                for (size_t i = 0; i < gallery->count; ++i)
+                    if (!strcmp(candidate, gallery->screenshots[i])) duplicate = true;
+                if (!duplicate) strcpy(gallery->screenshots[gallery->count++], candidate);
+            }
+        }
+        cursor = digits + (n ? n : 1);
+    }
+}
+
 static bool fetch_gallery(GalleryJob *job, const char *url, const char *key, const char *alternate,
                           CatalogFetchStatus *status, bool trusted_screenshots_page) {
     size_t size;
     unsigned char *data = catalog_fetch_document(url, &job->cancel, &size, status);
     if (!data) return false;
+    if (trusted_screenshots_page) {
+        scan_nl_screenshots((const char *)data, &job->result);
+        free(data);
+        return job->result.count != 0;
+    }
     htmlDocPtr page = htmlReadMemory((char *)data, (int)size, url, "UTF-8",
                                     HTML_PARSE_NONET | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
+    if (page) {
+        xmlNodePtr root = xmlDocGetRootElement(page);
+        if (match_heading(root, key, alternate)) {
+            // Stable JPEG references can exist outside any screenshot section.
+            scan_nl_screenshots((const char *)data, &job->result);
+            if (!job->result.count) extract_gallery(root, &job->result, false);
+        }
+        xmlFreeDoc(page);
+    }
     free(data);
-    if (!page) return false;
-    xmlNodePtr root = xmlDocGetRootElement(page);
-    // The standalone Nintendo Life /screenshots page has no
-    // <section id="screenshots">: its screenshot anchors are in <figure>s.
-    // Only trust it when the URL comes from the verified built-in NL index.
-    if (trusted_screenshots_page)
-        extract_gallery(root, &job->result, true);
-    else if (match_heading(root, key, alternate))
-        extract_gallery(root, &job->result, false);
-    xmlFreeDoc(page);
     return job->result.count != 0;
 }
 
@@ -524,10 +553,14 @@ void load_game_gallery(GalleryJob *job) {
     if (!atomic_load(&job->cancel) && !status.curl) {
         char slugs[2][CATALOG_TEXT] = {{0}};
         make_slug(slugs[0], name);
+        // Nintendo Life omits an initial "the_" for some major titles,
+        // including The Legend of Zelda: Tears of the Kingdom.
+        if (!strncmp(slugs[0], "the_", 4))
+            snprintf(slugs[1], sizeof(slugs[1]), "%s", slugs[0] + 4);
         if (remove_suffix(name, "nintendo switch") || remove_suffix(name, "switch")) {
             title_key(alternate, name);
             make_slug(slugs[1], name);
-        } else if (begins(job->page, SOURCE_PAGE)) {
+        } else if (!slugs[1][0] && begins(job->page, SOURCE_PAGE)) {
             const char *slug = job->page + sizeof(SOURCE_PAGE) - 1;
             size_t size = strspn(slug, "abcdefghijklmnopqrstuvwxyz0123456789-");
             if (size >= sizeof("-switch") && size < sizeof(slugs[1]) &&

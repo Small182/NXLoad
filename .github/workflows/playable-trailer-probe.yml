@@ -113,3 +113,14 @@ jobs:
               print('MATCH_COUNT',len(found),flush=True)
             except Exception as e:print('ERROR',title,repr(e),flush=True)
           PY
+      - name: Inspect Gamereactor video codecs and seekability
+        run: |
+          if ! command -v ffprobe >/dev/null; then echo "ffprobe unavailable"; exit 0; fi
+          for url in \
+            'https://media.gamereactor.eu/default/t_HollowKnight_383543.mp4' \
+            'https://media.gamereactor.eu/default/t_SuperMarioOdyssey_340253.mp4' \
+            'https://media.gamereactor.eu/default/t_The_Legend_of_Zelda_Tears_of_the_Kingdom_Rediscover_your_sense_of_adventure_643033.mp4'; do
+            echo "=== CODECS $url"
+            timeout 22 ffprobe -v error -show_entries format=duration,format_name -show_entries stream=codec_type,codec_name,width,height -of compact "$url" | head -c 1500 || true
+            echo
+          done

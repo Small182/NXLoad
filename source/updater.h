@@ -15,6 +15,8 @@ typedef struct {
     UpdateBuild build;
     char details[UPDATE_DETAILS_BYTES];
     const char *error;
+    bool test_channel;
+    char branch[80];
 } UpdateCheck;
 
 void check_update(UpdateCheck *check);

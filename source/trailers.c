@@ -11,6 +11,7 @@
 #include <strings.h>
 
 #define TRAILER_HOST "assets.nintendo.com/video/upload/"
+#define GAMEREACTOR_MEDIA "media.gamereactor.eu/default/"
 #define TRAILER_480 "c_limit,w_854,h_480,vc_h264/"
 #define TRAILER_SCHEME "nxtrailer"
 #define STREAM_BLOCK (512 * 1024)
@@ -145,6 +146,8 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
     if (strncmp(uri, scheme, sizeof(scheme) - 1)) return MPV_ERROR_LOADING_FAILED;
     const char *source = uri + sizeof(scheme) - 1;
     bool nintendo_video = !strncmp(source, nintendo, sizeof(nintendo) - 1);
+    bool gamereactor_video = !strncmp(source, GAMEREACTOR_MEDIA,
+                                     sizeof(GAMEREACTOR_MEDIA) - 1);
     const char *path = NULL;
     char video_id[12];
     if (nintendo_video) {
@@ -152,6 +155,14 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
         size_t length = strlen(path);
         if (length < 5 || strcmp(path + length - 4, ".mp4") ||
             strspn(path, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/") != length - 4)
+            return MPV_ERROR_LOADING_FAILED;
+    } else if (gamereactor_video) {
+        const char *filename = source + sizeof(GAMEREACTOR_MEDIA) - 1;
+        size_t len = strlen(filename);
+        if (len < 5 || len >= CATALOG_URL - sizeof(GAMEREACTOR_MEDIA) ||
+            strcasecmp(filename + len - 4, ".mp4") ||
+            strspn(filename,
+                   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != len)
             return MPV_ERROR_LOADING_FAILED;
     } else if (!switch_trailer_url(source, video_id)) {
         return MPV_ERROR_LOADING_FAILED;
@@ -195,9 +206,12 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
                 video_close(stream);
                 return MPV_ERROR_LOADING_FAILED;
             }
+        } else if (gamereactor_video) {
+            // Gamereactor supplies native HTTP 206 byte-range MP4s and does
+            // not require any alternate host or expiring signed URL.
+            video_close(stream);
+            return MPV_ERROR_LOADING_FAILED;
         } else {
-            // One independent video source is available for search; direct
-            // streaming may fail if its upstream refuses playback.
             snprintf(stream->url, sizeof(stream->url),
                      "https://iv.catgirl.cloud/latest_version?id=%s&itag=18&local=false",
                      video_id);

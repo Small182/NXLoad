@@ -2881,6 +2881,11 @@ static void draw_game(void) {
             snprintf(label, sizeof(label), tr("X  Трейлери · %zu"), app.trailers.count);
             rect(945, 595, 259, 34, selected);
             text(app.small, label, 960, 603, 230, blue);
+        } else {
+            const char *notice = app.trailer_busy || !app.trailer_requested ?
+                "Пошук трейлерів…" : app.trailers.issue[0] ? app.trailers.issue :
+                "Трейлерів не знайдено";
+            text(app.small, notice, 810, 603, 394, gray);
         }
     }
     else draw_game_files();

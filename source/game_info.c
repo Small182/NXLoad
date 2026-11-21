@@ -522,6 +522,174 @@ unsigned char *load_gallery_image(const char *url, atomic_bool *cancel, size_t *
     return NULL;
 }
 
+
+#define GEMATSU_GALLERY "https://www.gematsu.com/gallery/"
+#define GEMATSU_IMAGES "https://www.gematsu.com/wp-content/uploads/"
+
+/* Gematsu hosts individual gallery pages with actual gameplay screenshots.
+ * Only accept canonical pages for the exact game slug; other slugs can
+ * silently redirect to unrelated games (e.g. Hollow Knight -> Silksong). */
+static bool gematsu_canonical(const char *html, const char *url) {
+    char canonical[CATALOG_URL + 48];
+    int n = snprintf(canonical, sizeof(canonical),
+                     "<link rel=\"canonical\" href=\"%s\"", url);
+    return n > 0 && (size_t)n < sizeof(canonical) && strstr(html, canonical);
+}
+
+static bool gematsu_image(const char *start, size_t length, char url[CATALOG_URL]) {
+    if (!length || length >= CATALOG_URL) return false;
+    memcpy(url, start, length);
+    url[length] = 0;
+    if (!begins(url, GEMATSU_IMAGES)) return false;
+    const char *ext = strrchr(url, '.');
+    return ext && (!strcasecmp(ext, ".jpg") || !strcasecmp(ext, ".jpeg") ||
+                   !strcasecmp(ext, ".png") || !strcasecmp(ext, ".webp"));
+}
+
+/* WordPress serves 768/1024px images as separate static files. Prefer those
+ * over multi-megabyte originals that exceed the screenshot download budget.
+ * Only extract srcset from within the current gallery figure. */
+static bool gematsu_resized_image(const char *start, const char *figure_end,
+                                  const char *original, char chosen[CATALOG_URL]) {
+    const char *attr = strstr(start, "data-srcset=\"");
+    if (!attr || attr >= figure_end) return false;
+    const char *p = attr + sizeof("data-srcset=\"") - 1;
+    const char *end = strchr(p, '"');
+    if (!end || end > figure_end) return false;
+    bool png = false;
+    const char *ext = strrchr(original, '.');
+    if (ext) png = !strcasecmp(ext, ".png");
+    unsigned maximum = png ? 768 : 1024, best = 0;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == ',')) ++p;
+        const char *u = p;
+        while (p < end && *p != ' ' && *p != ',' && *p != '\t') ++p;
+        size_t length = (size_t)(p - u);
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        char *after = NULL;
+        unsigned long width = strtoul(p, &after, 10);
+        if (after != p && after < end && *after == 'w') {
+            char candidate[CATALOG_URL];
+            if (width >= 480 && width <= maximum && width > best &&
+                gematsu_image(u, length, candidate)) {
+                strcpy(chosen, candidate);
+                best = (unsigned)width;
+            }
+            p = after + 1;
+        }
+        while (p < end && *p != ',') ++p;
+        if (p < end) ++p;
+    }
+    return best != 0;
+}
+
+static void gematsu_collect_images(const char *html, GameGallery *gallery) {
+    /* The image links are inside this carousel, not the article/sidebar.
+     * Do not use an unscoped search for <img> or the page shows other games. */
+    const char *carousel = strstr(html, "<div class=\"carousel\"");
+    if (!carousel) return;
+    const char *end = strstr(carousel, "</section>");
+    if (!end) end = carousel + strlen(carousel);
+    const char *cursor = carousel;
+    static const char marker[] = "class=\"btn bytes-image__link\" href=\"";
+    while (gallery->count < GALLERY_LIMIT &&
+           (cursor = strstr(cursor, marker)) && cursor < end) {
+        const char *image_start = cursor + sizeof(marker) - 1;
+        const char *image_end = strchr(image_start, '"');
+        if (!image_end || image_end >= end) break;
+        char original[CATALOG_URL], selected[CATALOG_URL];
+        cursor = image_end + 1;
+        if (!gematsu_image(image_start, (size_t)(image_end - image_start), original))
+            continue;
+        strcpy(selected, original);
+        const char *figure_end = strstr(cursor, "</figure>");
+        if (figure_end && figure_end < end) {
+            char resized[CATALOG_URL];
+            if (gematsu_resized_image(cursor, figure_end, original, resized))
+                strcpy(selected, resized);
+        }
+        bool duplicate = false;
+        for (size_t i = 0; i < gallery->count; ++i)
+            if (!strcmp(gallery->screenshots[i], selected)) duplicate = true;
+        if (!duplicate) strcpy(gallery->screenshots[gallery->count++], selected);
+    }
+    if (gallery->count) gallery->issue[0] = 0;
+}
+
+static bool gematsu_gallery(GalleryJob *job) {
+    const char *names[] = {job->title, job->catalog_title, job->heading};
+    char previous[3][CATALOG_TEXT] = {{0}};
+    size_t seen = 0;
+    for (size_t i = 0; i < 3 && !atomic_load(&job->cancel); ++i) {
+        if (!names[i][0]) continue;
+        char name[CATALOG_TEXT], slug[CATALOG_TEXT], url[CATALOG_URL];
+        snprintf(name, sizeof(name), "%s", names[i]);
+        clean_heading(name);
+        remove_suffix(name, "nintendo switch");
+        remove_suffix(name, "switch");
+        make_slug(slug, name);
+        for (char *p = slug; *p; ++p)
+            if (*p == '_') *p = '-';
+        if (!slug[0]) continue;
+        bool already = false;
+        for (size_t j = 0; j < seen; ++j)
+            if (!strcmp(slug, previous[j])) already = true;
+        if (already) continue;
+        strcpy(previous[seen++], slug);
+        int n = snprintf(url, sizeof(url), GEMATSU_GALLERY "%s", slug);
+        if (n <= 0 || n >= (int)sizeof(url)) continue;
+        size_t size = 0;
+        CatalogFetchStatus status = {0};
+        unsigned char *html = catalog_fetch_document(url, &job->cancel, &size, &status);
+        if (!html) {
+            // If Gematsu is unreachable, do not repeat several costly queries.
+            if (status.curl) break;
+            continue;
+        }
+        if (!gematsu_canonical((const char *)html, url)) {
+            free(html);
+            continue;
+        }
+        char prefix[CATALOG_URL + 10];
+        n = snprintf(prefix, sizeof(prefix), "href=\"" GEMATSU_GALLERY "%s/", slug);
+        if (n <= 0 || n >= (int)sizeof(prefix)) {
+            free(html);
+            continue;
+        }
+        const char *cursor = (const char *)html;
+        unsigned pages = 0;
+        char seen_date[3][CATALOG_URL] = {{0}};
+        while (pages < 3 && (cursor = strstr(cursor, prefix)) && !atomic_load(&job->cancel)) {
+            const char *date = cursor + strlen(prefix), *after = date;
+            size_t length = strspn(date, "abcdefghijklmnopqrstuvwxyz0123456789-");
+            cursor = date + (length ? length : 1);
+            if (length < 8 || length >= 55 || date[length] != '"') continue;
+            char page[CATALOG_URL];
+            n = snprintf(page, sizeof(page), GEMATSU_GALLERY "%s/%.*s",
+                         slug, (int)length, date);
+            if (n <= 0 || n >= (int)sizeof(page)) continue;
+            bool repeat = false;
+            for (unsigned j = 0; j < pages; ++j)
+                if (!strcmp(page, seen_date[j])) repeat = true;
+            if (repeat) continue;
+            strcpy(seen_date[pages++], page);
+            size_t bytes = 0;
+            CatalogFetchStatus detail_status = {0};
+            unsigned char *detail = catalog_fetch_document(page, &job->cancel,
+                                                            &bytes, &detail_status);
+            if (detail) {
+                if (gematsu_canonical((const char *)detail, page))
+                    gematsu_collect_images((const char *)detail, &job->result);
+                free(detail);
+            }
+            if (job->result.count) break;
+        }
+        free(html);
+        if (job->result.count) return true;
+    }
+    return false;
+}
+
 void load_game_gallery(GalleryJob *job) {
     if (job->romsns_page[0]) {
         bool loaded = catalog_read_romsns_media(job->romsns_page, &job->cancel, job->port_description,
@@ -578,6 +746,11 @@ void load_game_gallery(GalleryJob *job) {
             }
         }
     }
+    if (atomic_load(&job->cancel)) return;
+
+    // A separately hosted gallery avoids Nintendo's blocked domains and
+    // also covers Switch exclusives that are not available on Steam.
+    if (gematsu_gallery(job)) return;
     if (atomic_load(&job->cancel)) return;
 
     /* Steam is a last resort, using only media from an exact title match. */

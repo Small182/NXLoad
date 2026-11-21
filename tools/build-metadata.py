@@ -45,6 +45,7 @@ def build(database):
             b"",  # Alternate description field reserved by the ROMFS index format.
             "".join(hashes).encode("ascii"),
             field_bytes(text(item.get("developer")), 192),
+            field_bytes(item.get("id", ""), 17),  # Screenshot API lookup by Title ID
         ]
         body = zlib.compress(b"\0".join(fields) + b"\0")
         records.append(key + b"\0" + struct.pack("<H", len(body)) + body)

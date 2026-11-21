@@ -120,7 +120,7 @@ static void video_cancel(void *arg) {
 /* Invidious exposes YouTube's muxed H.264/AAC itag 18 in a stream
  * addressed by video ID. Restrict hosts and URL grammar before fetching. */
 static bool switch_trailer_url(const char *source, char id[12]) {
-    static const char *const hosts[] = {"inv.nadeko.net", "yewtu.be"};
+    static const char *const hosts[] = {"iv.catgirl.cloud"};
     for (size_t i = 0; i < sizeof(hosts)/sizeof(*hosts); ++i) {
         char prefix[96];
         snprintf(prefix, sizeof(prefix), "%s/latest_version?id=", hosts[i]);
@@ -196,12 +196,11 @@ static int video_open(void *unused, char *uri, mpv_stream_cb_info *info) {
                 return MPV_ERROR_LOADING_FAILED;
             }
         } else {
-            /* A failed public gateway must not prevent use of the other. */
-            const char *alternate = !strncmp(source, "inv.nadeko.net/", 15) ?
-                "yewtu.be" : "inv.nadeko.net";
+            // One independent video source is available for search; direct
+            // streaming may fail if its upstream refuses playback.
             snprintf(stream->url, sizeof(stream->url),
-                     "https://%s/latest_version?id=%s&itag=18&local=true",
-                     alternate, video_id);
+                     "https://iv.catgirl.cloud/latest_version?id=%s&itag=18&local=false",
+                     video_id);
             if (!fetch_video_block(stream, 0)) {
                 video_close(stream);
                 return MPV_ERROR_LOADING_FAILED;

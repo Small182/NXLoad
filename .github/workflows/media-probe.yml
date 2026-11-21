@@ -19,6 +19,15 @@ jobs:
             "steam-search":"https://store.steampowered.com/api/storesearch/?term=Hollow%20Knight&l=english&cc=US",
             "invidious-nadeko":"https://inv.nadeko.net/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
             "invidious-yewtu":"https://yewtu.be/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.protokolla.fi":"https://invidious.protokolla.fi/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-iv.catgirl.cloud":"https://iv.catgirl.cloud/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.ritoge.com":"https://invidious.ritoge.com/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.qwik.space":"https://invidious.qwik.space/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.slipfox.xyz":"https://invidious.slipfox.xyz/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.io.lol":"https://invidious.io.lol/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-y.com.sb":"https://y.com.sb/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.privacyredirect.com":"https://invidious.privacyredirect.com/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-inv.riverside.rocks":"https://inv.riverside.rocks/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
           }
           for name,url in urls.items():
             print("\n=== "+name+" ===",flush=True)
@@ -36,7 +45,7 @@ jobs:
                 for snippet in ["screenshots/",'id="screenshots"','Screenshots (','data-src','srcset']:
                   i=text.find(snippet);print("CONTAINS",snippet,i,repr(text[max(0,i-160):i+400]) if i>=0 else "")
               else:
-                print("PREVIEW",repr(text[:1800]))
+                print("PREVIEW",repr(text[:900]))
             except Exception as e:
               print("ERROR",type(e).__name__,str(e)[:220],flush=True)
           PY

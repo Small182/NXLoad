@@ -137,9 +137,14 @@ static unsigned char *fetch_resource(const char *url, atomic_bool *cancel, size_
     return data.data;
 }
 
+unsigned char *catalog_fetch_cover_status(const char *url, atomic_bool *cancel, size_t *bytes,
+                                          CatalogFetchStatus *status) {
+    return fetch_resource(url, cancel, COVER_BYTES, bytes, status);
+}
+
 unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t *bytes) {
     CatalogFetchStatus status;
-    return fetch_resource(url, cancel, COVER_BYTES, bytes, &status);
+    return catalog_fetch_cover_status(url, cancel, bytes, &status);
 }
 
 unsigned char *catalog_fetch_thumbnail(CURL *connection, const char *url, atomic_bool *cancel, size_t *bytes) {

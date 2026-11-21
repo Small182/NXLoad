@@ -10,6 +10,7 @@
 typedef struct {
     char urls[TRAILER_LIMIT][CATALOG_URL];
     size_t count;
+    char issue[128];
 } GameTrailers;
 
 typedef struct {

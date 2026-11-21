@@ -34,6 +34,9 @@ jobs:
             "gematsu-hollow-gallery":"https://www.gematsu.com/gallery/hollow-knight",
             "gematsu-silksong-gallery":"https://www.gematsu.com/gallery/hollow-knight-silksong",
             "gematsu-pikmin-gallery":"https://www.gematsu.com/gallery/pikmin-4",
+            "gematsu-zelda-date":"https://www.gematsu.com/gallery/the-legend-of-zelda-tears-of-the-kingdom/february-8-2023",
+            "gematsu-pikmin-date":"https://www.gematsu.com/gallery/pikmin-4/june-22-2023",
+            "gematsu-silksong-date":"https://www.gematsu.com/gallery/hollow-knight-silksong/june-12-2022",
             "gamespot-search":"https://www.gamespot.com/search/?q=Hollow+Knight",
             "gamepressure-search":"https://www.gamepressure.com/games/search.asp?search=Hollow+Knight",
             "igdb-search":"https://www.igdb.com/search?type=1&q=Hollow%20Knight",
@@ -52,6 +55,10 @@ jobs:
                   print("ARTICLES",re.findall(r'<a[^>]{0,500}href=["\\x27](https?://[^"\\x27]+)["\\x27][^>]{0,200}>([^<]+)',page,re.I)[:8])
                   print("MEDIA_IMAGE",re.findall(r'https?://[^"\\x27 <]+\\.(?:jpg|jpeg|png|webp)',page,re.I)[:15])
                   if name.startswith("gematsu"):
+                      gallery_start=page.find('class="gematsu-gallery')
+                      print("GALLERY_CLASS_START",gallery_start,repr(page[max(0,gallery_start-120):gallery_start+900]) if gallery_start>=0 else "")
+                      for pat in (r'(?:id|class)="[^"]*(?:gallery|image|media)[^"]*"',r'(?:href|src|data-src|data-srcset)="[^"]*(?:wp-content/uploads|wp\.com)[^"]*"',r'<h1[^>]*>.*?</h1>'):
+                          print("DETAIL_MATCH",pat,re.findall(pat,page,re.I|re.S)[:15])
                       for pattern in [r'.{0,200}(?:gallery-item|gallery-item__img|gallery-category|gallery-card|screenshots?).{0,350}',r'<img[^>]{0,650}>',r'<a[^>]{0,650}href=["\\x27][^"\\x27]*gallery[^"\\x27]*["\\x27][^>]*>',r'https://www\\.gematsu\\.com/wp-content/uploads/[^"\\x27 <]+']:
                           print("GEMATSU_PATTERN",pattern,"MATCHES",re.findall(pattern,page,re.I)[:10])
                   print("SCREENSHOTS",re.findall(r'.{0,80}(?:screenshots|gallery|gameplay|wp-content/uploads).{0,120}',page,re.I)[:7])

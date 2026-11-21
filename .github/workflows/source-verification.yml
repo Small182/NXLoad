@@ -24,6 +24,11 @@ jobs:
             "romslab-hollow":"https://romslab.com/hollow-knight-switch-nsp-free-download-1/",
             "nswpedia-hollow":"https://nswpedia.com/nintendo-switch-roms/action/hollow-knight",
             "nswpedia-zelda":"https://nswpedia.com/nintendo-switch-roms/action/the-legend-of-zelda-tears-of-the-kingdom-totk",
+            "nswpedia-search-pikmin":"https://nswpedia.com/?s=Pikmin%204",
+            "nswpedia-search-hollow":"https://nswpedia.com/?s=Hollow%20Knight",
+            "yuumi-search":"https://yuumijungle.com/en/?s=Hollow%20Knight",
+            "yuumi-search-zelda":"https://yuumijungle.com/en/?s=Zelda%20Tears%20of%20the%20Kingdom",
+            "romslab-hollow-search":"https://romslab.com/?s=Hollow+Knight",
             "nlib-zelda":"https://api.nlib.cc/nx/0100F2C0115B6000/screens",
             "nlib-hollow":"https://api.nlib.cc/nx/0100633007D48000/screens",
             "nlib-zelda-detail":"https://api.nlib.cc/nx/0100F2C0115B6000?fields=name,screens",
@@ -51,6 +56,11 @@ jobs:
                   if point>50000:break
                 print("IMG_ATTRS",re.findall(r'<img[^>]{0,900}>',html,re.I)[:14],flush=True)
                 print("LINKED_IMAGES",re.findall(r'https?://[^"\\x27 <>]+?\\.(?:jpg|jpeg|webp|png)',html,re.I)[:22],flush=True)
+                if name.startswith("nswpedia-search") or name.startswith("yuumi-search") or name.startswith("romslab-hollow-search"):
+                  for marker in ('Hollow Knight','hollow-knight','Pikmin 4','The Legend of Zelda'):
+                    pos=html.find(marker)
+                    print("SEARCH_MATCH",marker,pos,repr(html[max(0,pos-430):pos+280]) if pos>=0 else "",flush=True)
+                  print("ALL_GAME_LINKS",re.findall(r'href=["\\x27](https?://(?:nswpedia\\.com|romslab\\.com|yuumijungle\\.com)[^"\\x27]+)["\\x27]',html,re.I)[:40],flush=True)
                 print("SCREENSHOTS",re.findall(r'.{0,70}(?:screenshots?|gameplay).{0,70}',html,re.I)[:4],flush=True)
             except Exception as e:
               print("ERROR",repr(e),flush=True)

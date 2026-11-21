@@ -14,6 +14,7 @@ typedef struct {
     char description[6144];
     char original[6144];
     char fallback_hashes[GALLERY_HASHES];
+    char title_id[17]; /* Canonical 16-digit Switch Title ID for media API */
 } GameMetadata;
 
 typedef struct {
@@ -33,6 +34,7 @@ typedef struct {
     char heading[CATALOG_TEXT];
     char catalog_title[CATALOG_TEXT];
     char fallback_hashes[GALLERY_HASHES];
+    char title_id[17];
     bool prefer_titledb;
     GameGallery result;
     atomic_bool cancel;

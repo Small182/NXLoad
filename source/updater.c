@@ -247,14 +247,28 @@ static bool read_artifact(Response *r, UpdateBuild *build) {
 }
 
 static bool version_number(const char *version, uint64_t *number) {
-    *number = 0;
-    for (unsigned i = 0; i < 3; ++i) {
+    // Accept legacy 3-part releases (1.0.50) and the new 4-part format
+    // (1.0.5.1). Map old patch numbers to the fourth position so that
+    // 1.0.5.1 is recognized as newer than 1.0.50.
+    unsigned parts[4] = {0};
+    unsigned count = 0;
+    while (*version && count < 4) {
         size_t digits = strspn(version, "0123456789");
-        if (!digits || digits > 5 || (digits > 1 && *version == '0') ||
-            version[digits] != (i < 2 ? '.' : 0)) return false;
-        *number = *number * 100000 + strtoul(version, NULL, 10);
-        version += digits + (i < 2);
+        if (!digits || digits > 4 || (digits > 1 && *version == '0')) return false;
+        parts[count++] = (unsigned)strtoul(version, NULL, 10);
+        version += digits;
+        if (!*version) break;
+        if (*version != '.') return false;
+        ++version;
+        if (!*version) return false;
     }
+    if (*version || (count != 3 && count != 4)) return false;
+    if (count == 3) {
+        parts[3] = parts[2];
+        parts[2] = 0;
+    }
+    *number = (((uint64_t)parts[0] * 10000 + parts[1]) * 10000 +
+               parts[2]) * 10000 + parts[3];
     return true;
 }
 

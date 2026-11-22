@@ -2897,16 +2897,14 @@ static void draw_game(void) {
     if (app.game_tab == GAME_OVERVIEW) draw_game_overview();
     else if (app.game_tab == GAME_MEDIA) {
         draw_game_screenshots();
+        // Trailer discovery runs asynchronously; keep Media clean while
+        // searching or when no playable trailer was found. Only show the
+        // button after the worker confirms at least one playable stream.
         if (app.trailers.count) {
             char label[96];
             snprintf(label, sizeof(label), tr("X  Трейлери · %zu"), app.trailers.count);
             rect(945, 595, 259, 34, selected);
             text(app.small, label, 960, 603, 230, blue);
-        } else {
-            const char *status = app.trailer_busy || !app.trailer_requested ?
-                "Пошук трейлерів…" : app.trailers.issue[0] ?
-                app.trailers.issue : "Трейлери недоступні";
-            text(app.small, status, 945, 603, 259, gray);
         }
     }
     else draw_game_files();

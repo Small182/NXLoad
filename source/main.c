@@ -3028,7 +3028,7 @@ static void draw_update_dialog(void) {
     if (build->version[0])
         snprintf(line, sizeof(line), tr("Версія %s"), build->version);
     else
-        snprintf(line, sizeof(line), tr("Збірка %" PRIu64 " · %.8s"), build->run, build->sha);
+        snprintf(line, sizeof(line), "Доступне оновлення");
     if (app.update_details_open) {
         draw_update_details(line);
         return;
@@ -3165,9 +3165,6 @@ static void draw(void) {
     rect(0, 0, 1280, 720, background);
     text(app.large, "NXLoad", 40, 24, 320, white);
     text(app.small, NXLOAD_VERSION, 206, 44, 120, gray);
-    char build_label[24];
-    snprintf(build_label, sizeof(build_label), "Build %.7s", NXLOAD_BUILD_SHA);
-    text(app.small, build_label, 310, 44, 165, gray);
     draw_header();
     if (app.settings_open) {
         draw_settings();

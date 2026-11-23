@@ -3119,7 +3119,7 @@ static void draw_downloads(void) {
         }
         if (app.download_paused) {
             if (total)
-                snprintf(line, sizeof(line), "На паузі · %.1f%% · %.1f / %.1f МіБ",
+                snprintf(line, sizeof(line), tr("На паузі · %.1f%% · %.1f / %.1f МіБ"),
                          percent, have / 1048576.0, total / 1048576.0);
             else strcpy(line, "На паузі · A — продовжити");
         } else if (app.download_busy && stage == 2) {

@@ -407,7 +407,11 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     snprintf(header.etag, sizeof(header.etag), "%s", info->etag);
     bool valid = state && same_file_size &&
         fread(&previous, sizeof(previous), 1, state) == 1 &&
-        !memcmp(&header, &previous, sizeof(header)) &&
+        !memcmp(header.magic, previous.magic, sizeof(header.magic)) &&
+        header.length == previous.length &&
+        header.block_size == previous.block_size &&
+        header.chunks == previous.chunks &&
+        !memcmp(header.etag, previous.etag, sizeof(header.etag)) &&
         fread(bits, 1, bytes, state) == bytes && fgetc(state) == EOF;
     if (!valid) {
         if (state) fclose(state);

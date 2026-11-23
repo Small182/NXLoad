@@ -10,6 +10,7 @@
 #include <libxml/HTMLparser.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -233,6 +234,29 @@ static size_t on_header(char *data, size_t size, size_t count, void *arg) {
     return n;
 }
 
+
+static void partial_path(char out[256], const char *url, const char *id) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const char *values[] = {url ? url : "", id ? id : ""};
+    for (unsigned i = 0; i < 2; ++i) {
+        for (const unsigned char *p = (const unsigned char *)values[i]; *p; ++p) {
+            hash ^= *p;
+            hash *= UINT64_C(1099511628211);
+        }
+        hash ^= 0xff;
+        hash *= UINT64_C(1099511628211);
+    }
+    snprintf(out, 256, NXLOAD_DOWNLOAD_DIR "/.nxload-%016" PRIx64 ".part", hash);
+}
+
+void fichier_discard_partial(const char *url, const char *id) {
+    char path[256], metadata[272];
+    partial_path(path, url, id);
+    snprintf(metadata, sizeof(metadata), "%s.range", path);
+    unlink(path);
+    unlink(metadata);
+}
+
 static bool open_partial(Transfer *t, bool buffered) {
     const char *fallback = t->job->romshq ? "romshq-download.bin" :
         t->job->datanodes ? "datanodes-download.bin" :
@@ -248,31 +272,29 @@ static bool open_partial(Transfer *t, bool buffered) {
     }
     const char *name = t->name[0] ? t->name : fallback;
     snprintf(t->job->path, sizeof(t->job->path), "%s/%s", NXLOAD_DOWNLOAD_DIR, name);
-    snprintf(t->partial, sizeof(t->partial), "%s/%s.part", NXLOAD_DOWNLOAD_DIR, name);
+    partial_path(t->partial, t->job->url, t->job->dlarchive_id ? t->job->dlarchive_id : t->job->romshq_id);
     struct stat info;
     if (!stat(t->job->path, &info)) {
         t->error = "Destination file already exists";
         return false;
     }
-    int fd;
+
+    int fd = -1;
 #ifdef __SWITCH__
-    // A virtual SD can grow during writes. Check the actual write result.
-    if (t->expected > UINT32_MAX) {
+    // Never recreate an existing partial file when resuming a large download.
+    if (t->expected > UINT32_MAX && access(t->partial, F_OK) != 0) {
         Result rc = fsdevCreateFile(t->partial, 0, FsCreateOption_BigFile);
         if (R_FAILED(rc)) {
             t->error = "Cannot create a large split file on SD";
             return false;
         }
-        fd = open(t->partial, O_WRONLY);
-        if (fd < 0) {
-            int error = errno;
-            unlink(t->partial);
-            errno = error;
-        }
-    } else
+    }
 #endif
-    {
-        fd = open(t->partial, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    fd = open(t->partial, O_WRONLY | O_CREAT | (buffered ? O_TRUNC : 0), 0666);
+    if (buffered) {
+        char metadata[272];
+        snprintf(metadata, sizeof(metadata), "%s.range", t->partial);
+        unlink(metadata);
     }
     if (fd < 0) {
         t->error = nxload_storage_error(errno, "Не вдалося відкрити тимчасовий файл на microSD");
@@ -310,20 +332,23 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
         job->result = t->error;
         return true;
     }
-    RangeResult result = range_download(&source, &info, job, fileno(t->file));
+    RangeResult result = range_download(&source, &info, job, fileno(t->file), t->partial);
     bool closed = fclose(t->file) == 0;
     t->file = NULL;
     if (result == RANGE_OK && closed && !atomic_load(&job->cancelled)) {
         if (!rename(t->partial, job->path)) {
+            char metadata[272];
+            snprintf(metadata, sizeof(metadata), "%s.range", t->partial);
+            unlink(metadata);
             job->result = "Download saved";
             job->tls_detail[0] = 0;
             return true;
         }
         job->result = "Could not finalize file on SD";
-        unlink(t->partial);
         return true;
     }
-    unlink(t->partial);
+    if (!atomic_load(&job->pause_requested))
+        fichier_discard_partial(job->url, job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
     if (atomic_load(&job->cancelled)) return true;
     if (result == RANGE_SD_ERROR || !closed) {
         job->result = "SD write failed (space or file size limit)";
@@ -893,7 +918,8 @@ void fichier_download(FichierJob *job) {
                 }
                 t.error = "Could not finalize file on SD";
             }
-            unlink(t.partial);
+            if (!atomic_load(&job->pause_requested))
+                fichier_discard_partial(job->url, job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
             job->result = t.error ? t.error : curl_easy_strerror(code);
             goto done;
         }
@@ -1032,7 +1058,8 @@ void fichier_download(FichierJob *job) {
     }
 
 done:
-    if (atomic_load(&job->cancelled)) job->result = "Download cancelled";
+    if (atomic_load(&job->cancelled)) job->result =
+        atomic_load(&job->pause_requested) ? "Download paused" : "Download cancelled";
     curl_easy_cleanup(curl);
     xmlBufferFree(data);
     free(t.html);

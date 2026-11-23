@@ -12,6 +12,7 @@
 
 typedef struct {
     atomic_bool cancelled;
+    atomic_bool pause_requested;
     atomic_bool unpacking;
     atomic_bool copying_port_files;
     atomic_bool installing;
@@ -45,5 +46,6 @@ typedef struct {
 } FichierJob;
 
 void fichier_download(FichierJob *job);
+void fichier_discard_partial(const char *url, const char *id);
 
 #endif

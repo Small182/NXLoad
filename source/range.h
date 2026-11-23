@@ -25,6 +25,6 @@ typedef enum {
 } RangeResult;
 
 bool range_probe(const RangeSource *source, FichierJob *job, RangeInfo *info);
-RangeResult range_download(const RangeSource *source, const RangeInfo *info, FichierJob *job, int fd);
+RangeResult range_download(const RangeSource *source, const RangeInfo *info, FichierJob *job, int fd, const char *partial_path);
 
 #endif

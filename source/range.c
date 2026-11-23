@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,6 +21,17 @@
 #define MAX_CONNECTIONS 4
 #define MAX_RANGE_RETRIES 2
 #define WRITE_QUEUE_SIZE 8
+#define RANGE_RESUME_MAGIC "NXLRNG02"
+#define RANGE_MAX_CHUNKS 262144
+typedef struct {
+    char magic[8];
+    uint64_t length, block_size;
+    char etag[160];
+    uint32_t chunks;
+} RangeResumeHeader;
+static bool bit_set(const unsigned char *bits, size_t index) {
+    return (bits[index / 8] & (1u << (index % 8))) != 0;
+}
 
 typedef struct {
     unsigned char *data;
@@ -334,22 +346,89 @@ static bool retryable_range_error(CURLcode code) {
         code == CURLE_COULDNT_CONNECT || code == CURLE_GOT_NOTHING;
 }
 
+
+/* Journal a completed chunk only after its bytes are durably on microSD. */
+static bool checkpoint_chunk(RangeWriter *writer, FILE *state, unsigned char *bits,
+                             size_t chunk) {
+    if (writer->active) {
+        pthread_mutex_lock(&writer->lock);
+        while (writer->count && !writer->failed)
+            pthread_cond_wait(&writer->space, &writer->lock);
+        bool failed = writer->failed;
+        pthread_mutex_unlock(&writer->lock);
+        if (failed) return false;
+    }
+    if (fsync(writer->fd)) return false;
+    unsigned char value = bits[chunk / 8] | (1u << (chunk % 8));
+    long offset = (long)sizeof(RangeResumeHeader) + (long)(chunk / 8);
+    if (fseek(state, offset, SEEK_SET) || fwrite(&value, 1, 1, state) != 1 ||
+        fflush(state) || fsync(fileno(state))) return false;
+    bits[chunk / 8] = value;
+    return true;
+}
+static void skip_completed(uint64_t *next, uint64_t length, uint64_t block_size,
+                           const unsigned char *bits) {
+    while (*next < length && bit_set(bits, (size_t)(*next / block_size))) {
+        uint64_t span = length - *next;
+        if (span > block_size) span = block_size;
+        *next += span;
+    }
+}
 static uint64_t milliseconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
     return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
 }
 
-RangeResult range_download(const RangeSource *source, const RangeInfo *info, FichierJob *job, int fd) {
+RangeResult range_download(const RangeSource *source, const RangeInfo *info, FichierJob *job,
+                           int fd, const char *partial_path) {
     off_t length = (off_t)info->length;
     if ((uint64_t)length != info->length) return RANGE_RETRY_SINGLE;
-    if (ftruncate(fd, length))
-        return errno == ENOSPC || errno == EFBIG ? RANGE_SD_ERROR : RANGE_RETRY_SINGLE;
     const unsigned lanes = MAX_CONNECTIONS;
     uint64_t block_size = info->length / (lanes * 6);
     if (block_size < 8 * MIB) block_size = 8 * MIB;
     if (block_size > 64 * MIB) block_size = 64 * MIB;
     block_size -= block_size % RANGE_WRITE_BUFFER;
+    size_t chunks = (size_t)((info->length - 1) / block_size + 1);
+    if (!chunks || chunks > RANGE_MAX_CHUNKS) return RANGE_RETRY_SINGLE;
+    size_t bytes = (chunks + 7) / 8;
+    unsigned char *bits = calloc(bytes, 1);
+    if (!bits) return RANGE_SD_ERROR;
+    char state_path[272];
+    snprintf(state_path, sizeof(state_path), "%s.range", partial_path);
+    FILE *state = fopen(state_path, "rb+");
+    struct stat existing = {0};
+    bool same_file_size = !fstat(fd, &existing) && existing.st_size == length;
+    RangeResumeHeader header = {0}, previous = {0};
+    memcpy(header.magic, RANGE_RESUME_MAGIC, sizeof(header.magic));
+    header.length = info->length;
+    header.block_size = block_size;
+    header.chunks = (uint32_t)chunks;
+    snprintf(header.etag, sizeof(header.etag), "%s", info->etag);
+    bool valid = state && same_file_size &&
+        fread(&previous, sizeof(previous), 1, state) == 1 &&
+        !memcmp(&header, &previous, sizeof(header)) &&
+        fread(bits, 1, bytes, state) == bytes && fgetc(state) == EOF;
+    if (!valid) {
+        if (state) fclose(state);
+        state = fopen(state_path, "wb+");
+        memset(bits, 0, bytes);
+        if (!state || ftruncate(fd, 0) || ftruncate(fd, length) || fsync(fd) ||
+            fwrite(&header, sizeof(header), 1, state) != 1 ||
+            fwrite(bits, 1, bytes, state) != bytes || fflush(state) ||
+            fsync(fileno(state))) {
+            if (state) fclose(state);
+            free(bits);
+            return RANGE_SD_ERROR;
+        }
+    }
+    uint64_t saved = 0;
+    for (size_t i = 0; i < chunks; ++i)
+        if (bit_set(bits, i)) {
+            uint64_t span = info->length - (uint64_t)i * block_size;
+            saved += span > block_size ? block_size : span;
+        }
+    atomic_store(&job->received, saved);
 
     RangePart parts[MAX_CONNECTIONS] = {0};
     RangeWriter writer = {
@@ -370,7 +449,9 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     start_writer(&writer);
     atomic_store(&job->total, info->length);
     atomic_store(&job->streams, lanes);
-    for (unsigned i = 0; i < lanes && next < info->length; ++i) {
+    for (unsigned i = 0; i < lanes; ++i) {
+        skip_completed(&next, info->length, block_size, bits);
+        if (next >= info->length) break;
         RangePart *part = &parts[i];
         part->job = job;
         part->info = info;
@@ -422,10 +503,13 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
                 rescheduled = true;
                 continue;
             }
-            if (!flush_part(part)) {
+            if (!flush_part(part) ||
+                !checkpoint_chunk(&writer, state, bits, (size_t)(part->first / block_size))) {
                 result = RANGE_SD_ERROR;
                 goto done;
             }
+            saved += length;
+            skip_completed(&next, info->length, block_size, bits);
             if (next < info->length) {
                 if (!schedule_part(multi, part, &next, block_size)) goto done;
                 ++active;
@@ -446,7 +530,10 @@ done:
     curl_slist_free_all(headers);
     if (multi) curl_multi_cleanup(multi);
     if (!finish_writer(&writer, result == RANGE_OK)) result = RANGE_SD_ERROR;
-    if (result == RANGE_RETRY_SINGLE && atomic_load(&job->received))
+    if (result != RANGE_OK) atomic_store(&job->received, saved);
+    if (state) fclose(state);
+    free(bits);
+    if (result == RANGE_RETRY_SINGLE && saved)
         result = RANGE_INTERRUPTED;
     if (result == RANGE_OK) {
         uint64_t ended = milliseconds();

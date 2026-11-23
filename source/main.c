@@ -197,7 +197,7 @@ typedef struct {
     size_t trailer_index;
     uint64_t trailer_controls_until;
     TrailerState trailer_state;
-    bool confirm_install, choose_download, close, download_busy, download_finished, download_paused;
+    bool confirm_install, confirm_exit, confirm_exit_installing, choose_download, close, download_busy, download_finished, download_paused;
     bool catalog_busy[CATALOG_SOURCE_COUNT];
     size_t download_choice;
     char update_target[256], staged_update_sha[41];
@@ -627,6 +627,24 @@ static unsigned transfer_stage(void) {
 
 static bool network_download_active(void) {
     return app.download_busy && transfer_stage() == 0;
+}
+
+static bool wake_download_screen(void);
+
+/* Only interactive + can request confirmation. The system can forcibly
+ * terminate a homebrew app without allowing it to show a dialog. */
+static void request_exit(void) {
+    if (app.download_busy && !app.active_transfer.app_update && transfer_stage() != 0) {
+        app.confirm_exit = true;
+        app.confirm_exit_installing = transfer_stage() == 2;
+        if (app.dimmed) wake_download_screen();
+        return;
+    }
+    if (network_download_active() && !app.active_transfer.app_update) {
+        atomic_store(&app.download.pause_requested, true);
+        atomic_store(&app.download.cancelled, true);
+    }
+    app.close = true;
 }
 
 static bool update_in_progress(void) {
@@ -1531,6 +1549,8 @@ static void finish_jobs(void) {
         threadClose(&app.download_thread);
         app.download_busy = false;
         app.download_finished = true;
+        // If the operation has already finished, there is nothing left to interrupt.
+        app.confirm_exit = false;
         bool finished_update = app.active_transfer.app_update;
         app.download_paused = (atomic_load(&app.download.pause_requested) ||
                                app.download.resume_blocked) &&
@@ -2183,6 +2203,11 @@ static void touch_swipe(int y, int dx, int dy) {
 }
 
 static void touch_tap(int x, int y) {
+    if (app.confirm_exit) {
+        if (x >= 224 && x < 1050 && y >= 417 && y < 490)
+            input(x < 640 ? HidNpadButton_A : HidNpadButton_B);
+        return;
+    }
     if (app.confirm_install) {
         if (x >= 224 && x < 1050 && y >= 417 && y < 490)
             input(x < 640 ? HidNpadButton_A : HidNpadButton_B);
@@ -2452,8 +2477,15 @@ static void app_lifecycle_hook(AppletHookType hook, void *unused) {
     bool focused = appletGetFocusState() == AppletFocusState_InFocus;
     if (hook == AppletHookType_OnFocusState)
         keep_console_awake(focused);
-    else if (hook == AppletHookType_OnExitRequest)
+    else if (hook == AppletHookType_OnExitRequest) {
         keep_console_awake(false);
+        // System-driven exits cannot display confirmation; preserve network
+        // progress as early as possible before standard shutdown cleanup.
+        if (network_download_active() && !app.active_transfer.app_update) {
+            atomic_store(&app.download.pause_requested, true);
+            atomic_store(&app.download.cancelled, true);
+        }
+    }
 
     if (app.dimmed && (hook == AppletHookType_OnExitRequest ||
                       hook == AppletHookType_OnOperationMode ||
@@ -2513,6 +2545,19 @@ static bool poll_touch(bool controller_input) {
 
 static void input(u64 buttons) {
     if (!buttons || update_in_progress()) return;
+    if (app.confirm_exit) {
+        if (buttons & HidNpadButton_A) {
+            app.confirm_exit = false;
+            app.close = true;
+        } else if (buttons & (HidNpadButton_B | HidNpadButton_Plus)) {
+            app.confirm_exit = false;
+        }
+        return;
+    }
+    if (buttons & HidNpadButton_Plus) {
+        request_exit();
+        return;
+    }
     if (app.dimmed) {
         if (buttons & HidNpadButton_Minus) wake_download_screen();
         return;
@@ -2530,13 +2575,11 @@ static void input(u64 buttons) {
         } else if (buttons & HidNpadButton_A) respond_to_update(true);
         else if (buttons & HidNpadButton_B) respond_to_update(false);
         else if (buttons & HidNpadButton_X) open_update_details();
-        else if (buttons & HidNpadButton_Plus) app.close = true;
         return;
     }
     if (app.trailer_open) {
         app.trailer_controls_until = SDL_GetTicks64() + 3000;
         if (buttons & HidNpadButton_B) close_trailer();
-        else if (buttons & HidNpadButton_Plus) app.close = true;
         else if (buttons & HidNpadButton_L) step_trailer(false);
         else if (buttons & HidNpadButton_R) step_trailer(true);
         else if (buttons & (left_buttons | right_buttons)) trailer_seek((buttons & right_buttons) != 0);
@@ -2547,7 +2590,6 @@ static void input(u64 buttons) {
         if (buttons & HidNpadButton_B) app.fullscreen_shot = false;
         else if (buttons & (left_buttons | HidNpadButton_L)) step_screenshot(false);
         else if (buttons & (right_buttons | HidNpadButton_R)) step_screenshot(true);
-        else if (buttons & HidNpadButton_Plus) app.close = true;
         return;
     }
     if (app.choose_download) {
@@ -2565,7 +2607,6 @@ static void input(u64 buttons) {
         if (buttons & HidNpadButton_B) app.delete_file[0] = 0;
         return;
     }
-    if (buttons & HidNpadButton_Plus) { app.close = true; return; }
     if (app.settings_open) {
         if (buttons & (HidNpadButton_B | HidNpadButton_Minus)) toggle_settings();
         else {
@@ -3382,6 +3423,19 @@ static void draw_update_progress(void) {
     text(app.small, line, 224, 405, 828, gray);
 }
 
+
+static void draw_exit_confirmation(void) {
+    rect(190, 200, 900, 305, selected);
+    text(app.large, tr("Вийти з NXLoad?"), 224, 230, 828, white);
+    text(app.normal, tr(app.confirm_exit_installing ?
+         "Встановлення буде перервано." : "Розпакування буде перервано."),
+         224, 299, 828, white);
+    text(app.small, tr("Незавершену операцію не можна буде продовжити з цього місця."),
+         224, 355, 828, gray);
+    text(app.normal, tr("A  Вийти"), 224, 428, 396, blue);
+    text(app.normal, tr("B  Скасувати"), 656, 428, 390, gray);
+}
+
 static void draw_installer_dialog(void) {
     bool busy = app.download_busy || app.queue_count;
     rect(190, 200, 900, 305, selected);
@@ -3406,12 +3460,14 @@ static void draw(void) {
     if (app.trailer_open) {
         draw_trailer();
         if (app.confirm_install) draw_installer_dialog();
+        if (app.confirm_exit) draw_exit_confirmation();
         SDL_RenderPresent(app.renderer);
         return;
     }
     if (app.dimmed) {
         SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
         SDL_RenderClear(app.renderer);
+        if (app.confirm_exit) draw_exit_confirmation();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -3419,6 +3475,7 @@ static void draw(void) {
         rect(0, 0, 1280, 720, (SDL_Color){0, 0, 0, 255});
         draw_game_screenshots();
         if (app.confirm_install) draw_installer_dialog();
+        if (app.confirm_exit) draw_exit_confirmation();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -3430,6 +3487,7 @@ static void draw(void) {
         draw_settings();
         if (app.confirm_install) draw_installer_dialog();
         else if (update_dialog_visible()) draw_update_dialog();
+        if (app.confirm_exit) draw_exit_confirmation();
         SDL_RenderPresent(app.renderer);
         return;
     }
@@ -3476,6 +3534,7 @@ static void draw(void) {
         text(app.normal, "A  Видалити", 224, 428, 396, blue);
         text(app.normal, "B  Скасувати", 656, 428, 390, gray);
     }
+    if (app.confirm_exit) draw_exit_confirmation();
     SDL_RenderPresent(app.renderer);
 }
 

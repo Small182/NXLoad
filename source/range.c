@@ -537,6 +537,7 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     snprintf(state_path, sizeof(state_path), "%s.range", partial_path);
     FILE *state = fopen(state_path, "rb+");
     RangeResumeHeader previous = {0};
+    uint64_t legacy_saved = 0;
     uint64_t block_size = info->length / (lanes * 6);
     if (block_size < 8 * MIB) block_size = 8 * MIB;
     if (block_size > 16 * MIB) block_size = 16 * MIB;
@@ -558,6 +559,7 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
         if (!validate_saved_region(source, info, job, partial_path,
                                    0, (uint64_t)existing.st_size))
             return RANGE_INTERRUPTED;
+        legacy_saved = (uint64_t)existing.st_size;
         block_size = 4 * MIB;
     } else if (existing.st_size != 0) {
         // A full-size sparse file without a valid journal is not trustworthy.
@@ -618,6 +620,19 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
         free(prefix);
         return RANGE_INTERRUPTED;
     }
+    if (legacy_saved && legacy_saved % block_size) {
+        // Keep the unfinished tail of a sequential .part rather than
+        // rounding the saved position down to the previous 4 MiB boundary.
+        size_t index = (size_t)(legacy_saved / block_size);
+        prefix[index] = (uint32_t)(legacy_saved % block_size);
+        if (!save_pause_progress(progress_path, info->length, block_size,
+                                 chunks, prefix)) {
+            fclose(state);
+            free(bits);
+            free(prefix);
+            return RANGE_SD_ERROR;
+        }
+    }
     uint64_t saved = 0;
     size_t first_done = chunks, last_done = chunks;
     for (size_t i = 0; i < chunks; ++i) {
@@ -640,17 +655,20 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     }
     if (previous.magic[0] && saved &&
         (!info->etag[0] || strcmp(previous.etag, header.etag))) {
-        uint64_t offset = (uint64_t)first_done * block_size;
-        uint64_t span = info->length - offset;
-        if (span > block_size) span = block_size;
-        bool valid = validate_saved_region(source, info, job, partial_path,
-                                           offset, span);
-        if (valid && last_done != first_done) {
-            offset = (uint64_t)last_done * block_size;
-            span = info->length - offset;
+        bool valid = true;
+        if (first_done < chunks) {
+            uint64_t offset = (uint64_t)first_done * block_size;
+            uint64_t span = info->length - offset;
             if (span > block_size) span = block_size;
             valid = validate_saved_region(source, info, job, partial_path,
                                           offset, span);
+            if (valid && last_done != first_done) {
+                offset = (uint64_t)last_done * block_size;
+                span = info->length - offset;
+                if (span > block_size) span = block_size;
+                valid = validate_saved_region(source, info, job, partial_path,
+                                              offset, span);
+            }
         }
         if (valid) {
             for (size_t i = 0; i < chunks && valid; ++i) {

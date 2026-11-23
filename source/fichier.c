@@ -320,12 +320,13 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
     FichierJob *job = t->job;
     const RangeSource source = { url, referer, "romfs:/cacert.pem" };
     RangeInfo info;
+    char partial[256];
+    partial_path(partial, job->url,
+                 job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
+    struct stat pending;
+    bool had_partial = !stat(partial, &pending) && pending.st_size > 0;
     if (!range_probe(&source, job, &info)) {
-        char partial[256];
-        partial_path(partial, job->url,
-                     job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
-        struct stat pending;
-        if (!stat(partial, &pending) && pending.st_size > 0) {
+        if (had_partial) {
             job->resume_blocked = true;
             job->result = "Сервер не підтримує відновлення. Y — скасувати.";
             return true;
@@ -369,10 +370,15 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
                                         "Файловий сервер обмежив кількість запитів";
         return true;
     }
-    if (result == RANGE_INTERRUPTED) {
+    if (result == RANGE_INTERRUPTED || (result == RANGE_RETRY_SINGLE && had_partial)) {
         job->resume_blocked = true;
         job->result = "Не вдалося перевірити збережені блоки. Y — скасувати.";
         return true;
+    }
+    if (result == RANGE_RETRY_SINGLE) {
+        // No previously saved data: fall back to the original single-GET path.
+        fichier_discard_partial(job->url, job->dlarchive_id ?
+                                 job->dlarchive_id : job->romshq_id);
     }
     atomic_store(&job->received, 0);
     atomic_store(&job->total, 0);

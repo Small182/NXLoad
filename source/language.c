@@ -123,7 +123,6 @@ static const struct {
     {"Завантажити й встановити", "Download and install"},
     {"Залишилось %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, "Time left %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64},
     {"Запит адреси файлу…", "Requesting the file URL…"},
-    {"Збереження прогресу та призупинення…", "Saving progress and pausing…"},
     {"Збережено · %.1f МіБ · середня %.1f МіБ/с", "Saved · %.1f MiB · average %.1f MiB/s"},
     {"Збережені файли", "Saved files"},
     {"Збірка %" PRIu64 " · %.8s", "Build %" PRIu64 " · %.8s"},

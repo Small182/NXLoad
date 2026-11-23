@@ -2616,7 +2616,7 @@ static void input(u64 buttons) {
             if (network_download_active() && !app.active_transfer.app_update) {
                 atomic_store(&app.download.pause_requested, true);
                 atomic_store(&app.download.cancelled, true);
-                strcpy(app.notice, "Збереження прогресу та призупинення…");
+                app.notice[0] = 0;
                 return;
             }
         }

@@ -251,10 +251,16 @@ static void partial_path(char out[256], const char *url, const char *id) {
 }
 
 void fichier_discard_partial(const char *url, const char *id) {
-    char path[256], metadata[272];
+    char path[256], metadata[288];
     partial_path(path, url, id);
-    snprintf(metadata, sizeof(metadata), "%s.range", path);
     unlink(path);
+    snprintf(metadata, sizeof(metadata), "%s.range", path);
+    unlink(metadata);
+    snprintf(metadata, sizeof(metadata), "%s.progress", path);
+    unlink(metadata);
+    snprintf(metadata, sizeof(metadata), "%s.progress.prev", path);
+    unlink(metadata);
+    snprintf(metadata, sizeof(metadata), "%s.progress.tmp", path);
     unlink(metadata);
 }
 
@@ -348,9 +354,8 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
     t->file = NULL;
     if (result == RANGE_OK && closed && !atomic_load(&job->cancelled)) {
         if (!rename(t->partial, job->path)) {
-            char metadata[272];
-            snprintf(metadata, sizeof(metadata), "%s.range", t->partial);
-            unlink(metadata);
+            fichier_discard_partial(job->url,
+                                    job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
             job->result = "Download saved";
             job->tls_detail[0] = 0;
             return true;

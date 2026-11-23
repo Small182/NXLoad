@@ -1,0 +1,67 @@
+name: Probe suggested media sources
+on:
+  push:
+    paths:
+      - .github/workflows/source-verification.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect HTTP access and screenshot metadata
+        run: |
+          python3 - <<'PY'
+          import re,json,urllib.request,urllib.error
+          checks={
+            "yuumi-com":"https://yuumijungle.com/en/",
+            "yuumi-games":"https://yuumijungle.games/en/",
+            "romslab":"https://romslab.com/",
+            "romslab-search":"https://romslab.com/?s=Hollow+Knight",
+            "nswpedia":"https://nswpedia.com/",
+            "nswpedia-search":"https://nswpedia.com/?s=Hollow+Knight",
+            "yuumi-zelda":"https://yuumijungle.com/en/the-legend-of-zelda-tears-of-the-kingdom-rom-free-download-for-nintendo-4/",
+            "romslab-hollow":"https://romslab.com/hollow-knight-switch-nsp-free-download-1/",
+            "nswpedia-hollow":"https://nswpedia.com/nintendo-switch-roms/action/hollow-knight",
+            "nswpedia-zelda":"https://nswpedia.com/nintendo-switch-roms/action/the-legend-of-zelda-tears-of-the-kingdom-totk",
+            "nswpedia-search-pikmin":"https://nswpedia.com/?s=Pikmin%204",
+            "nswpedia-search-hollow":"https://nswpedia.com/?s=Hollow%20Knight",
+            "yuumi-search":"https://yuumijungle.com/en/?s=Hollow%20Knight",
+            "yuumi-search-zelda":"https://yuumijungle.com/en/?s=Zelda%20Tears%20of%20the%20Kingdom",
+            "romslab-hollow-search":"https://romslab.com/?s=Hollow+Knight",
+            "nlib-zelda":"https://api.nlib.cc/nx/0100F2C0115B6000/screens",
+            "nlib-hollow":"https://api.nlib.cc/nx/0100633007D48000/screens",
+            "nlib-zelda-detail":"https://api.nlib.cc/nx/0100F2C0115B6000?fields=name,screens",
+            "nlib-zelda-image":"https://api.nlib.cc/nx/0100F2C0115B6000/screen/1",
+          }
+          for name,url in checks.items():
+            print("=== "+name+" ===",flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (NXLoad media compatibility test)","Accept":"application/json,text/html,image/jpeg,*/*;q=0.8"})
+              with urllib.request.urlopen(req,timeout=13) as r:
+                typ=r.headers.get("content-type","");status=r.status;end=r.url;body=r.read(280000)
+              print("RESULT",status,typ,"BYTES",len(body),"FINAL",end,"JPEG",body[:3].hex(),flush=True)
+              if "json" in typ.lower():
+                print("JSON",repr(body[:1200]),flush=True)
+              elif "html" in typ.lower():
+                html=body.decode("utf-8","replace")
+                print("TITLE",re.findall(r'<title[^>]*>([^<]+)',html,re.I)[:2],flush=True)
+                print("OG_IMAGES",re.findall(r'<meta[^>]*property=["\\x27]og:image["\\x27][^>]*>',html,re.I)[:2],flush=True)
+                print("GAME_URLS",re.findall(r'href=["\\x27](https?://[^"\\x27]*?(?:hollow-knight|zelda)[^"\\x27]*)',html,re.I)[:6],flush=True)
+                for match in re.finditer(r'(?i)screenshot|gameplay|gallery',html):
+                  point=match.start()
+                  if point>200000:break
+                  if len(str(point))<1:break
+                  print("MEDIA_CONTEXT",repr(html[max(0,point-170):point+380]),flush=True)
+                  if point>50000:break
+                print("IMG_ATTRS",re.findall(r'<img[^>]{0,900}>',html,re.I)[:14],flush=True)
+                print("LINKED_IMAGES",re.findall(r'https?://[^"\\x27 <>]+?\\.(?:jpg|jpeg|webp|png)',html,re.I)[:22],flush=True)
+                if name.startswith("nswpedia-search") or name.startswith("yuumi-search") or name.startswith("romslab-hollow-search"):
+                  for marker in ('Hollow Knight','hollow-knight','Pikmin 4','The Legend of Zelda'):
+                    pos=html.find(marker)
+                    print("SEARCH_MATCH",marker,pos,repr(html[max(0,pos-430):pos+280]) if pos>=0 else "",flush=True)
+                  print("ALL_GAME_LINKS",re.findall(r'href=["\\x27](https?://(?:nswpedia\\.com|romslab\\.com|yuumijungle\\.com)[^"\\x27]+)["\\x27]',html,re.I)[:40],flush=True)
+                print("SCREENSHOTS",re.findall(r'.{0,70}(?:screenshots?|gameplay).{0,70}',html,re.I)[:4],flush=True)
+            except Exception as e:
+              print("ERROR",repr(e),flush=True)
+          PY

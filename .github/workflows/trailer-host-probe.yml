@@ -1,0 +1,43 @@
+name: Test native Switch trailer hosts
+on:
+  push:
+    paths:
+      - .github/workflows/trailer-host-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Inspect available Switch trailer videos
+        run: |
+          python3 - <<'PY'
+          import re,urllib.request,urllib.error,json,html
+          pages={
+            "gamespot-zelda":"https://www.gamespot.com/videos/the-legend-of-zelda-tears-of-the-kingdom-official-out-now-launch-trailer/2300-6461369/",
+            "gamespot-mario":"https://www.gamespot.com/videos/super-mario-odyssey-trailer-nintendo-switch-presen/2300-6436609/",
+            "ign-zelda":"https://www.ign.com/videos/the-legend-of-zelda-tears-of-the-kingdom-official-final-trailer",
+            "gematsu-zelda":"https://www.gematsu.com/games/the-legend-of-zelda-tears-of-the-kingdom",
+            "gamefaqs-zelda":"https://gamefaqs.gamespot.com/switch/266202-the-legend-of-zelda-tears-of-the-kingdom/videos/26461226",
+            "nlib-zelda-movie":"https://api.nlib.cc/nx/0100F2C0115B6000/videos",
+          }
+          for name,url in pages.items():
+            print("\n###",name,url,flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"})
+              with urllib.request.urlopen(req,timeout=10) as resp:
+                raw=resp.read(1048576);mime=resp.headers.get("Content-Type");code=resp.status
+              data=raw.decode("utf-8","replace")
+              print("STATUS",code,"TYPE",mime,"BYTES",len(raw),flush=True)
+              if 'json' in (mime or ''):
+                print("JSON",data[:1300],flush=True)
+              else:
+                print("TITLE",re.findall(r'<title[^>]*>(.*?)</title>',data,re.I|re.S)[:1],flush=True)
+                for pat in [r'https?[^"<> ]{10,700}\.(?:mp4|m3u8|mpd)(?:\?[^"<> ]*)?',
+                            r'.{0,150}(?:jwplayer|videoPlayer|zencoder|hls|video_url|videoUrl|assetURL|playbackURL).{0,230}',
+                            r'.{0,150}(?:video/mp4|streaming|sourceUrl|video\/upload).{0,250}']:
+                    hits=re.findall(pat,data,re.I)
+                    print("PATTERN",pat[:50],"COUNT",len(hits),"EXAMPLES",[h[:350] for h in hits[:6]],flush=True)
+            except Exception as e:
+              print("ERROR",type(e).__name__,str(e)[:250],flush=True)
+          PY

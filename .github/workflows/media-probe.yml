@@ -1,0 +1,76 @@
+name: Probe media providers
+on:
+  push:
+    paths:
+      - .github/workflows/media-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect Zelda catalog link
+        run: |
+          python3 - <<'PY'
+          import gzip,json,re
+          with gzip.open('tools/nintendo-life.json.gz','rt') as f: data=json.load(f)
+          for path,info in data.items():
+              if 'zelda' in path and 'kingdom' in path and ('switch/' in path):
+                  print('INDEX PATH',path,'TITLE',repr(info[0]),flush=True)
+          PY
+      - name: Check actual provider responses
+        run: |
+          python3 - <<'PY'
+          import gzip, re, urllib.parse, urllib.request, urllib.error, json
+          urls={
+            "nintendolife-overview":"https://www.nintendolife.com/games/nintendo-switch/super_mario_odyssey",
+            "nintendolife-screenshots":"https://www.nintendolife.com/games/nintendo-switch/super_mario_odyssey/screenshots",
+            "zelda-overview":"https://www.nintendolife.com/games/nintendo-switch/legend_of_zelda_tears_of_the_kingdom",
+            "zelda-screenshots":"https://www.nintendolife.com/games/nintendo-switch/legend_of_zelda_tears_of_the_kingdom/screenshots",
+            "zelda-alternate":"https://www.nintendolife.com/games/nintendo-switch/the_legend_of_zelda_tears_of_the_kingdom/screenshots",
+            "steam-search":"https://store.steampowered.com/api/storesearch/?term=Hollow%20Knight&l=english&cc=US",
+            "invidious-nadeko":"https://inv.nadeko.net/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "invidious-yewtu":"https://yewtu.be/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.protokolla.fi":"https://invidious.protokolla.fi/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-iv.catgirl.cloud":"https://iv.catgirl.cloud/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.ritoge.com":"https://invidious.ritoge.com/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.qwik.space":"https://invidious.qwik.space/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.slipfox.xyz":"https://invidious.slipfox.xyz/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.io.lol":"https://invidious.io.lol/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-y.com.sb":"https://y.com.sb/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-invidious.privacyredirect.com":"https://invidious.privacyredirect.com/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-inv.riverside.rocks":"https://inv.riverside.rocks/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "invidious-stream-catgirl":"https://iv.catgirl.cloud/latest_version?id=5kcdRBHM7kM&itag=18&local=true",
+            "invidious-video-catgirl":"https://iv.catgirl.cloud/api/v1/videos/5kcdRBHM7kM",
+            "instance-invidious-privatecoffee":"https://invidious.private.coffee/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-iv-melmac":"https://iv.melmac.space/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "instance-iv-nerdvpn":"https://invidious.nerdvpn.de/api/v1/search?q=Super%20Mario%20Odyssey%20Nintendo%20Switch%20trailer&type=video",
+            "piped-pipedapi.kavin.rocks":"https://pipedapi.kavin.rocks/streams/5kcdRBHM7kM",
+            "piped-pipedapi.leptons.xyz":"https://pipedapi.leptons.xyz/streams/5kcdRBHM7kM",
+            "piped-pipedapi.nosebs.ru":"https://pipedapi.nosebs.ru/streams/5kcdRBHM7kM",
+            "piped-pipedapi.adminforge.de":"https://pipedapi.adminforge.de/streams/5kcdRBHM7kM",
+            "piped-api.piped.yt":"https://api.piped.yt/streams/5kcdRBHM7kM",
+            "piped-piped-api.codespace.cz":"https://piped-api.codespace.cz/streams/5kcdRBHM7kM",
+            "piped-api.piped.private.coffee":"https://api.piped.private.coffee/streams/5kcdRBHM7kM",
+          }
+          for name,url in urls.items():
+            print("\n=== "+name+" ===",flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (NXLoad media probe)","Accept":"text/html,application/json;q=0.9,*/*;q=0.8",**({"Range":"bytes=0-1023"} if name.startswith("invidious-stream") else {})})
+              with urllib.request.urlopen(req,timeout=12) as f:
+                body=f.read(4096 if name.startswith("invidious-stream") else 1024*1024)
+                print("status",f.status,"bytes",len(body),"mime",f.headers.get("content-type"),"content-range",f.headers.get("content-range"),"url",f.url)
+              text=body.decode("utf-8","replace")
+              if name.startswith("nintendolife") or name.startswith("zelda"):
+                for patt in (r'images\.nintendolife\.com/screenshots/\d+/(?:large|small)\.jpg',
+                             r'/(?:games|screenshots)/[^"< ]+',r'(?i)<section[^>]{0,200}screenshots[^>]*>',
+                             r'(?i)<img[^>]{0,500}>'):
+                  print("REGEX",patt,"hits",len(re.findall(patt,text)),"samples",re.findall(patt,text)[:4])
+                for snippet in ["screenshots/",'id="screenshots"','Screenshots (','data-src','srcset']:
+                  i=text.find(snippet);print("CONTAINS",snippet,i,repr(text[max(0,i-160):i+400]) if i>=0 else "")
+              else:
+                print("PREVIEW",repr(text[:900]))
+            except Exception as e:
+              print("ERROR",type(e).__name__,str(e)[:220],flush=True)
+          PY

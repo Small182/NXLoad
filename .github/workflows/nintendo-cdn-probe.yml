@@ -1,0 +1,30 @@
+name: Probe Nintendo media CDN aliases
+on:
+  push:
+    paths:
+      - .github/workflows/nintendo-cdn-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check actual video CDN links
+        run: |
+          python3 - <<'PY'
+          import urllib.request, urllib.error, socket
+          path="video/upload/sp_full_hd/v1/Microsites/zelda-tears-of-the-kingdom/videos/totk_microsite_features_ultrahand.m3u8"
+          urls=["https://assets.nintendo.com/"+path,
+                "https://res.cloudinary.com/nintendo/"+path,
+                "https://res.cloudinary.com/nintendo-us/"+path,
+                "https://res.cloudinary.com/nintendoamerica/"+path,
+                "https://assets.nintendo.com/"+path.replace(".m3u8",".mp4"),
+                "https://res.cloudinary.com/nintendo/"+path.replace(".m3u8",".mp4")]
+          for url in urls:
+            print("URL",url,flush=True)
+            try:
+              req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0","Range":"bytes=0-1023"})
+              with urllib.request.urlopen(req,timeout=8) as response:
+                b=response.read(1024); print("RESULT",response.status,response.headers.get("content-type"),response.headers.get("content-range"),len(b),repr(b[:60]),flush=True)
+            except Exception as e: print("ERROR",str(e)[:160],flush=True)
+          PY

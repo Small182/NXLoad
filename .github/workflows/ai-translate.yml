@@ -1,0 +1,165 @@
+name: Improve Ukrainian game descriptions with AI
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "prepare (free), pilot/full_chunk (paid), collect, publish (reviewed)"
+        required: true
+        type: choice
+        default: prepare
+        options: [prepare, pilot, full_chunk, collect, publish]
+      source_run_id:
+        description: "For collect: submit run ID; for publish: collect run ID"
+        required: false
+        type: string
+      model:
+        description: "Translation model (default: high-quality Terra)"
+        required: false
+        type: string
+        default: gpt-5.6-terra
+
+permissions:
+  contents: read
+
+jobs:
+  translate:
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      STAGE: ${{ inputs.stage || 'prepare' }}
+      MODEL: ${{ inputs.model || 'gpt-5.6-terra' }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Validate translation pipeline
+        run: |
+          python3 -m py_compile tools/ai-translate.py tools/build-metadata.py tools/title_db.py tools/local-translate.py
+          python3 tools/local-translate.py --prepare --limit 3
+          echo "Context-aware AI translation tooling loaded"
+
+      - name: Prepare controlled translation batch
+        if: env.STAGE != 'collect' && env.STAGE != 'publish'
+        run: |
+          case "$STAGE" in
+            prepare|pilot) LIMIT=30 ;;
+            full_chunk) LIMIT=1500 ;;
+            *) echo "Unknown stage: $STAGE" && exit 1 ;;
+          esac
+          python3 tools/ai-translate.py prepare ai-work --limit "$LIMIT" --model "$MODEL"
+          if test "$STAGE" = prepare; then
+            echo "No API calls or charges. Inspect requests.jsonl before using pilot/full_chunk."
+          fi
+
+      - name: Submit explicitly requested paid batch
+        if: env.STAGE == 'pilot' || env.STAGE == 'full_chunk'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if test -z "$OPENAI_API_KEY"; then
+            echo "::error::Add OPENAI_API_KEY as a GitHub Actions repository secret before paid translation."
+            exit 1
+          fi
+          python3 -m pip install --quiet 'openai>=2,<5'
+          python3 tools/ai-translate.py submit ai-work
+          echo "Save this run ID to use the collect stage later: $GITHUB_RUN_ID"
+
+      - name: Fetch submitted batch data
+        if: env.STAGE == 'collect'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Provide the submit workflow run ID in source_run_id."
+            exit 1
+          fi
+          mkdir -p ai-work
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name nxload-ai-translation-batch --dir ai-work
+
+      - name: Collect and audit without publishing
+        if: env.STAGE == 'collect'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if test -z "$OPENAI_API_KEY"; then
+            echo "::error::OPENAI_API_KEY is required to fetch results."
+            exit 1
+          fi
+          python3 -m pip install --quiet 'openai>=2,<5'
+          python3 tools/ai-translate.py collect ai-work
+          if ! test -f tools/translations.ai.uk.json.gz; then
+            echo "Batch still pending or no validated results."
+          fi
+
+      - name: Fetch reviewed translations
+        if: env.STAGE == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Provide the collect workflow run ID."
+            exit 1
+          fi
+          mkdir -p editorial-work
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name nxload-ai-translation-review --dir editorial-work
+          test -f editorial-work/translations.ai.uk.json.gz
+          test -f editorial-work/editorial-sample.json
+          test -f editorial-work/quality-report.json
+
+      - name: Publish explicitly approved translations
+        if: env.STAGE == 'publish'
+        run: |
+          python3 - <<'PY'
+          import gzip, json
+          from pathlib import Path
+          published = Path("tools/translations.ai.uk.json.gz")
+          reviewed = Path("editorial-work/translations.ai.uk.json.gz")
+          old = json.loads(gzip.decompress(published.read_bytes())) if published.exists() else {}
+          new = json.loads(gzip.decompress(reviewed.read_bytes()))
+          if not new:
+              raise SystemExit("No translations to publish")
+          old.update(new)
+          published.write_bytes(gzip.compress(json.dumps(old, ensure_ascii=False,
+              sort_keys=True, separators=(",", ":")).encode(), mtime=0))
+          print("Approved AI translations now in catalog:", len(old))
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/translations.ai.uk.json.gz
+          if ! git diff --cached --quiet; then
+            git commit -m 'Publish editorially reviewed Ukrainian game descriptions'
+            git push origin HEAD:refs/heads/main
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && env.STAGE != 'collect' && env.STAGE != 'publish'
+        with:
+          name: nxload-ai-translation-batch
+          path: ai-work/
+          retention-days: 30
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Package review data in one folder
+        if: env.STAGE == 'collect'
+        run: |
+          mkdir -p editorial-package
+          for file in ai-work/quality-report.json ai-work/review.json.gz ai-work/editorial-sample.json tools/translations.ai.uk.json.gz; do
+            if test -f "$file"; then cp "$file" editorial-package/; fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: env.STAGE == 'collect'
+        with:
+          name: nxload-ai-translation-review
+          path: editorial-package/
+          retention-days: 30
+          if-no-files-found: warn

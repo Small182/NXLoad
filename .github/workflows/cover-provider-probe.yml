@@ -1,0 +1,24 @@
+name: Verify fallback cover icons
+on:
+  push:
+    paths:
+      - .github/workflows/cover-provider-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate independent Switch title ID covers
+        run: |
+          python3 - <<'PY'
+          import urllib.request
+          for tid in ["0100F2C0115B6000","0100633007D48000","0100000000010000","01007EF00011E000"]:
+              u=f"https://api.nlib.cc/nx/{tid}/icon/256"
+              try:
+                  req=urllib.request.Request(u,headers={"User-Agent":"NXLoad/1.0.50"})
+                  with urllib.request.urlopen(req,timeout=8) as r:
+                      data=r.read(600000)
+                      print("COVER",tid,"STATUS",r.status,"MIME",r.headers.get("content-type"),"LEN",len(data),"MAGIC",data[:3].hex(),flush=True)
+              except Exception as e:print("COVER",tid,"ERROR",repr(e),flush=True)
+          PY

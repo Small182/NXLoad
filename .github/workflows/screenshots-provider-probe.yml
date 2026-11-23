@@ -1,0 +1,72 @@
+name: Probe fallback screenshot sites
+on:
+  push:
+    paths:
+      - .github/workflows/screenshots-provider-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check provider access and game screenshot markup
+        run: |
+          python3 - <<'PY'
+          import re,urllib.request,urllib.error,html
+          urls={
+            "nxbrew.net-home":"https://nxbrew.net/",
+            "nxbrew.net-search":"https://nxbrew.net/?s=Hollow+Knight",
+            "nxbrew.net-zelda":"https://nxbrew.net/?s=zelda+tears+of+the+kingdom",
+            "nxbrew.io-home":"https://nxbrew.io/",
+            "nxbrew.io-search":"https://nxbrew.io/?s=Hollow+Knight",
+            "gamefaqs-search":"https://gamefaqs.gamespot.com/search?game=Hollow+Knight",
+            "nintendolife-search":"https://www.nintendolife.com/search?query=Hollow%20Knight",
+            "romshq-zelda":"https://romshq.com/?s=Zelda+Tears+of+the+Kingdom",
+            "nintendolife-search-zelda":"https://www.nintendolife.com/search?query=The%20Legend%20of%20Zelda%20Tears%20of%20the%20Kingdom",
+            "nintendolife-search-mario":"https://www.nintendolife.com/search?query=Super%20Mario%20Odyssey",
+            "nintendolife-search-hades":"https://www.nintendolife.com/search?query=Hades",
+            "nintendolife-slug-hades":"https://www.nintendolife.com/games/nintendo-switch/hades",
+            "nxbrew-rest":"https://nxbrew.net/wp-json/wp/v2/posts?search=Hollow+Knight&per_page=2",
+            "mobygames-search":"https://www.mobygames.com/search/?q=Hollow+Knight",
+            "gematsu-search":"https://www.gematsu.com/games/hollow-knight",
+            "gematsu-zelda-game":"https://www.gematsu.com/games/the-legend-of-zelda-tears-of-the-kingdom",
+            "gematsu-zelda-gallery":"https://www.gematsu.com/gallery/the-legend-of-zelda-tears-of-the-kingdom",
+            "gematsu-hollow-gallery":"https://www.gematsu.com/gallery/hollow-knight",
+            "gematsu-silksong-gallery":"https://www.gematsu.com/gallery/hollow-knight-silksong",
+            "gematsu-pikmin-gallery":"https://www.gematsu.com/gallery/pikmin-4",
+            "gematsu-zelda-date":"https://www.gematsu.com/gallery/the-legend-of-zelda-tears-of-the-kingdom/february-8-2023",
+            "gematsu-pikmin-date":"https://www.gematsu.com/gallery/pikmin-4/june-22-2023",
+            "gematsu-silksong-date":"https://www.gematsu.com/gallery/hollow-knight-silksong/june-12-2022",
+            "gamespot-search":"https://www.gamespot.com/search/?q=Hollow+Knight",
+            "gamepressure-search":"https://www.gamepressure.com/games/search.asp?search=Hollow+Knight",
+            "igdb-search":"https://www.igdb.com/search?type=1&q=Hollow%20Knight",
+          }
+          for name,url in urls.items():
+              print("\n=== SOURCE",name,url,flush=True)
+              try:
+                  req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36","Accept":"text/html,*/*;q=0.8"})
+                  with urllib.request.urlopen(req,timeout=8) as response:
+                      raw=response.read(400000)
+                      print("HTTP",response.status,"CONTENT_TYPE",response.headers.get("Content-Type"),"FINAL",response.url,"BYTES",len(raw),flush=True)
+                  page=raw.decode("utf-8","replace")
+                  print("TITLE",re.findall(r"<title[^>]*>([^<]*)",page,re.I)[:2])
+                  print("OGIMAGE",re.findall(r'<meta[^>]+(?:property|name)=["\\x27]og:image["\\x27][^>]{0,500}',page,re.I)[:2])
+                  print("GAME_LINKS",re.findall(r'(?s)<a[^>]*href=["\\x27]([^"\\x27]*(?:/games/|/game/)[^"\\x27]*)["\\x27][^>]*>(.{0,120}?)</a>',page,re.I)[:12])
+                  print("ARTICLES",re.findall(r'<a[^>]{0,500}href=["\\x27](https?://[^"\\x27]+)["\\x27][^>]{0,200}>([^<]+)',page,re.I)[:8])
+                  print("MEDIA_IMAGE",re.findall(r'https?://[^"\\x27 <]+\\.(?:jpg|jpeg|png|webp)',page,re.I)[:15])
+                  if name.startswith("gematsu"):
+                      if "date" in name:
+                          image_start=page.find('bytes-image__link')
+                          print("IMAGE_HTML",repr(page[max(0,image_start-260):image_start+1500]))
+                          print("SCREENSHOT_LINK_COUNT",len(re.findall(r'class="[^"]*bytes-image__link[^"]*"',page)))
+                      gallery_start=page.find('class="gematsu-gallery')
+                      print("GALLERY_CLASS_START",gallery_start,repr(page[max(0,gallery_start-120):gallery_start+900]) if gallery_start>=0 else "")
+                      for pat in (r'(?:id|class)="[^"]*(?:gallery|image|media)[^"]*"',r'(?:href|src|data-src|data-srcset)="[^"]*(?:wp-content/uploads|wp\.com)[^"]*"',r'<h1[^>]*>.*?</h1>'):
+                          print("DETAIL_MATCH",pat,re.findall(pat,page,re.I|re.S)[:15])
+                      for pattern in [r'.{0,200}(?:gallery-item|gallery-item__img|gallery-category|gallery-card|screenshots?).{0,350}',r'<img[^>]{0,650}>',r'<a[^>]{0,650}href=["\\x27][^"\\x27]*gallery[^"\\x27]*["\\x27][^>]*>',r'https://www\\.gematsu\\.com/wp-content/uploads/[^"\\x27 <]+']:
+                          print("GEMATSU_PATTERN",pattern,"MATCHES",re.findall(pattern,page,re.I)[:10])
+                  print("SCREENSHOTS",re.findall(r'.{0,80}(?:screenshots|gallery|gameplay|wp-content/uploads).{0,120}',page,re.I)[:7])
+                  print("SAMPLE",repr(page[:180]))
+              except Exception as e:
+                  print("ERROR",type(e).__name__,str(e)[:200],flush=True)
+          PY

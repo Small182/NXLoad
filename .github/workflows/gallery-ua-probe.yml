@@ -1,0 +1,26 @@
+name: Check game gallery user agents
+on:
+  push:
+    paths:
+      - .github/workflows/gallery-ua-probe.yml
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Compare NXLoad and browser HTTP responses
+        run: |
+          python3 - <<'PY'
+          import urllib.request,re
+          url="https://www.nintendolife.com/games/nintendo-switch/legend_of_zelda_tears_of_the_kingdom"
+          for agent in ["NXLoad/1.0.3","NXLoad/1.0.50","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"]:
+              for suffix in ("","/screenshots"):
+                  try:
+                      req=urllib.request.Request(url+suffix,headers={"User-Agent":agent})
+                      with urllib.request.urlopen(req,timeout=8) as r:
+                          html=r.read().decode("utf-8","replace")
+                          hits=re.findall(r'https://images\.nintendolife\.com/screenshots/[0-9]+/large\.jpg',html)
+                          print("UA",agent[:38],"PATH",suffix,"STATUS",r.status,"IMAGES",len(hits),"LEN",len(html),"REDIRECT",r.url,flush=True)
+                  except Exception as e: print("UA",agent[:38],"PATH",suffix,"ERROR",str(e),flush=True)
+          PY

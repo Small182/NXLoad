@@ -609,8 +609,10 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     uint32_t *prefix = calloc(chunks, sizeof(*prefix));
     char progress_path[288];
     snprintf(progress_path, sizeof(progress_path), "%s.progress", partial_path);
-    if (!prefix || load_pause_progress(progress_path, info->length,
-                                        block_size, chunks, prefix) < 0) {
+    if (!prefix ||
+        (previous.magic[0] &&
+         load_pause_progress(progress_path, info->length,
+                             block_size, chunks, prefix) < 0)) {
         if (state) fclose(state);
         free(bits);
         free(prefix);
@@ -768,6 +770,20 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     if (!active && !atomic_load(&job->cancelled) && atomic_load(&job->received) == info->length)
         result = RANGE_OK;
 done:
+    // During a pause, drain all received bytes, including unfinished blocks.
+    // Ordinary cancellation and failed writes still discard uncommitted data.
+    bool pausing = atomic_load(&job->cancelled) && atomic_load(&job->pause_requested);
+    bool can_checkpoint = pausing && result != RANGE_SD_ERROR;
+    if (can_checkpoint) {
+        for (unsigned i = 0; i < lanes; ++i) {
+            RangePart *part = &parts[i];
+            if (part->received && part->buffered && !flush_part(part)) {
+                can_checkpoint = false;
+                result = RANGE_SD_ERROR;
+                break;
+            }
+        }
+    }
     for (unsigned i = 0; i < lanes; ++i) {
         RangePart *part = &parts[i];
         if (part->active) curl_multi_remove_handle(multi, part->curl);
@@ -776,9 +792,53 @@ done:
     }
     curl_slist_free_all(headers);
     if (multi) curl_multi_cleanup(multi);
-    if (!finish_writer(&writer, result == RANGE_OK)) result = RANGE_SD_ERROR;
-    if (result != RANGE_OK) atomic_store(&job->received, saved);
+    if (!finish_writer(&writer, result == RANGE_OK || can_checkpoint)) {
+        result = RANGE_SD_ERROR;
+        can_checkpoint = false;
+    }
+    if (can_checkpoint) {
+        if (fsync(fd)) {
+            result = RANGE_SD_ERROR;
+        } else {
+            // The completed-block bitmap and the progress journal are both
+            // persisted after the part file itself is durable on microSD.
+            for (unsigned i = 0; i < lanes; ++i) {
+                RangePart *part = &parts[i];
+                if (!part->received || part->last < part->first) continue;
+                size_t chunk = (size_t)(part->first / block_size);
+                if (chunk >= chunks || bit_set(bits, chunk)) continue;
+                uint64_t chunk_length = part->last - part->first + 1;
+                if (part->received > chunk_length || part->received > UINT32_MAX) {
+                    result = RANGE_SD_ERROR;
+                    break;
+                }
+                if (part->received == chunk_length) {
+                    if (!checkpoint_chunk(NULL, state, bits, chunk)) {
+                        result = RANGE_SD_ERROR;
+                        break;
+                    }
+                    prefix[chunk] = 0;
+                } else {
+                    prefix[chunk] = (uint32_t)part->received;
+                }
+            }
+            if (result != RANGE_SD_ERROR &&
+                !save_pause_progress(progress_path, info->length, block_size,
+                                      chunks, prefix))
+                result = RANGE_SD_ERROR;
+        }
+    }
+    if (result != RANGE_OK) {
+        saved = 0;
+        for (size_t i = 0; i < chunks; ++i) {
+            uint64_t span = info->length - (uint64_t)i * block_size;
+            if (span > block_size) span = block_size;
+            saved += bit_set(bits, i) ? span : prefix[i];
+        }
+        atomic_store(&job->received, saved);
+    }
     if (state) fclose(state);
+    free(prefix);
     free(bits);
     if (result == RANGE_RETRY_SINGLE && saved)
         result = RANGE_INTERRUPTED;

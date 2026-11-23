@@ -1531,6 +1531,7 @@ static void finish_jobs(void) {
         threadClose(&app.download_thread);
         app.download_busy = false;
         app.download_finished = true;
+        bool finished_update = app.active_transfer.app_update;
         app.download_paused = (atomic_load(&app.download.pause_requested) ||
                                app.download.resume_blocked) &&
                               !app.active_transfer.app_update;
@@ -1558,7 +1559,7 @@ static void finish_jobs(void) {
         if (app.download.dbi_file[0] && !atomic_load(&app.download.cancelled))
             offer_installer(app.download.dbi_file, app.download.result);
         refresh_saved();
-        if (app.queue_count && !app.active_transfer.app_update)
+        if (app.queue_count && !finished_update)
             snprintf(app.notice, sizeof(app.notice), tr("Попереднє: %.170s"), tr(app.download.result));
     }
     if (app.download_busy) {

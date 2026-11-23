@@ -2186,7 +2186,7 @@ static void toggle_trailer(void) {
 }
 
 static void touch_swipe(int y, int dx, int dy) {
-    if (update_dialog_visible()) return;
+    if (app.confirm_exit || update_dialog_visible()) return;
     if (app.filters_open || app.delete_file[0] || app.confirm_install || app.choose_download || app.settings_open) return;
     if (abs(dx) < 42 || abs(dx) <= abs(dy)) return;
     if (app.trailer_open) {
@@ -2362,7 +2362,7 @@ typedef enum {
 } DragArea;
 
 static DragArea drag_area(int x, int y) {
-    if (app.fullscreen_shot) return DRAG_NONE;
+    if (app.confirm_exit || app.fullscreen_shot) return DRAG_NONE;
     if (update_dialog_visible())
         return app.update_details_open && x >= 170 && x < 1110 &&
                y >= UPDATE_NOTES_Y && y < UPDATE_NOTES_Y + UPDATE_NOTES_ROWS * UPDATE_NOTES_LINE ?
@@ -2382,7 +2382,7 @@ static DragArea drag_area(int x, int y) {
 }
 
 static bool drag_scroll(DragArea area, int delta, int *remainder) {
-    if (update_dialog_visible() && area != DRAG_UPDATE_DETAILS) return false;
+    if (app.confirm_exit || (update_dialog_visible() && area != DRAG_UPDATE_DETAILS)) return false;
     if (area == DRAG_UPDATE_DETAILS) {
         int pixels = *remainder + delta;
         *remainder = pixels % UPDATE_NOTES_LINE;

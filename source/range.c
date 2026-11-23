@@ -788,6 +788,7 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     if (!active && !atomic_load(&job->cancelled) && atomic_load(&job->received) == info->length)
         result = RANGE_OK;
 done:
+    ; // C11 label must precede a statement, not a declaration.
     // During a pause, drain all received bytes, including unfinished blocks.
     // Ordinary cancellation and failed writes still discard uncommitted data.
     bool pausing = atomic_load(&job->cancelled) && atomic_load(&job->pause_requested);

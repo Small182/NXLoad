@@ -31,6 +31,7 @@ typedef struct {
     char dbi_file[FICHIER_INPUT_CAPACITY];
     char path[256];
     const char *url;
+    bool resume_blocked;
     bool megaup;
     bool dlarchive;
     bool datanodes;

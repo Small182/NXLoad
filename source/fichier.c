@@ -45,6 +45,7 @@ typedef struct {
     bool attachment;
     bool binary;
     bool allow_file;
+    bool retry_parallel;
     FILE *file;
     char *write_buffer;
     char partial[256];
@@ -320,6 +321,15 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
     const RangeSource source = { url, referer, "romfs:/cacert.pem" };
     RangeInfo info;
     if (!range_probe(&source, job, &info)) {
+        char partial[256];
+        partial_path(partial, job->url,
+                     job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
+        struct stat pending;
+        if (!stat(partial, &pending) && pending.st_size > 0) {
+            job->resume_blocked = true;
+            job->result = "Сервер не підтримує відновлення. Y — скасувати.";
+            return true;
+        }
         if (info.status != 429) return false;
         job->http = info.status;
         job->result = job->dlarchive ? "DLArchive обмежив кількість запитів" :
@@ -347,7 +357,7 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
         job->result = "Could not finalize file on SD";
         return true;
     }
-    if (!atomic_load(&job->pause_requested))
+    if (atomic_load(&job->cancelled) && !atomic_load(&job->pause_requested))
         fichier_discard_partial(job->url, job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
     if (atomic_load(&job->cancelled)) return true;
     if (result == RANGE_SD_ERROR || !closed) {
@@ -360,7 +370,8 @@ static bool parallel_download(Transfer *t, const char *url, const char *referer)
         return true;
     }
     if (result == RANGE_INTERRUPTED) {
-        job->result = "Завантаження перервано. Спробуй ще раз.";
+        job->resume_blocked = true;
+        job->result = "Не вдалося перевірити збережені блоки. Y — скасувати.";
         return true;
     }
     atomic_store(&job->received, 0);
@@ -377,7 +388,18 @@ static size_t on_body(char *data, size_t size, size_t count, void *arg) {
     if (atomic_load(&t->job->cancelled)) return 0;
     if (t->allow_file && t->status == 200 && !t->challenge && !t->text &&
         (t->attachment || t->binary)) {
-        if (!t->file && !open_partial(t, true)) return 0;
+        if (!t->file) {
+            char existing[256];
+            partial_path(existing, t->job->url,
+                         t->job->dlarchive_id ? t->job->dlarchive_id : t->job->romshq_id);
+            struct stat pending;
+            if (!stat(existing, &pending) && pending.st_size > 0) {
+                // Try the same provider as verified HTTP Range, never truncate.
+                t->retry_parallel = true;
+                return 0;
+            }
+            if (!open_partial(t, true)) return 0;
+        }
         size_t written = fwrite(data, 1, n, t->file);
         atomic_fetch_add(&t->job->received, written);
         if (written != n) t->error = nxload_storage_error(errno, "Помилка запису на microSD");
@@ -900,6 +922,14 @@ void fichier_download(FichierJob *job) {
         }
         CURLcode code = curl_easy_perform(curl);
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->http);
+        if (t.retry_parallel) {
+            t.retry_parallel = false;
+            if (parallel_download(&t, url, referrer) || atomic_load(&job->cancelled))
+                goto done;
+            job->resume_blocked = true;
+            job->result = "Сервер не підтримує відновлення. Y — скасувати.";
+            goto done;
+        }
         if (t.file) {
             curl_off_t speed = 0;
             curl_easy_getinfo(curl, CURLINFO_SPEED_DOWNLOAD_T, &speed);
@@ -918,7 +948,7 @@ void fichier_download(FichierJob *job) {
                 }
                 t.error = "Could not finalize file on SD";
             }
-            if (!atomic_load(&job->pause_requested))
+            if (atomic_load(&job->cancelled) && !atomic_load(&job->pause_requested))
                 fichier_discard_partial(job->url, job->dlarchive_id ? job->dlarchive_id : job->romshq_id);
             job->result = t.error ? t.error : curl_easy_strerror(code);
             goto done;
@@ -980,8 +1010,6 @@ void fichier_download(FichierJob *job) {
                                   strncmp(next, www_card, strlen(www_card));
                 strcpy(url, next);
                 job->result = "Забагато перенаправлень до файлу";
-                snprintf(job->tls_detail, sizeof(job->tls_detail),
-                         tr("Перенаправлення на %.91s"), destination_host);
                 continue;
             }
             if (location) {

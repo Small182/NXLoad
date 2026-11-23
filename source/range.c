@@ -177,7 +177,8 @@ bool range_probe(const RangeSource *source, FichierJob *job, RangeInfo *info) {
     CURLcode code = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     info->status = probe.response.status;
-    if (code != CURLE_OK || probe.count != 1 || !probe.response.etag[0] ||
+    // Some download CDNs support byte ranges but omit ETag.
+    if (code != CURLE_OK || probe.count != 1 ||
         probe.response.total < MIN_PARALLEL_SIZE) return false;
     info->length = probe.response.total;
     strcpy(info->etag, probe.response.etag);
@@ -301,7 +302,8 @@ static size_t part_body(char *data, size_t size, size_t count, void *arg) {
     if (atomic_load(&part->job->cancelled) ||
         !has_range(&part->response, part->request_first, part->last) ||
         part->response.total != part->info->length ||
-        (part->response.has_etag && strcmp(part->response.etag, part->info->etag)) ||
+        (part->info->etag[0] && part->response.has_etag &&
+         strcmp(part->response.etag, part->info->etag)) ||
         total > part->last - part->first + 1 - part->received) return 0;
     size_t copied = 0;
     while (copied < total) {
@@ -442,12 +444,12 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     CURLM *multi = curl_multi_init();
     char if_range[sizeof(info->etag) + 12];
     snprintf(if_range, sizeof(if_range), "If-Range: %s", info->etag);
-    struct curl_slist *headers = curl_slist_append(NULL, if_range);
+    struct curl_slist *headers = info->etag[0] ? curl_slist_append(NULL, if_range) : NULL;
     RangeResult result = RANGE_RETRY_SINGLE;
     uint64_t started = milliseconds();
     uint64_t next = 0;
     unsigned active = 0;
-    if (!multi || !headers) goto done;
+    if (!multi || (info->etag[0] && !headers)) goto done;
     curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, (long)lanes);
     curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)lanes);
     start_writer(&writer);

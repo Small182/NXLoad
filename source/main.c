@@ -1509,12 +1509,14 @@ static void finish_jobs(void) {
         threadClose(&app.download_thread);
         app.download_busy = false;
         app.download_finished = true;
-        app.download_paused = atomic_load(&app.download.pause_requested) &&
+        app.download_paused = (atomic_load(&app.download.pause_requested) ||
+                               app.download.resume_blocked) &&
                               !app.active_transfer.app_update;
         app.header_status_at = 0;
         if (app.download_paused) {
             app.speed = 0;
-            app.download.result = "Download paused";
+            if (atomic_load(&app.download.pause_requested))
+                app.download.result = "Download paused";
         }
         if (!save_download_queue())
             strcpy(app.notice, "Не вдалося зберегти чергу завантажень");
@@ -3562,7 +3564,8 @@ int main(int argc, char **argv) {
         atomic_store(&app.download.cancelled, true);
         wait_for_thread(&app.download_thread);
         threadClose(&app.download_thread);
-        app.download_paused = atomic_load(&app.download.pause_requested) &&
+        app.download_paused = (atomic_load(&app.download.pause_requested) ||
+                               app.download.resume_blocked) &&
                               !app.active_transfer.app_update;
         app.download_busy = false;
     }

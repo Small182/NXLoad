@@ -23,6 +23,82 @@
 #define WRITE_QUEUE_SIZE 8
 #define RANGE_RESUME_MAGIC "NXLRNG02"
 #define RANGE_MAX_CHUNKS 262144
+#define RANGE_PROGRESS_MAGIC "NXLPART1"
+
+typedef struct {
+    char magic[8];
+    uint64_t length, block_size;
+    uint32_t chunks, reserved;
+    uint64_t checksum;
+} RangeProgressHeader;
+
+static uint64_t progress_checksum(const uint32_t *values, size_t count) {
+    const unsigned char *p = (const unsigned char *)values;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < count * sizeof(*values); ++i) {
+        hash ^= p[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int load_pause_progress(const char *path, uint64_t length, uint64_t block_size,
+                               size_t chunks, uint32_t *prefix) {
+    const char *candidate = path;
+    char backup[320];
+    if (access(path, F_OK) && errno == ENOENT) {
+        snprintf(backup, sizeof(backup), "%s.prev", path);
+        candidate = backup;
+        if (access(candidate, F_OK) && errno == ENOENT) return 0;
+    }
+    FILE *file = fopen(candidate, "rb");
+    if (!file) return -1;
+    RangeProgressHeader head = {0};
+    bool valid = fread(&head, sizeof(head), 1, file) == 1 &&
+        !memcmp(head.magic, RANGE_PROGRESS_MAGIC, sizeof(head.magic)) &&
+        head.length == length && head.block_size == block_size &&
+        head.chunks == chunks && head.reserved == 0 &&
+        fread(prefix, sizeof(*prefix), chunks, file) == chunks &&
+        fgetc(file) == EOF &&
+        progress_checksum(prefix, chunks) == head.checksum;
+    fclose(file);
+    if (!valid) memset(prefix, 0, chunks * sizeof(*prefix));
+    return valid ? 1 : -1;
+}
+
+static bool save_pause_progress(const char *path, uint64_t length, uint64_t block_size,
+                                size_t chunks, const uint32_t *prefix) {
+    char tmp[320], backup[320];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+        snprintf(backup, sizeof(backup), "%s.prev", path) >= (int)sizeof(backup))
+        return false;
+    RangeProgressHeader head = {0};
+    memcpy(head.magic, RANGE_PROGRESS_MAGIC, sizeof(head.magic));
+    head.length = length;
+    head.block_size = block_size;
+    head.chunks = (uint32_t)chunks;
+    head.checksum = progress_checksum(prefix, chunks);
+    FILE *file = fopen(tmp, "wb");
+    bool ok = file && fwrite(&head, sizeof(head), 1, file) == 1 &&
+        fwrite(prefix, sizeof(*prefix), chunks, file) == chunks &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (file && fclose(file)) ok = false;
+    if (!ok) { unlink(tmp); return false; }
+    bool had_old = false;
+    if (!access(path, F_OK)) {
+        unlink(backup);
+        if (rename(path, backup)) { unlink(tmp); return false; }
+        had_old = true;
+    }
+    if (rename(tmp, path)) {
+        if (had_old) rename(backup, path);
+        unlink(tmp);
+        return false;
+    }
+    unlink(backup);
+    return true;
+}
+
 typedef struct {
     char magic[8];
     uint64_t length, block_size;
@@ -65,6 +141,7 @@ typedef struct {
     const RangeInfo *info;
     RangeResponse response;
     uint64_t first, last, request_first, received, written;
+    uint32_t resumed_prefix;
     unsigned retries;
     unsigned char *buffer;
     size_t buffered;
@@ -276,9 +353,12 @@ static bool flush_part(RangePart *part) {
     } else {
         pthread_mutex_lock(&writer->lock);
         while (writer->count == WRITE_QUEUE_SIZE && !writer->failed &&
-               !atomic_load(&part->job->cancelled))
+               (!atomic_load(&part->job->cancelled) ||
+                atomic_load(&part->job->pause_requested)))
             pthread_cond_wait(&writer->space, &writer->lock);
-        if (writer->failed || atomic_load(&part->job->cancelled)) {
+        if (writer->failed ||
+            (atomic_load(&part->job->cancelled) &&
+             !atomic_load(&part->job->pause_requested))) {
             part->write_failed = writer->failed;
             pthread_mutex_unlock(&writer->lock);
             return false;
@@ -330,13 +410,15 @@ static bool request_remaining(CURLM *multi, RangePart *part) {
     return part->active;
 }
 
-static bool schedule_part(CURLM *multi, RangePart *part, uint64_t *next, uint64_t block_size) {
+static bool schedule_part(CURLM *multi, RangePart *part, uint64_t *next,
+                          uint64_t block_size, const uint32_t *prefix) {
     part->first = *next;
     uint64_t length = part->info->length - *next;
     if (length > block_size) length = block_size;
     *next += length;
     part->last = *next - 1;
-    part->received = part->written = 0;
+    part->resumed_prefix = prefix[part->first / block_size];
+    part->received = part->written = part->resumed_prefix;
     part->buffered = 0;
     part->retries = 0;
     return request_remaining(multi, part);
@@ -352,7 +434,7 @@ static bool retryable_range_error(CURLcode code) {
 /* Journal a completed chunk only after its bytes are durably on microSD. */
 static bool checkpoint_chunk(RangeWriter *writer, FILE *state, unsigned char *bits,
                              size_t chunk) {
-    if (writer->active) {
+    if (writer && writer->active) {
         pthread_mutex_lock(&writer->lock);
         while (writer->count && !writer->failed)
             pthread_cond_wait(&writer->space, &writer->lock);
@@ -360,7 +442,7 @@ static bool checkpoint_chunk(RangeWriter *writer, FILE *state, unsigned char *bi
         pthread_mutex_unlock(&writer->lock);
         if (failed) return false;
     }
-    if (fsync(writer->fd)) return false;
+    if (writer && fsync(writer->fd)) return false;
     unsigned char value = bits[chunk / 8] | (1u << (chunk % 8));
     long offset = (long)sizeof(RangeResumeHeader) + (long)(chunk / 8);
     if (fseek(state, offset, SEEK_SET) || fwrite(&value, 1, 1, state) != 1 ||
@@ -522,14 +604,36 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
             return RANGE_SD_ERROR;
         }
     }
+    // A separate journal stores durable prefixes of unfinished chunks.
+    // Old NXLRNG02 bitmaps remain readable without this new sidecar.
+    uint32_t *prefix = calloc(chunks, sizeof(*prefix));
+    char progress_path[288];
+    snprintf(progress_path, sizeof(progress_path), "%s.progress", partial_path);
+    if (!prefix || load_pause_progress(progress_path, info->length,
+                                        block_size, chunks, prefix) < 0) {
+        if (state) fclose(state);
+        free(bits);
+        free(prefix);
+        return RANGE_INTERRUPTED;
+    }
     uint64_t saved = 0;
     size_t first_done = chunks, last_done = chunks;
     for (size_t i = 0; i < chunks; ++i) {
+        uint64_t span = info->length - (uint64_t)i * block_size;
+        if (span > block_size) span = block_size;
         if (bit_set(bits, i)) {
-            uint64_t span = info->length - (uint64_t)i * block_size;
-            saved += span > block_size ? block_size : span;
+            saved += span;
+            prefix[i] = 0;
             if (first_done == chunks) first_done = i;
             last_done = i;
+        } else {
+            if (prefix[i] >= span) {
+                fclose(state);
+                free(bits);
+                free(prefix);
+                return RANGE_INTERRUPTED;
+            }
+            saved += prefix[i];
         }
     }
     if (previous.magic[0] && saved &&
@@ -546,9 +650,17 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
             valid = validate_saved_region(source, info, job, partial_path,
                                           offset, span);
         }
+        if (valid) {
+            for (size_t i = 0; i < chunks && valid; ++i) {
+                if (!prefix[i]) continue;
+                valid = validate_saved_region(source, info, job, partial_path,
+                                              (uint64_t)i * block_size, prefix[i]);
+            }
+        }
         if (!valid) {
             fclose(state);
             free(bits);
+            free(prefix);
             return RANGE_INTERRUPTED;
         }
     }
@@ -558,6 +670,7 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
             fflush(state) || fsync(fileno(state))) {
             fclose(state);
             free(bits);
+            free(prefix);
             return RANGE_SD_ERROR;
         }
     }
@@ -598,7 +711,7 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
         curl_easy_setopt(part->curl, CURLOPT_WRITEFUNCTION, part_body);
         curl_easy_setopt(part->curl, CURLOPT_WRITEDATA, part);
         curl_easy_setopt(part->curl, CURLOPT_PRIVATE, part);
-        if (!schedule_part(multi, part, &next, block_size)) goto done;
+        if (!schedule_part(multi, part, &next, block_size, prefix)) goto done;
         ++active;
     }
     while (active && !atomic_load(&job->cancelled)) {
@@ -641,10 +754,11 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
                 result = RANGE_SD_ERROR;
                 goto done;
             }
-            saved += length;
+            saved += length - part->resumed_prefix;
+            prefix[part->first / block_size] = 0;
             skip_completed(&next, info->length, block_size, bits);
             if (next < info->length) {
-                if (!schedule_part(multi, part, &next, block_size)) goto done;
+                if (!schedule_part(multi, part, &next, block_size, prefix)) goto done;
                 ++active;
                 rescheduled = true;
             }

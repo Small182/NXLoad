@@ -1564,7 +1564,11 @@ static void finish_jobs(void) {
     }
     if (app.download_busy) {
         unsigned stage = transfer_stage();
-        uint64_t now = SDL_GetTicks64(), bytes = atomic_load(&app.download.received);
+        uint64_t now = SDL_GetTicks64();
+        // Restored bytes count toward progress, not the current transfer speed.
+        // For unpack/install stages keep the existing progress-based estimator.
+        uint64_t bytes = atomic_load(stage == 0 ? &app.download.transferred :
+                                     &app.download.received);
         if (stage != app.speed_stage || bytes < app.previous_bytes) {
             app.speed = 0;
             app.speed_stage = stage;
@@ -1604,6 +1608,7 @@ static void start_active_transfer(void) {
     atomic_init(&job->yield_for_game_requests, false);
     atomic_init(&job->update_received, false);
     atomic_init(&job->received, 0);
+    atomic_init(&job->transferred, 0);
     atomic_init(&job->total, 0);
     atomic_init(&job->streams, 0);
     atomic_init(&job->waiting, 0);

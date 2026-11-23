@@ -396,6 +396,7 @@ static size_t part_body(char *data, size_t size, size_t count, void *arg) {
     }
     part->received += total;
     atomic_fetch_add(&part->job->received, total);
+    atomic_fetch_add(&part->job->transferred, total);
     return total;
 }
 
@@ -863,7 +864,9 @@ done:
         result = RANGE_INTERRUPTED;
     if (result == RANGE_OK) {
         uint64_t ended = milliseconds();
-        if (ended > started) job->avg_speed = (uint64_t)(info->length * 1000.0 / (ended - started));
+        if (ended > started)
+            job->avg_speed = (uint64_t)(atomic_load(&job->transferred) *
+                                        1000.0 / (ended - started));
     }
     return result;
 }

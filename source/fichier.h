@@ -19,6 +19,8 @@ typedef struct {
     atomic_bool yield_for_game_requests;
     atomic_bool update_received;
     atomic_uint_fast64_t received;
+    // Only bytes newly received during this transfer (excludes restored data).
+    atomic_uint_fast64_t transferred;
     atomic_uint_fast64_t total;
     atomic_uint streams;
     atomic_uint waiting;

@@ -413,6 +413,7 @@ static size_t on_body(char *data, size_t size, size_t count, void *arg) {
         }
         size_t written = fwrite(data, 1, n, t->file);
         atomic_fetch_add(&t->job->received, written);
+        atomic_fetch_add(&t->job->transferred, written);
         if (written != n) t->error = nxload_storage_error(errno, "Помилка запису на microSD");
         return written;
     }

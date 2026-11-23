@@ -61,6 +61,7 @@ static size_t receive(char *data, size_t size, size_t count, void *arg) {
         if (fwrite(data, 1, bytes, r->out) != bytes) return 0;
         sha256ContextUpdate(&r->sha, data, bytes);
         atomic_fetch_add(&r->job->received, bytes);
+        atomic_fetch_add(&r->job->transferred, bytes);
     } else {
         memcpy(r->json + r->size, data, bytes);
         r->json[r->size + bytes] = 0;

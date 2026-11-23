@@ -51,6 +51,9 @@
 #define COVER_WORKERS 3
 #define GRID_THUMB_SIZE 180
 #define DOWNLOAD_QUEUE_LIMIT 24
+#define DOWNLOAD_QUEUE_PATH NXLOAD_APP_DIR "/downloads.queue"
+#define DOWNLOAD_QUEUE_TEMP DOWNLOAD_QUEUE_PATH ".tmp"
+#define DOWNLOAD_QUEUE_BACKUP DOWNLOAD_QUEUE_PATH ".prev"
 #define UPDATE_NOTES_WIDTH 920
 #define UPDATE_NOTES_Y 211
 #define UPDATE_NOTES_LINE 23
@@ -194,7 +197,7 @@ typedef struct {
     size_t trailer_index;
     uint64_t trailer_controls_until;
     TrailerState trailer_state;
-    bool confirm_install, choose_download, close, download_busy, download_finished;
+    bool confirm_install, choose_download, close, download_busy, download_finished, download_paused;
     bool catalog_busy[CATALOG_SOURCE_COUNT];
     size_t download_choice;
     char update_target[256], staged_update_sha[41];
@@ -231,6 +234,142 @@ typedef struct {
 } App;
 
 static App app;
+
+/* Persist requests by value; signed delivery URLs are NOT saved here. The
+ * catalog URL and source ID allow a fresh link to be resolved after restart. */
+typedef struct {
+    char magic[8];
+    uint32_t count;
+    uint8_t has_active;
+    uint8_t reserved[3];
+    uint64_t received, total, checksum;
+} DownloadQueueHeader;
+
+static uint64_t queue_checksum(const DownloadRequest *items, size_t count) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const unsigned char *data = (const unsigned char *)items;
+    for (size_t i = 0; i < count * sizeof(*items); ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool valid_download_request(const DownloadRequest *r) {
+    if (!memchr(r->name, 0, sizeof(r->name)) ||
+        !memchr(r->url, 0, sizeof(r->url)) ||
+        !memchr(r->id, 0, sizeof(r->id)) ||
+        !r->url[0] || r->app_update || r->source > FILE_1FICHIER)
+        return false;
+    if (r->unpack || r->install_local) {
+        const char *root = NXLOAD_DOWNLOAD_DIR "/";
+        return !strncmp(r->url, root, strlen(root)) &&
+               !strstr(r->url, "/../") && !strstr(r->url, "/./") &&
+               !strchr(r->url, '\\');
+    }
+    return !strncmp(r->url, "https://", 8);
+}
+
+static bool save_download_queue(void) {
+    bool active = (app.download_busy || app.download_paused) &&
+                  !app.active_transfer.app_update;
+    size_t count = app.queue_count + (active ? 1 : 0);
+    if (!count) {
+        unlink(DOWNLOAD_QUEUE_PATH);
+        unlink(DOWNLOAD_QUEUE_BACKUP);
+        return true;
+    }
+    if (count > DOWNLOAD_QUEUE_LIMIT + 1 || !nxload_ensure_storage()) return false;
+    DownloadRequest *items = calloc(count, sizeof(*items));
+    if (!items) return false;
+    size_t offset = 0;
+    if (active) items[offset++] = app.active_transfer;
+    for (size_t i = 0; i < app.queue_count; ++i) {
+        if (!app.queue[i].app_update) items[offset++] = app.queue[i];
+    }
+    count = offset;
+    if (!count) {
+        free(items);
+        unlink(DOWNLOAD_QUEUE_PATH);
+        unlink(DOWNLOAD_QUEUE_BACKUP);
+        return true;
+    }
+    DownloadQueueHeader header = {0};
+    memcpy(header.magic, "NXLDQ002", 8);
+    header.count = (uint32_t)count;
+    header.has_active = active;
+    if (active) {
+        header.received = atomic_load(&app.download.received);
+        header.total = atomic_load(&app.download.total);
+    }
+    header.checksum = queue_checksum(items, count);
+    FILE *file = fopen(DOWNLOAD_QUEUE_TEMP, "wb");
+    bool ok = file &&
+        fwrite(&header, sizeof(header), 1, file) == 1 &&
+        fwrite(items, sizeof(*items), count, file) == count &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (file && fclose(file)) ok = false;
+    free(items);
+    if (!ok) {
+        unlink(DOWNLOAD_QUEUE_TEMP);
+        return false;
+    }
+    bool moved = false;
+    if (!access(DOWNLOAD_QUEUE_PATH, F_OK)) {
+        unlink(DOWNLOAD_QUEUE_BACKUP);
+        if (rename(DOWNLOAD_QUEUE_PATH, DOWNLOAD_QUEUE_BACKUP)) {
+            unlink(DOWNLOAD_QUEUE_TEMP);
+            return false;
+        }
+        moved = true;
+    }
+    if (rename(DOWNLOAD_QUEUE_TEMP, DOWNLOAD_QUEUE_PATH)) {
+        if (moved) rename(DOWNLOAD_QUEUE_BACKUP, DOWNLOAD_QUEUE_PATH);
+        unlink(DOWNLOAD_QUEUE_TEMP);
+        return false;
+    }
+    unlink(DOWNLOAD_QUEUE_BACKUP);
+    return true;
+}
+
+static bool load_download_queue_path(const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    DownloadQueueHeader header = {0};
+    DownloadRequest *items = calloc(DOWNLOAD_QUEUE_LIMIT + 1, sizeof(*items));
+    bool ok = items && fread(&header, sizeof(header), 1, file) == 1 &&
+        !memcmp(header.magic, "NXLDQ002", 8) &&
+        header.count && header.count <= DOWNLOAD_QUEUE_LIMIT + 1 &&
+        header.has_active <= 1 &&
+        fread(items, sizeof(*items), header.count, file) == header.count &&
+        fgetc(file) == EOF && !ferror(file) &&
+        queue_checksum(items, header.count) == header.checksum;
+    for (size_t i = 0; ok && i < header.count; ++i)
+        if (!valid_download_request(&items[i])) ok = false;
+    if (ok) {
+        size_t first = header.has_active ? 1 : 0;
+        if (!header.has_active) first = 1; // Offer the first pending item paused.
+        app.active_transfer = items[0];
+        app.queue_count = header.count - first;
+        for (size_t i = 0; i < app.queue_count; ++i)
+            app.queue[i] = items[first + i];
+        app.download_paused = true;
+        app.download_finished = true;
+        app.download.result = "Download paused";
+        atomic_store(&app.download.received, header.has_active ? header.received : 0);
+        atomic_store(&app.download.total, header.has_active ? header.total : 0);
+        app.queue_focus = true;
+    }
+    free(items);
+    fclose(file);
+    return ok;
+}
+
+static void load_download_queue(void) {
+    if (!load_download_queue_path(DOWNLOAD_QUEUE_PATH))
+        load_download_queue_path(DOWNLOAD_QUEUE_BACKUP);
+}
+
 static struct {
     char label[512];
     SDL_Texture *texture;
@@ -1370,7 +1509,15 @@ static void finish_jobs(void) {
         threadClose(&app.download_thread);
         app.download_busy = false;
         app.download_finished = true;
+        app.download_paused = atomic_load(&app.download.pause_requested) &&
+                              !app.active_transfer.app_update;
         app.header_status_at = 0;
+        if (app.download_paused) {
+            app.speed = 0;
+            app.download.result = "Download paused";
+        }
+        if (!save_download_queue())
+            strcpy(app.notice, "Не вдалося зберегти чергу завантажень");
         if (app.download.update_staged) {
             app.update_ready = true;
             strcpy(app.staged_update_sha, app.active_transfer.update.sha);
@@ -1398,7 +1545,7 @@ static void finish_jobs(void) {
             app.speed_time = now;
         }
     }
-    if (!app.download_busy) {
+    if (!app.download_busy && !app.download_paused) {
         if (app.queue_count) launch_next_transfer();
         else if (app.update_ready) app.close = true;
     }
@@ -1411,13 +1558,12 @@ static void remove_queued(size_t index) {
     if (app.queue_index && app.queue_index >= app.queue_count) --app.queue_index;
 }
 
-static void launch_next_transfer(void) {
-    app.active_transfer = app.queue[0];
-    remove_queued(0);
+static void start_active_transfer(void) {
     const DownloadRequest *request = &app.active_transfer;
     FichierJob *job = &app.download;
     memset(job, 0, sizeof(*job));
     atomic_init(&job->cancelled, false);
+    atomic_init(&job->pause_requested, false);
     atomic_init(&job->unpacking, false);
     atomic_init(&job->copying_port_files, false);
     atomic_init(&job->installing, false);
@@ -1445,12 +1591,21 @@ static void launch_next_transfer(void) {
     app.speed = 0;
     app.speed_stage = 0;
     app.download_finished = false;
+    app.download_paused = false;
     app.download_busy = start_worker(&app.download_thread, download_worker, job);
     if (!app.download_busy) {
         job->result = "Не вдалося запустити операцію";
         if (request->app_update) strcpy(app.update_notice, job->result);
         app.download_finished = true;
+        app.download_paused = !request->app_update;
     }
+    if (!save_download_queue()) strcpy(app.notice, "Не вдалося зберегти чергу завантажень");
+}
+
+static void launch_next_transfer(void) {
+    app.active_transfer = app.queue[0];
+    remove_queued(0);
+    start_active_transfer();
 }
 
 static bool same_transfer(const DownloadRequest *a, const DownloadRequest *b) {
@@ -1459,13 +1614,16 @@ static bool same_transfer(const DownloadRequest *a, const DownloadRequest *b) {
 }
 
 static const char *enqueue_transfer(const DownloadRequest *request) {
-    if (app.download_busy && same_transfer(request, &app.active_transfer))
+    if ((app.download_busy || app.download_paused) && same_transfer(request, &app.active_transfer))
         return "Цей файл уже обробляється";
     for (size_t i = 0; i < app.queue_count; ++i)
         if (same_transfer(request, &app.queue[i])) return "Цей файл уже в черзі";
     if (app.queue_count == DOWNLOAD_QUEUE_LIMIT) return "Черга заповнена";
     app.queue[app.queue_count++] = *request;
-    if (app.download_busy) return "Додано до черги";
+    if (app.download_busy || app.download_paused) {
+        if (!save_download_queue()) return "Не вдалося зберегти чергу завантажень";
+        return "Додано до черги";
+    }
     bool app_update = request->app_update;
     launch_next_transfer();
     if (!app_update) {
@@ -1638,6 +1796,7 @@ static void delete_saved_file(void) {
             if (strcmp(app.saved[i].file, app.delete_file)) app.saved[out++] = app.saved[i];
         app.saved_count = out;
         if (app.saved_index && app.saved_index >= app.saved_count) --app.saved_index;
+        save_download_queue();
     }
     app.delete_file[0] = 0;
 }
@@ -2386,7 +2545,30 @@ static void input(u64 buttons) {
             app.screen = app.previous;
             return;
         }
+        if ((buttons & HidNpadButton_A) && (app.queue_focus || !app.saved_count)) {
+            if (app.download_paused) {
+                start_active_transfer();
+                return;
+            }
+            if (network_download_active() && !app.active_transfer.app_update) {
+                atomic_store(&app.download.pause_requested, true);
+                atomic_store(&app.download.cancelled, true);
+                strcpy(app.notice, "Збереження прогресу та призупинення…");
+                return;
+            }
+        }
+        if ((buttons & HidNpadButton_Y) && app.download_paused) {
+            fichier_discard_partial(app.active_transfer.url, app.active_transfer.id[0] ?
+                                    app.active_transfer.id : NULL);
+            app.download_paused = false;
+            app.download_finished = true;
+            app.download.result = "Download cancelled";
+            app.speed = 0;
+            save_download_queue();
+            return;
+        }
         if ((buttons & HidNpadButton_Y) && app.download_busy) {
+            atomic_store(&app.download.pause_requested, false);
             atomic_store(&app.download.cancelled, true);
             return;
         }
@@ -2405,7 +2587,10 @@ static void input(u64 buttons) {
             return;
         }
         if (buttons & HidNpadButton_X) {
-            if (app.queue_focus && app.queue_count) remove_queued(app.queue_index);
+            if (app.queue_focus && app.queue_count) {
+                remove_queued(app.queue_index);
+                save_download_queue();
+            }
             else if (!app.queue_focus && app.saved_count)
                 strcpy(app.delete_file, app.saved[app.saved_index].file);
             return;
@@ -2932,7 +3117,12 @@ static void draw_downloads(void) {
         } else {
             rect(66, 225, (int)(bar_width * percent / 100.0), 8, blue);
         }
-        if (app.download_busy && stage == 2) {
+        if (app.download_paused) {
+            if (total)
+                snprintf(line, sizeof(line), "На паузі · %.1f%% · %.1f / %.1f МіБ",
+                         percent, have / 1048576.0, total / 1048576.0);
+            else strcpy(line, "На паузі · A — продовжити");
+        } else if (app.download_busy && stage == 2) {
             if (total)
                 snprintf(line, sizeof(line), tr("Встановлення на microSD · %.1f%% · %.1f / %.1f МіБ"),
                          percent, have / 1048576.0, total / 1048576.0);
@@ -3185,9 +3375,14 @@ static void draw(void) {
         text(app.small, "← / →  Вкладки    Y  Вибране    B  Назад    ↑  Верхнє меню    −  Налаштування",
              40, 665, 1200, gray);
     } else {
-        text(app.small, "← / →  Списки    A  Встановити / розпакувати", 40, 665, 410, gray);
+        text(app.small, app.queue_focus || !app.saved_count ?
+             app.download_paused ? "← / →  Списки    A  Продовжити" :
+             network_download_active() ? "← / →  Списки    A  Пауза" :
+             "← / →  Списки    A  Обрати" :
+             "← / →  Списки    A  Встановити / розпакувати", 40, 665, 410, gray);
         text(app.small, app.queue_focus ? "X  Прибрати з черги" : "X  Видалити файл", 455, 665, 225, gray);
-        if (app.download_busy) text(app.small, "Y  Скасувати", 685, 665, 190, gray);
+        if (app.download_busy || app.download_paused)
+            text(app.small, "Y  Скасувати", 685, 665, 190, gray);
         else if (!app.queue_focus && app.saved_count && !app.queue_count)
             text(app.small, "ZL  Відкрити DBI", 685, 665, 190, gray);
         text(app.small, "B  Назад", 880, 665, DOWNLOADS_DIM_X - 880, gray);
@@ -3279,6 +3474,7 @@ int main(int argc, char **argv) {
     if (ok) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
         app.settings = load_settings();
+        load_download_queue();
         apply_theme();
         set_english(app.settings.english);
         load_favorites();
@@ -3361,10 +3557,16 @@ int main(int argc, char **argv) {
         threadClose(&app.catalog_thread[source]);
     }
     if (app.download_busy) {
+        if (!app.active_transfer.app_update && network_download_active())
+            atomic_store(&app.download.pause_requested, true);
         atomic_store(&app.download.cancelled, true);
         wait_for_thread(&app.download_thread);
         threadClose(&app.download_thread);
+        app.download_paused = atomic_load(&app.download.pause_requested) &&
+                              !app.active_transfer.app_update;
+        app.download_busy = false;
     }
+    save_download_queue();
     for (size_t i = 0; i < COVER_WORKERS; ++i)
         if (app.cover_jobs[i].busy) atomic_store(&app.cover_jobs[i].cancel, true);
     for (size_t i = 0; i < COVER_WORKERS; ++i) {

@@ -202,6 +202,8 @@ typedef struct {
     size_t download_choice;
     char update_target[256], staged_update_sha[41];
     bool update_ready, update_checking, update_offered, update_details_open;
+    bool update_parked_download;
+    uint64_t update_parked_received, update_parked_total;
     UpdateCheck update_check;
     Thread update_thread;
     struct { uint16_t offset, length; } update_lines[UPDATE_DETAILS_BYTES];
@@ -1463,6 +1465,26 @@ static void offer_installer(const char *filename, const char *reason) {
     app.confirm_install = true;
 }
 
+/* Keep a paused download intact when updating NXLoad. The update worker
+ * temporarily uses the single download thread, while the paused request
+ * remains first in the persisted queue. */
+static void restore_update_parked_download(void) {
+    if (!app.update_parked_download || !app.queue_count) return;
+    app.active_transfer = app.queue[0];
+    --app.queue_count;
+    if (app.queue_count)
+        memmove(&app.queue[0], &app.queue[1],
+                app.queue_count * sizeof(app.queue[0]));
+    app.update_parked_download = false;
+    app.download_busy = false;
+    app.download_paused = true;
+    app.download_finished = true;
+    atomic_store(&app.download.received, app.update_parked_received);
+    atomic_store(&app.download.total, app.update_parked_total);
+    app.download.result = "Download paused";
+    app.speed = 0;
+}
+
 static void finish_jobs(void) {
     if (app.update_checking && R_SUCCEEDED(waitSingle(waiterForThread(&app.update_thread), 0))) {
         threadWaitForExit(&app.update_thread);
@@ -1518,14 +1540,21 @@ static void finish_jobs(void) {
             if (atomic_load(&app.download.pause_requested))
                 app.download.result = "Download paused";
         }
-        if (!save_download_queue())
-            strcpy(app.notice, "Не вдалося зберегти чергу завантажень");
         if (app.download.update_staged) {
             app.update_ready = true;
             strcpy(app.staged_update_sha, app.active_transfer.update.sha);
         }
-        if (app.active_transfer.app_update)
+        if (app.active_transfer.app_update) {
             snprintf(app.update_notice, sizeof(app.update_notice), "%s", tr(app.download.result));
+            if (app.update_parked_download) {
+                const bool failed = !app.download.update_staged;
+                restore_update_parked_download();
+                if (failed)
+                    snprintf(app.notice, sizeof(app.notice), "%s", app.update_notice);
+            }
+        }
+        if (!save_download_queue())
+            strcpy(app.notice, "Не вдалося зберегти чергу завантажень");
         if (app.download.dbi_file[0] && !atomic_load(&app.download.cancelled))
             offer_installer(app.download.dbi_file, app.download.result);
         refresh_saved();
@@ -1547,9 +1576,11 @@ static void finish_jobs(void) {
             app.speed_time = now;
         }
     }
-    if (!app.download_busy && !app.download_paused) {
-        if (app.queue_count) launch_next_transfer();
-        else if (app.update_ready) app.close = true;
+    if (!app.download_busy) {
+        // Install the staged updater before processing any queued downloads.
+        // Their original order and paused state are already saved on microSD.
+        if (app.update_ready) app.close = true;
+        else if (!app.download_paused && app.queue_count) launch_next_transfer();
     }
 }
 
@@ -1755,12 +1786,41 @@ static void respond_to_update(bool install) {
     DownloadRequest request = {.name = "Оновлення NXLoad", .app_update = true,
                                .update = app.update_check.build};
     strcpy(request.url, app.update_target);
+    if (app.download_paused && !app.download_busy) {
+        // A paused download must not stall an accepted application update.
+        // Park it at the front of the queue without touching its .part files.
+        app.update_parked_received = atomic_load(&app.download.received);
+        app.update_parked_total = atomic_load(&app.download.total);
+        if (app.queue_count)
+            memmove(&app.queue[1], &app.queue[0],
+                    app.queue_count * sizeof(app.queue[0]));
+        app.queue[0] = app.active_transfer;
+        ++app.queue_count;
+        app.update_parked_download = true;
+        app.download_paused = false;
+        app.active_transfer = request;
+        start_active_transfer();
+        if (!app.download_busy) {
+            snprintf(app.update_notice, sizeof(app.update_notice), "%s",
+                     tr(app.download.result));
+            restore_update_parked_download();
+            save_download_queue();
+            snprintf(app.notice, sizeof(app.notice), "%s", app.update_notice);
+        } else {
+            strcpy(app.update_notice, "Завантаження оновлення NXLoad…");
+        }
+        app.settings_open = false;
+        open_downloads();
+        return;
+    }
     const char *message = enqueue_transfer(&request);
-    if (app.download_busy) {
+    if (app.download_busy || *message) {
         app.settings_open = false;
         open_downloads();
         snprintf(app.update_notice, sizeof(app.update_notice), "%s",
-                 *message ? message : "Завантаження оновлення NXLoad…");
+                 *message ? tr(message) : "Завантаження оновлення NXLoad…");
+        if (*message)
+            snprintf(app.notice, sizeof(app.notice), "%s", tr(message));
     }
 }
 

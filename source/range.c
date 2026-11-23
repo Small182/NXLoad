@@ -376,6 +376,68 @@ static void skip_completed(uint64_t *next, uint64_t length, uint64_t block_size,
         *next += span;
     }
 }
+
+/* Compare saved blocks with fresh HTTPS byte ranges whenever the server
+ * does not provide a stable ETag. */
+#define RESUME_SAMPLE_SIZE (16 * 1024)
+typedef struct {
+    unsigned char data[RESUME_SAMPLE_SIZE];
+    size_t length, received;
+} ResumeSample;
+
+static size_t resume_sample_body(char *data, size_t size, size_t count, void *arg) {
+    ResumeSample *sample = arg;
+    if (size && count > SIZE_MAX / size) return 0;
+    size_t bytes = size * count;
+    if (bytes > sample->length - sample->received ||
+        memcmp(sample->data + sample->received, data, bytes)) return 0;
+    sample->received += bytes;
+    return bytes;
+}
+
+static bool validate_saved_region(const RangeSource *source, const RangeInfo *info,
+                                  FichierJob *job, const char *path,
+                                  uint64_t first, uint64_t span) {
+    if (!span || first > info->length || span > info->length - first) return false;
+    FILE *local = fopen(path, "rb");
+    CURL *curl = curl_easy_init();
+    if (!local || !curl) {
+        if (local) fclose(local);
+        if (curl) curl_easy_cleanup(curl);
+        return false;
+    }
+    RangeResponse response = {0};
+    configure(curl, source, job, &response);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, resume_sample_body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    bool ok = true;
+    for (unsigned pass = 0; pass < 2 && ok; ++pass) {
+        size_t bytes = span < RESUME_SAMPLE_SIZE ? (size_t)span : RESUME_SAMPLE_SIZE;
+        uint64_t offset = pass ? first + span - bytes : first;
+        if (pass && offset == first) break;
+        off_t seek = (off_t)offset;
+        ResumeSample sample = {.length = bytes};
+        if ((uint64_t)seek != offset || fseeko(local, seek, SEEK_SET) ||
+            fread(sample.data, 1, bytes, local) != bytes) {
+            ok = false;
+            break;
+        }
+        char range[64];
+        snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64,
+                 offset, offset + bytes - 1);
+        memset(&response, 0, sizeof(response));
+        curl_easy_setopt(curl, CURLOPT_RANGE, range);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sample);
+        CURLcode result = curl_easy_perform(curl);
+        ok = result == CURLE_OK && sample.received == bytes &&
+             has_range(&response, offset, offset + bytes - 1) &&
+             response.total == info->length;
+    }
+    curl_easy_cleanup(curl);
+    fclose(local);
+    return ok;
+}
+
 static uint64_t milliseconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
@@ -387,53 +449,118 @@ RangeResult range_download(const RangeSource *source, const RangeInfo *info, Fic
     off_t length = (off_t)info->length;
     if ((uint64_t)length != info->length) return RANGE_RETRY_SINGLE;
     const unsigned lanes = MAX_CONNECTIONS;
-    uint64_t block_size = info->length / (lanes * 6);
-    if (block_size < 8 * MIB) block_size = 8 * MIB;
-    if (block_size > 64 * MIB) block_size = 64 * MIB;
-    block_size -= block_size % RANGE_WRITE_BUFFER;
-    size_t chunks = (size_t)((info->length - 1) / block_size + 1);
-    if (!chunks || chunks > RANGE_MAX_CHUNKS) return RANGE_RETRY_SINGLE;
-    size_t bytes = (chunks + 7) / 8;
-    unsigned char *bits = calloc(bytes, 1);
-    if (!bits) return RANGE_SD_ERROR;
+    struct stat existing = {0};
+    if (fstat(fd, &existing) || existing.st_size < 0) return RANGE_SD_ERROR;
     char state_path[272];
     snprintf(state_path, sizeof(state_path), "%s.range", partial_path);
     FILE *state = fopen(state_path, "rb+");
-    struct stat existing = {0};
-    bool same_file_size = !fstat(fd, &existing) && existing.st_size == length;
-    RangeResumeHeader header = {0}, previous = {0};
+    RangeResumeHeader previous = {0};
+    uint64_t block_size = info->length / (lanes * 6);
+    if (block_size < 8 * MIB) block_size = 8 * MIB;
+    if (block_size > 16 * MIB) block_size = 16 * MIB;
+    block_size -= block_size % RANGE_WRITE_BUFFER;
+    if (state) {
+        if (fread(&previous, sizeof(previous), 1, state) != 1 ||
+            memcmp(previous.magic, RANGE_RESUME_MAGIC, sizeof(previous.magic)) ||
+            previous.length != info->length ||
+            previous.block_size < MIB || previous.block_size > 64 * MIB ||
+            previous.block_size % RANGE_WRITE_BUFFER ||
+            previous.chunks != (info->length - 1) / previous.block_size + 1 ||
+            existing.st_size != length) {
+            fclose(state);
+            return RANGE_INTERRUPTED;
+        }
+        block_size = previous.block_size;
+    } else if (existing.st_size > 0 && existing.st_size < length) {
+        // Convert a paused sequential .part to a verified range journal.
+        if (!validate_saved_region(source, info, job, partial_path,
+                                   0, (uint64_t)existing.st_size))
+            return RANGE_INTERRUPTED;
+        block_size = 4 * MIB;
+    } else if (existing.st_size != 0) {
+        // A full-size sparse file without a valid journal is not trustworthy.
+        return RANGE_INTERRUPTED;
+    }
+    size_t chunks = (size_t)((info->length - 1) / block_size + 1);
+    if (!chunks || chunks > RANGE_MAX_CHUNKS) {
+        if (state) fclose(state);
+        return RANGE_RETRY_SINGLE;
+    }
+    size_t bytes = (chunks + 7) / 8;
+    unsigned char *bits = calloc(bytes, 1);
+    if (!bits) {
+        if (state) fclose(state);
+        return RANGE_SD_ERROR;
+    }
+    RangeResumeHeader header = {0};
     memcpy(header.magic, RANGE_RESUME_MAGIC, sizeof(header.magic));
     header.length = info->length;
     header.block_size = block_size;
     header.chunks = (uint32_t)chunks;
     snprintf(header.etag, sizeof(header.etag), "%s", info->etag);
-    bool valid = state && same_file_size &&
-        fread(&previous, sizeof(previous), 1, state) == 1 &&
-        !memcmp(header.magic, previous.magic, sizeof(header.magic)) &&
-        header.length == previous.length &&
-        header.block_size == previous.block_size &&
-        header.chunks == previous.chunks &&
-        !memcmp(header.etag, previous.etag, sizeof(header.etag)) &&
-        fread(bits, 1, bytes, state) == bytes && fgetc(state) == EOF;
-    if (!valid) {
-        if (state) fclose(state);
+    if (state) {
+        if (fread(bits, 1, bytes, state) != bytes || fgetc(state) != EOF) {
+            fclose(state);
+            free(bits);
+            return RANGE_INTERRUPTED;
+        }
+    } else {
+        size_t complete = existing.st_size > 0 ?
+            (size_t)((uint64_t)existing.st_size / block_size) : 0;
+        for (size_t i = 0; i < complete; ++i)
+            bits[i / 8] |= 1u << (i % 8);
+        if (ftruncate(fd, length) || fsync(fd)) {
+            free(bits);
+            return RANGE_SD_ERROR;
+        }
         state = fopen(state_path, "wb+");
-        memset(bits, 0, bytes);
-        if (!state || ftruncate(fd, 0) || ftruncate(fd, length) || fsync(fd) ||
-            fwrite(&header, sizeof(header), 1, state) != 1 ||
-            fwrite(bits, 1, bytes, state) != bytes || fflush(state) ||
-            fsync(fileno(state))) {
+        if (!state || fwrite(&header, sizeof(header), 1, state) != 1 ||
+            fwrite(bits, 1, bytes, state) != bytes ||
+            fflush(state) || fsync(fileno(state))) {
             if (state) fclose(state);
             free(bits);
             return RANGE_SD_ERROR;
         }
     }
     uint64_t saved = 0;
-    for (size_t i = 0; i < chunks; ++i)
+    size_t first_done = chunks, last_done = chunks;
+    for (size_t i = 0; i < chunks; ++i) {
         if (bit_set(bits, i)) {
             uint64_t span = info->length - (uint64_t)i * block_size;
             saved += span > block_size ? block_size : span;
+            if (first_done == chunks) first_done = i;
+            last_done = i;
         }
+    }
+    if (previous.magic[0] && saved &&
+        (!info->etag[0] || strcmp(previous.etag, header.etag))) {
+        uint64_t offset = (uint64_t)first_done * block_size;
+        uint64_t span = info->length - offset;
+        if (span > block_size) span = block_size;
+        bool valid = validate_saved_region(source, info, job, partial_path,
+                                           offset, span);
+        if (valid && last_done != first_done) {
+            offset = (uint64_t)last_done * block_size;
+            span = info->length - offset;
+            if (span > block_size) span = block_size;
+            valid = validate_saved_region(source, info, job, partial_path,
+                                          offset, span);
+        }
+        if (!valid) {
+            fclose(state);
+            free(bits);
+            return RANGE_INTERRUPTED;
+        }
+    }
+    if (previous.magic[0] && strcmp(previous.etag, header.etag)) {
+        if (fseek(state, 0, SEEK_SET) ||
+            fwrite(&header, sizeof(header), 1, state) != 1 ||
+            fflush(state) || fsync(fileno(state))) {
+            fclose(state);
+            free(bits);
+            return RANGE_SD_ERROR;
+        }
+    }
     atomic_store(&job->received, saved);
 
     RangePart parts[MAX_CONNECTIONS] = {0};

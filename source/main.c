@@ -3120,7 +3120,9 @@ static void draw_downloads(void) {
             rect(66, 225, (int)(bar_width * percent / 100.0), 8, blue);
         }
         if (app.download_paused) {
-            if (total)
+            if (app.download.resume_blocked)
+                snprintf(line, sizeof(line), "%s", tr(app.download.result));
+            else if (total)
                 snprintf(line, sizeof(line), tr("На паузі · %.1f%% · %.1f / %.1f МіБ"),
                          percent, have / 1048576.0, total / 1048576.0);
             else strcpy(line, "На паузі · A — продовжити");

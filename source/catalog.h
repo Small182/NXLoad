@@ -93,6 +93,9 @@ bool catalog_can_probe_size(const GameFile *file);
 void catalog_probe_size(GameFile *file, atomic_bool *cancel);
 void catalog_request(CatalogJob *job);
 bool romsns_is_homebrew_port(const Game *game);
+bool catalog_read_romshq_media(const char *page, atomic_bool *cancel,
+                               char description[PORT_DESCRIPTION_BYTES],
+                               char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count);
 bool catalog_read_romsns_media(const char *page, atomic_bool *cancel,
                                char description[PORT_DESCRIPTION_BYTES],
                                char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count);

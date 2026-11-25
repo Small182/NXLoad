@@ -761,6 +761,83 @@ static void read_romshq_screenshots(xmlNodePtr node, GameDetails *details) {
     }
 }
 
+/* Fetch live ROMsHQ Overview/Screenshots only when local metadata is absent. */
+static bool romshq_site_description(xmlNodePtr node, char output[PORT_DESCRIPTION_BYTES]) {
+    for (; node; node = node->next) {
+        if (is_element(node, "p")) {
+            xmlChar *text = xmlNodeGetContent(node);
+            char candidate[PORT_DESCRIPTION_BYTES] = {0};
+            copy_text(candidate, sizeof(candidate), text);
+            xmlFree(text);
+            if (strlen(candidate) >= 75) {
+                snprintf(output, PORT_DESCRIPTION_BYTES, "%s", candidate);
+                return true;
+            }
+        }
+        if (romshq_site_description(node->children, output)) return true;
+    }
+    return false;
+}
+
+bool catalog_read_romshq_media(const char *page, atomic_bool *cancel,
+                               char description[PORT_DESCRIPTION_BYTES],
+                               char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count) {
+    description[0] = 0;
+    if (count) *count = 0;
+    char normalized[CATALOG_URL];
+    if (atomic_load(cancel) || !game_page(BAD_CAST page, normalized, CATALOG_ROMSHQ))
+        return false;
+    CURL *curl = curl_easy_init();
+    if (!curl) return false;
+    CatalogFetchStatus status = {0};
+    htmlDocPtr doc = fetch_page(curl, cancel, normalized, &status, true);
+    if (!doc && status.curl == CURLE_OPERATION_TIMEDOUT && !atomic_load(cancel))
+        doc = fetch_page(curl, cancel, normalized, &status, true);
+    curl_easy_cleanup(curl);
+    if (!doc || atomic_load(cancel)) {
+        if (doc) xmlFreeDoc(doc);
+        return false;
+    }
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    xmlNodePtr overview = romshq_section(root, "Overview", "overview");
+    if (overview) romshq_site_description(overview->children, description);
+    if (!description[0]) {
+        xmlNodePtr section = romshq_section(root, "Game Description", "game-description");
+        if (section) romshq_site_description(section->children, description);
+    }
+    if (!description[0]) {
+        xmlNodePtr head = find_tag(root, "head");
+        for (xmlNodePtr node = head ? head->children : NULL; node; node = node->next) {
+            if (!is_element(node, "meta")) continue;
+            xmlChar *name = xmlGetProp(node, BAD_CAST "name");
+            if (name && !xmlStrcasecmp(name, BAD_CAST "description")) {
+                xmlChar *value = xmlGetProp(node, BAD_CAST "content");
+                copy_text(description, PORT_DESCRIPTION_BYTES, value);
+                xmlFree(value);
+                xmlFree(name);
+                break;
+            }
+            xmlFree(name);
+        }
+    }
+    if (screenshots && count) {
+        xmlNodePtr gallery = romshq_section(root, "Screenshots", "screenshots");
+        if (gallery) {
+            GameDetails *details = calloc(1, sizeof(*details));
+            if (details) {
+                read_romshq_screenshots(gallery->children, details);
+                *count = details->screenshot_count;
+                if (*count)
+                    memcpy(screenshots, details->screenshots,
+                           *count * sizeof(screenshots[0]));
+                free(details);
+            }
+        }
+    }
+    xmlFreeDoc(doc);
+    return true;
+}
+
 static bool romsns_download_page(xmlNodePtr node, char url[CATALOG_URL]) {
     for (; node; node = node->next) {
         if (is_element(node, "a")) {

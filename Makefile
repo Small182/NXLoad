@@ -50,7 +50,7 @@ $(GALLERIES): $(TOPDIR)/tools/build-galleries.py
 clean:
 	rm -rf build $(TARGET).elf $(TARGET).nacp $(TARGET).nro
 else
-OFILES := main.o catalog.o game_info.o steam_media.o cover_cache.o fichier.o unpack.o install.o updater.o settings.o language.o range.o tls_platform.o trailers.o
+OFILES := main.o catalog.o game_info.o steam_media.o cover_cache.o fichier.o unpack.o install.o updater.o settings.o novelty.o language.o range.o tls_platform.o trailers.o
 all: $(OUTPUT).nro
 $(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(TITLEDB) $(CATALOG_META) $(GALLERIES) $(ROMSHQ_SEED)
 $(OUTPUT).elf: $(OFILES) $(ARCHIVE_LIB)

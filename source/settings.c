@@ -15,6 +15,7 @@ static bool read_settings(const char *path, Settings *s) {
     unsigned install, rar, nsp, legacy_auto_update, catalogs;
     long long legacy_update_checked, nsroms, romshq, romsns_checked = 0;
     unsigned ns_enabled = 1, roms_enabled = 1, romsns_enabled = 1, light = 0, english = 0;
+    unsigned default_sort_newest = 0;
     bool ok = fscanf(file, "NXLOAD1 %u %u %u %u %u %lld %lld %lld",
                      &install, &rar, &nsp, &legacy_auto_update, &catalogs, &legacy_update_checked, &nsroms, &romshq) == 8;
     if (ok) {
@@ -32,6 +33,11 @@ static bool read_settings(const char *path, Settings *s) {
                     romsns_enabled = enabled;
                     romsns_checked = checked;
                 }
+                // Optional field appended after the legacy settings layout.
+                // Old versions can still load the settings they understand.
+                unsigned newest;
+                if (fscanf(file, "%u", &newest) == 1 && newest <= 1)
+                    default_sort_newest = newest;
             }
         }
     }
@@ -41,7 +47,9 @@ static bool read_settings(const char *path, Settings *s) {
     *s = (Settings){
         .install_default = install, .delete_rar = rar, .delete_nsp = nsp,
         .auto_catalog = catalogs, .source_enabled = {ns_enabled, roms_enabled, romsns_enabled},
-        .light_theme = light, .english = english, .catalog_checked = {(time_t)nsroms, (time_t)romshq, (time_t)romsns_checked},
+        .light_theme = light, .english = english,
+        .default_sort_newest = default_sort_newest,
+        .catalog_checked = {(time_t)nsroms, (time_t)romshq, (time_t)romsns_checked},
     };
     return true;
 }
@@ -57,13 +65,14 @@ bool save_settings(const Settings *s) {
     FILE *file = fopen(TEMP, "wb");
     if (!file) return false;
     // Retain the old file layout so a rollback can read these settings.
-    bool ok = fprintf(file, "NXLOAD1\n%u %u %u 0 %u 0 %lld %lld\n%u %u %u %u\n%u %lld\n",
+    bool ok = fprintf(file, "NXLOAD1\n%u %u %u 0 %u 0 %lld %lld\n%u %u %u %u\n%u %lld\n%u\n",
                       (unsigned)s->install_default, (unsigned)s->delete_rar, (unsigned)s->delete_nsp,
                       (unsigned)s->auto_catalog, (long long)s->catalog_checked[0],
                       (long long)s->catalog_checked[1], (unsigned)s->source_enabled[0],
                       (unsigned)s->source_enabled[1], (unsigned)s->light_theme, (unsigned)s->english,
                       (unsigned)s->source_enabled[CATALOG_ROMSNS],
-                      (long long)s->catalog_checked[CATALOG_ROMSNS]) > 0 &&
+                      (long long)s->catalog_checked[CATALOG_ROMSNS],
+                      (unsigned)s->default_sort_newest) > 0 &&
               !fflush(file) && !fsync(fileno(file));
     if (fclose(file)) ok = false;
 

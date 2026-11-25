@@ -10,6 +10,7 @@ typedef struct {
     bool install_default;
     bool delete_rar, delete_nsp;
     bool auto_catalog, source_enabled[CATALOG_SOURCE_COUNT], light_theme, english;
+    bool default_sort_newest;
     time_t catalog_checked[CATALOG_SOURCE_COUNT];
 } Settings;
 

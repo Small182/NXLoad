@@ -184,7 +184,7 @@ void novelty_sync(NoveltyTracker *tracker,
 uint64_t novelty_rank(const NoveltyTracker *tracker,
                       const CatalogIndex indexes[CATALOG_SOURCE_COUNT],
                       const CatalogEntry *entry) {
-    uint64_t best = 0;
+    uint64_t baseline = 0, first_added = UINT64_MAX;
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) {
         const Game *game = entry->games[source];
         if (!game) continue;
@@ -197,9 +197,15 @@ uint64_t novelty_rank(const NoveltyTracker *tracker,
             if (game >= start && game < start + indexes[source].count)
                 value = CATALOG_CAPACITY - (uint64_t)(game - start);
         }
-        if (value > best) best = value;
+        if (value >= NOVELTY_BASE) {
+            if (value < first_added) first_added = value;
+        } else if (value > baseline) {
+            baseline = value;
+        }
     }
-    return best;
+    // When a title already exists in another source, discovering an
+    // additional download source must not make that old title "new" again.
+    return baseline ? baseline : first_added != UINT64_MAX ? first_added : 0;
 }
 
 void novelty_free(NoveltyTracker *tracker) {

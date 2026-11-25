@@ -844,6 +844,20 @@ static void read_romsns_media(xmlNodePtr root, char description[PORT_DESCRIPTION
             if (!strcmp(screenshots[i], url)) valid = false;
         if (valid) strcpy(screenshots[(*count)++], url);
     }
+    if (!length) {
+        xmlNodePtr paragraph = find_tag(intro->children, "p");
+        if (paragraph) {
+            xmlChar *value = xmlNodeGetContent(paragraph);
+            copy_text(description, PORT_DESCRIPTION_BYTES, value);
+            xmlFree(value);
+        }
+    }
+    if (!*count) {
+        xmlNodePtr gallery = find_class(article->children, "wp-block-gallery");
+        if (!gallery) gallery = find_class(article->children, "gallery");
+        if (!gallery) gallery = find_class(article->children, "screenshots");
+        if (gallery) romsns_gallery_fallback(gallery->children, screenshots, count);
+    }
 }
 
 bool catalog_read_romsns_media(const char *page, atomic_bool *cancel,

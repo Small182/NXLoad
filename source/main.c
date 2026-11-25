@@ -22,6 +22,7 @@
 #include "install.h"
 #include "storage.h"
 #include "settings.h"
+#include "novelty.h"
 #include "language.h"
 #include "unpack.h"
 #include "updater.h"
@@ -65,7 +66,7 @@ typedef enum { BACKLIGHT_UNCHANGED, BACKLIGHT_APPLET, BACKLIGHT_LBL } BacklightC
 typedef enum { SLEEP_UNCHANGED, SLEEP_APPLET, SLEEP_MEDIA } SleepControl;
 typedef enum { TOP_NONE, TOP_SEARCH, TOP_DOWNLOADS, TOP_SETTINGS } TopFocus;
 typedef enum {
-    SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG,
+    SETTINGS_DEFAULT, SETTINGS_RAR, SETTINGS_NSP, SETTINGS_AUTO_CATALOG, SETTINGS_INITIAL_SORT,
     SETTINGS_NSROMS, SETTINGS_ROMSHQ, SETTINGS_ROMSNS, SETTINGS_THEME, SETTINGS_LANGUAGE,
     SETTINGS_REFRESH_CATALOG, SETTINGS_UPDATE, SETTINGS_ROWS
 } SettingRow;
@@ -91,11 +92,13 @@ typedef enum {
 #define SD_STATUS_GAP 50
 #define DOWNLOADS_DIM_X 1000
 typedef enum { GAME_OVERVIEW, GAME_MEDIA, GAME_FILES } GameTab;
-typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_COUNT } SortMode;
+typedef enum { SORT_RATING, SORT_NAME, SORT_RELEASE, SORT_ADDED, SORT_COUNT } SortMode;
 
 enum { WORKER_PRIORITY = 0x2c, STORAGE_WORKER_PRIORITY = 0x30 };
 
-static const char *const sort_names[] = {"За рейтингом", "За алфавітом", "За датою виходу"};
+static const char *const sort_names[] = {
+    "За рейтингом", "За алфавітом", "За датою виходу", "За новизною"
+};
 static const char *const genre_names[] = {
     "Усі жанри", "Екшн", "Пригоди", "Аркада", "Настільні", "Освітні", "Файтинг",
     "Шутер від першої особи", "Музика", "Для вечірок", "Платформер", "Головоломки",
@@ -170,6 +173,8 @@ typedef struct {
     char sd_status[48];
     CatalogIndex catalogs[CATALOG_SOURCE_COUNT];
     CatalogEntry entries[MERGED_CAPACITY];
+    NoveltyTracker novelty;
+    uint64_t novelty_scores[MERGED_CAPACITY];
     size_t entry_count;
     CatalogIndexJob index_job;
     Thread index_thread;
@@ -859,9 +864,15 @@ static bool match_query(const CatalogEntry *entry) {
 }
 
 static int compare_rows(const void *left, const void *right) {
-    const CatalogEntry *a = &app.entries[*(const size_t *)left];
-    const CatalogEntry *b = &app.entries[*(const size_t *)right];
-    if (app.sort != SORT_NAME) {
+    const size_t index_a = *(const size_t *)left;
+    const size_t index_b = *(const size_t *)right;
+    const CatalogEntry *a = &app.entries[index_a];
+    const CatalogEntry *b = &app.entries[index_b];
+    if (app.sort == SORT_ADDED) {
+        uint64_t first = app.novelty_scores[index_a];
+        uint64_t second = app.novelty_scores[index_b];
+        if (first != second) return first > second ? -1 : 1;
+    } else if (app.sort != SORT_NAME) {
         const CatalogMetadata empty = {0};
         const CatalogMetadata *x = a->metadata ? a->metadata : &empty;
         const CatalogMetadata *y = b->metadata ? b->metadata : &empty;
@@ -1405,10 +1416,17 @@ static void refresh_saved(void) {
     if (app.saved_index >= app.saved_count) app.saved_index = 0;
 }
 
+static void refresh_novelty_scores(void) {
+    for (size_t i = 0; i < app.entry_count; ++i)
+        app.novelty_scores[i] =
+            novelty_rank(&app.novelty, app.catalogs, &app.entries[i]);
+}
+
 static void remake_catalog(void) {
     char keep[CATALOG_URL] = {0};
     if (app.game_count) strcpy(keep, game_at(app.game_index)->page);
     app.entry_count = merge_catalogs(app.catalogs, app.entries);
+    refresh_novelty_scores();
     rebuild_view(keep[0] ? keep : NULL);
 }
 
@@ -1426,6 +1444,9 @@ static void schedule_daily_catalogs(time_t now) {
 static void open_catalogs(void) {
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source)
         catalog_read_cache(&app.catalogs[source], (CatalogSource)source);
+    // Catalogs already on this device form a baseline. A later completed
+    // index refresh can then identify entries newly added to the catalog.
+    novelty_sync(&app.novelty, app.catalogs, (1u << CATALOG_SOURCE_COUNT) - 1);
     remake_catalog();
     schedule_daily_catalogs(time(NULL));
     start_next_index();
@@ -1462,7 +1483,9 @@ static void pump_index(void) {
         memcpy(index->games, job->index.games, job->index.count * sizeof(Game));
         index->count = job->index.count;
         index->saved_at = job->index.saved_at;
+        novelty_sync(&app.novelty, app.catalogs, 1u << job->source);
         app.entry_count = merge_catalogs(app.catalogs, app.entries);
+        refresh_novelty_scores();
         rebuild_view(keep[0] ? keep : NULL);
     } else if (app.show_partial_index && published > index->count) {
         memcpy(index->games + index->count, job->index.games + index->count,
@@ -2024,6 +2047,7 @@ static void change_setting(size_t row, bool activate) {
         case SETTINGS_RAR: value = &app.settings.delete_rar; break;
         case SETTINGS_NSP: value = &app.settings.delete_nsp; break;
         case SETTINGS_AUTO_CATALOG: value = &app.settings.auto_catalog; break;
+        case SETTINGS_INITIAL_SORT: value = &app.settings.default_sort_newest; break;
         case SETTINGS_NSROMS: value = &app.settings.source_enabled[CATALOG_NSROMS]; break;
         case SETTINGS_ROMSHQ: value = &app.settings.source_enabled[CATALOG_ROMSHQ]; break;
         case SETTINGS_ROMSNS: value = &app.settings.source_enabled[CATALOG_ROMSNS]; break;
@@ -2046,6 +2070,14 @@ static void change_setting(size_t row, bool activate) {
         app.background_check_at = 0;
         apply_theme();
         set_english(app.settings.english);
+        if (row == SETTINGS_INITIAL_SORT) {
+            SortMode initial = app.settings.default_sort_newest ?
+                SORT_ADDED : SORT_RATING;
+            for (size_t i = 0; i < GENRE_COUNT; ++i)
+                app.genre_sort[i] = initial;
+            app.sort = initial;
+            rebuild_view(NULL);
+        }
         if (row >= SETTINGS_NSROMS && row <= SETTINGS_ROMSNS) {
             app.file_index = 0;
             app.file_scroll = 0;
@@ -2967,7 +2999,7 @@ static void draw_settings(void) {
     static const char *const labels[] = {
         "Дія з файлом за замовчуванням", "Видаляти архів після розпакування",
         "Видаляти NSP після встановлення", "Щоденне оновлення каталогів",
-        "Джерело NSRoms", "Джерело ROMsHQ", "Джерело ROMsNS", "Тема", "Мова",
+        "Початкове сортування", "Джерело NSRoms", "Джерело ROMsHQ", "Джерело ROMsNS", "Тема", "Мова",
         "Оновити каталоги зараз", "Перевірити оновлення NXLoad",
     };
     const char *const on = "Увімкнено", *const off = "Вимкнено";
@@ -2975,6 +3007,7 @@ static void draw_settings(void) {
         app.settings.install_default ? "Завантажити й встановити" : "Завантажити",
         app.settings.delete_rar ? on : off, app.settings.delete_nsp ? on : off,
         app.settings.auto_catalog ? on : off,
+        sort_names[app.settings.default_sort_newest ? SORT_ADDED : SORT_RATING],
         app.settings.source_enabled[CATALOG_NSROMS] ? on : off,
         app.settings.source_enabled[CATALOG_ROMSHQ] ? on : off,
         app.settings.source_enabled[CATALOG_ROMSNS] ? on : off,
@@ -3603,6 +3636,10 @@ int main(int argc, char **argv) {
     if (ok) {
         SDL_RenderSetLogicalSize(app.renderer, 1280, 720);
         app.settings = load_settings();
+        novelty_load(&app.novelty);
+        SortMode initial_sort = app.settings.default_sort_newest ? SORT_ADDED : SORT_RATING;
+        for (size_t i = 0; i < GENRE_COUNT; ++i) app.genre_sort[i] = initial_sort;
+        app.sort = initial_sort;
         load_download_queue();
         apply_theme();
         set_english(app.settings.english);
@@ -3751,6 +3788,7 @@ int main(int argc, char **argv) {
     if (R_SUCCEEDED(sockets)) socketExit();
     if (R_SUCCEEDED(entropy)) csrngExit();
     free_catalog_metadata();
+    novelty_free(&app.novelty);
     free(app.favorites);
     if (app.update_ready) {
         char arguments[sizeof(app.update_target) + 2];

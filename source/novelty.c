@@ -159,7 +159,12 @@ void novelty_sync(NoveltyTracker *tracker,
         size_t previous_count = tracker->count;
         for (size_t i = index->count; i > 0; --i) {
             const uint64_t key = hash_url(source, index->games[i - 1].page);
-            if (lookup(tracker, key)) continue;
+            // Appended records are unsorted until the end of this source pass.
+            NoveltyRecord wanted = {.key = key};
+            if (previous_count &&
+                bsearch(&wanted, tracker->records, previous_count,
+                        sizeof(*tracker->records), compare_records))
+                continue;
             const uint64_t order = baseline ?
                 (uint64_t)(CATALOG_CAPACITY - (i - 1)) : ++tracker->next_order;
             tracker->records[tracker->count++] = (NoveltyRecord){.key = key, .order = order};

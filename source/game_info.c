@@ -937,7 +937,21 @@ void load_game_gallery(GalleryJob *job) {
              job->heading[0] ? job->heading : job->catalog_title);
     if (!job->title[0]) clean_heading(name);
     title_key(key, name);
-    if (bundled_gallery(key, &job->result)) return;
+    bool bundled = bundled_gallery(key, &job->result);
+    if (job->romshq_page[0] && (!bundled || job->need_romshq_description) &&
+        !atomic_load(&job->cancel)) {
+        // Only replace screenshots when no bundled gallery exists. A missing
+        // description can still be filled without overriding good artwork.
+        size_t count = 0;
+        bool loaded = catalog_read_romshq_media(
+            job->romshq_page, &job->cancel, job->port_description,
+            bundled ? NULL : job->result.screenshots, bundled ? NULL : &count);
+        if (!bundled && loaded && count) {
+            job->result.count = count;
+            job->result.from_romshq = true;
+        }
+    }
+    if (bundled || job->result.count) return;
     if (nlib_gallery(job)) return;
     if (atomic_load(&job->cancel)) return;
 

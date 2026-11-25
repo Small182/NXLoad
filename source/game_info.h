@@ -28,7 +28,9 @@ typedef struct {
 typedef struct {
     char page[CATALOG_URL];
     char romsns_page[CATALOG_URL];
+    char romshq_page[CATALOG_URL];
     char port_description[PORT_DESCRIPTION_BYTES];
+    bool need_romshq_description;
     char nintendo_life[CATALOG_URL];
     char title[CATALOG_TEXT];
     char heading[CATALOG_TEXT];

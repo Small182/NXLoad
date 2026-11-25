@@ -781,6 +781,24 @@ static bool romsns_download_page(xmlNodePtr node, char url[CATALOG_URL]) {
     return false;
 }
 
+static void romsns_gallery_fallback(xmlNodePtr node,
+                                    char shots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count) {
+    for (; node && *count < CATALOG_SCREENSHOTS; node = node->next) {
+        if (is_element(node, "img")) {
+            xmlChar *src = xmlGetProp(node, BAD_CAST "data-src");
+            if (!src || !*src) { xmlFree(src); src = xmlGetProp(node, BAD_CAST "src"); }
+            char url[CATALOG_URL];
+            bool ok = site_url(src, url, CATALOG_ROMSNS) &&
+                !strncmp(url, ROMSNS "/wp-content/uploads/", sizeof(ROMSNS "/wp-content/uploads/") - 1);
+            xmlFree(src);
+            for (size_t i = 0; ok && i < *count; ++i)
+                if (!strcmp(shots[i], url)) ok = false;
+            if (ok) strcpy(shots[(*count)++], url);
+        }
+        romsns_gallery_fallback(node->children, shots, count);
+    }
+}
+
 static void read_romsns_media(xmlNodePtr root, char description[PORT_DESCRIPTION_BYTES],
                                char screenshots[CATALOG_SCREENSHOTS][CATALOG_URL], size_t *count) {
     xmlNodePtr article = find_class(root, "entry-content");
@@ -825,6 +843,20 @@ static void read_romsns_media(xmlNodePtr root, char description[PORT_DESCRIPTION
         for (size_t i = 0; valid && i < *count; ++i)
             if (!strcmp(screenshots[i], url)) valid = false;
         if (valid) strcpy(screenshots[(*count)++], url);
+    }
+    if (!length) {
+        xmlNodePtr paragraph = find_tag(intro->children, "p");
+        if (paragraph) {
+            xmlChar *value = xmlNodeGetContent(paragraph);
+            copy_text(description, PORT_DESCRIPTION_BYTES, value);
+            xmlFree(value);
+        }
+    }
+    if (!*count) {
+        xmlNodePtr gallery = find_class(article->children, "wp-block-gallery");
+        if (!gallery) gallery = find_class(article->children, "gallery");
+        if (!gallery) gallery = find_class(article->children, "screenshots");
+        if (gallery) romsns_gallery_fallback(gallery->children, screenshots, count);
     }
 }
 

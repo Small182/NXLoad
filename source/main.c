@@ -191,6 +191,7 @@ typedef struct {
     bool show_original, fullscreen_shot;
     GameMetadata metadata;
     char port_description[PORT_DESCRIPTION_BYTES];
+    bool romsns_only;
     GameGallery gallery;
     GalleryJob gallery_job;
     Thread gallery_thread;
@@ -965,14 +966,18 @@ static void refresh_catalogs(void) {
     start_next_index();
 }
 
-static bool use_romsns_port_media(void) {
+static bool use_romsns_page_media(void) {
+    // The ROMsNS page is the only available metadata source for titles
+    // exclusive to ROMsNS. Homebrew ports also use that page by design.
     return app.settings.source_enabled[CATALOG_ROMSNS] &&
-           romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS]);
+           app.game_sources[CATALOG_ROMSNS].page[0] &&
+           (app.romsns_only ||
+            romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS]));
 }
 
 static void request_game_files(void) {
     if (app.screen != GAME || app.game_tab == GAME_OVERVIEW) return;
-    if (app.game_tab == GAME_MEDIA && use_romsns_port_media()) return;
+    if (app.game_tab == GAME_MEDIA && use_romsns_page_media()) return;
     for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source) {
         if (app.game_tab == GAME_MEDIA && source != CATALOG_ROMSHQ) continue;
         if (!app.settings.source_enabled[source] || app.files_loaded[source] || app.catalog_busy[source] ||
@@ -1305,7 +1310,7 @@ static void update_description(void) {
     app.description = NULL;
     app.description_scroll = 0;
     const char *summary = app.show_original ? app.metadata.original : app.metadata.description;
-    if (app.port_description[0] && use_romsns_port_media()) summary = app.port_description;
+    if (app.port_description[0] && use_romsns_page_media()) summary = app.port_description;
     if (!*summary) return;
     SDL_Surface *paragraph = TTF_RenderUTF8_Blended_Wrapped(app.normal, summary, gray, 750);
     if (!paragraph) return;
@@ -1315,7 +1320,7 @@ static void update_description(void) {
 
 static void pump_gallery(void) {
     GalleryJob *job = &app.gallery_job;
-    bool port_media = use_romsns_port_media();
+    bool port_media = use_romsns_page_media();
     if (app.gallery_busy && R_SUCCEEDED(waitSingle(waiterForThread(&app.gallery_thread), 0))) {
         threadWaitForExit(&app.gallery_thread);
         threadClose(&app.gallery_thread);
@@ -1551,7 +1556,7 @@ static void finish_jobs(void) {
             app.details[source] = job->details;
             strcpy(app.file_errors[source], job->error);
             if (app.settings.source_enabled[source] && source == CATALOG_ROMSHQ &&
-                job->details.screenshot_count && !app.gallery.count && !use_romsns_port_media()) {
+                job->details.screenshot_count && !app.gallery.count && !use_romsns_page_media()) {
                 if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
                 app.screenshot_index = 0;
                 app.gallery.count = job->details.screenshot_count;
@@ -2082,7 +2087,8 @@ static void change_setting(size_t row, bool activate) {
             app.file_index = 0;
             app.file_scroll = 0;
         }
-        if (row == SETTINGS_ROMSNS && romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS]) &&
+        if (row == SETTINGS_ROMSNS && (app.romsns_only ||
+            romsns_is_homebrew_port(&app.game_sources[CATALOG_ROMSNS])) &&
             (app.screen == GAME || (app.screen == DOWNLOADS && app.previous == GAME))) {
             if (app.gallery_busy) atomic_store(&app.gallery_job.cancel, true);
             app.gallery_requested = false;
@@ -2793,7 +2799,7 @@ static void input(u64 buttons) {
             }
         } else {
             if ((buttons & HidNpadButton_X) && app.metadata.original[0] &&
-                !(app.port_description[0] && use_romsns_port_media())) {
+                !(app.port_description[0] && use_romsns_page_media())) {
                 app.show_original = !app.show_original;
                 update_description();
             }
@@ -2852,6 +2858,11 @@ static void input(u64 buttons) {
             memset(app.game_sources, 0, sizeof(app.game_sources));
             for (unsigned source = 0; source < CATALOG_SOURCE_COUNT; ++source)
                 if (entry->games[source]) app.game_sources[source] = *entry->games[source];
+            // Determine exclusivity from merged catalog membership, BEFORE
+            // optional ROMsHQ URL guesses are introduced below.
+            app.romsns_only = entry->games[CATALOG_ROMSNS] &&
+                              !entry->games[CATALOG_NSROMS] &&
+                              !entry->games[CATALOG_ROMSHQ];
             app.show_original = false;
             app.port_description[0] = 0;
             memset(&app.details, 0, sizeof(app.details));
@@ -3104,10 +3115,10 @@ static void draw_game_overview(void) {
                 text(app.small, "↑ / ↓  Читати опис", 430, 522, 769, gray);
         }
     } else {
-        bool loading = use_romsns_port_media() && (app.gallery_busy || !app.gallery_requested);
+        bool loading = use_romsns_page_media() && (app.gallery_busy || !app.gallery_requested);
         text(app.normal, loading ? "Завантаження опису…" : "Опис недоступний", 430, 269, 769, gray);
     }
-    if (app.port_description[0] && use_romsns_port_media()) {
+    if (app.port_description[0] && use_romsns_page_media()) {
         text(app.small, "Опис · ROMsNS", 430, 548, 769, gray);
     } else if (app.metadata.original[0]) {
         text(app.small, app.show_original ? "Англійський оригінал" : "Український опис", 430, 548, 769, gray);
@@ -3118,7 +3129,7 @@ static void draw_game_overview(void) {
 static void draw_game_screenshots(void) {
     if (!app.gallery.count) {
         const char *status = app.gallery_busy || !app.gallery_requested ||
-            (app.catalog_busy[CATALOG_ROMSHQ] && !use_romsns_port_media()) ? "Пошук скриншотів…" :
+            (app.catalog_busy[CATALOG_ROMSHQ] && !use_romsns_page_media()) ? "Пошук скриншотів…" :
             app.gallery.issue[0] ? app.gallery.issue : "Скриншоти недоступні";
         text(app.normal, status, 430, 273, 769, gray);
         return;

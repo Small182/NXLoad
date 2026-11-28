@@ -85,8 +85,10 @@ static Buffer fetch(CURL *curl, atomic_bool *cancel, const char *url, size_t lim
 #endif
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, redirects ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, thumbnail ? 3L : 8L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, thumbnail ? 7L : 16L);
+    // Cover fetches can stall while NCM installs content to microSD.
+    // Seven seconds was too aggressive under simultaneous disk pressure.
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, thumbnail ? 8L : 8L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, thumbnail ? 20L : 16L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     // Preserve libcurl's normal IPv4/IPv6 fallback (as in v1.0.50).
     const bool nintendo_store = !strncmp(url, "https://www.nintendo.com/",

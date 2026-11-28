@@ -140,7 +140,7 @@ typedef struct {
     Thread thread;
     CURL *connection;
     CatalogFetchStatus screenshot_status;
-    bool screenshot, busy;
+    bool screenshot, busy, from_network;
 } CoverJob;
 
 typedef struct {
@@ -214,7 +214,8 @@ typedef struct {
     Thread update_thread;
     struct { uint16_t offset, length; } update_lines[UPDATE_DETAILS_BYTES];
     int update_line_count, update_details_scroll;
-    char query[96], notice[192], delete_file[sizeof(((SavedFile *)0)->file)];
+    char query[96], notice[192], cover_issue[96], delete_file[sizeof(((SavedFile *)0)->file)];
+    uint64_t cover_issue_until;
     char installer_file[sizeof(((SavedFile *)0)->file)];
     char installer_reason[192];
     const char *installer_error;
@@ -1095,6 +1096,7 @@ static void cover_worker(void *arg) {
     if (job->image || atomic_load(&job->cancel)) return;
     if (!job->connection) job->connection = curl_easy_init();
     if (!job->connection) return;
+    job->from_network = true;
     bytes = catalog_fetch_thumbnail(job->connection, job->url, &job->cancel, &count);
     if (!atomic_load(&job->cancel)) {
         job->image = decode_cover(bytes, count, false);
@@ -1204,6 +1206,17 @@ static void finish_cover(CoverJob *job) {
     job->busy = false;
     if (!atomic_load(&job->cancel)) {
         SDL_Texture *texture = job->image ? SDL_CreateTextureFromSurface(app.renderer, job->image) : NULL;
+        if (!job->screenshot && app.screen == LIBRARY && !texture && cover_install_active()) {
+            // Show a short diagnostic instead of silently failing throughout NSP install.
+            const char *error = job->from_network ? "Мережа або формат зображення" :
+                                                    "Помилка обкладинки";
+            snprintf(app.cover_issue, sizeof(app.cover_issue),
+                     "Обкладинка: %s", error);
+            app.cover_issue_until = SDL_GetTicks64() + 5500;
+        } else if (!job->screenshot && texture) {
+            app.cover_issue[0] = 0;
+            app.cover_issue_until = 0;
+        }
         if (job->screenshot && app.screen == GAME && app.gallery.count &&
             !strcmp(job->url, app.gallery.screenshots[app.screenshot_index])) {
             const char *source = strstr(job->url, "nintendolife.com") ? "Nintendo Life" :
@@ -1294,9 +1307,14 @@ static bool pump_covers(void) {
         }
     }
     if (app.gallery_busy && !app.gallery.count) return finished;
+    bool installing = cover_install_active();
+    unsigned active = 0;
+    for (size_t i = 0; i < COVER_WORKERS; ++i)
+        if (app.cover_jobs[i].busy && !atomic_load(&app.cover_jobs[i].cancel)) ++active;
     for (size_t i = 0; i < COVER_WORKERS; ++i) {
-        // Use one background cover worker while installing NSP.
-        if (cover_install_active() && i > 0) continue;
+        // The first slot may be winding down a cancelled task from another
+        // screen. Choose any idle worker, limiting total live requests.
+        if (installing && active) break;
         CoverJob *job = &app.cover_jobs[i];
         if (job->busy) continue;
         const char *url = next_cover(&job->screenshot);
@@ -1304,8 +1322,10 @@ static bool pump_covers(void) {
         strcpy(job->url, url);
         atomic_init(&job->cancel, false);
         job->image = NULL;
+        job->from_network = false;
         job->screenshot_status = (CatalogFetchStatus){0};
         job->busy = start_worker(&job->thread, cover_worker, job);
+        if (job->busy) ++active;
     }
     return finished;
 }
@@ -3022,7 +3042,8 @@ static void draw_library(void) {
     if (app.game_count) {
         const CatalogEntry *entry = &app.entries[app.rows[app.game_index]];
         text(app.normal, entry_title(entry), 40, 593, 905, white);
-        text(app.small, app.notice, 1000, 593, 240, blue);
+        text(app.small, app.cover_issue_until > SDL_GetTicks64() ?
+             app.cover_issue : app.notice, 1000, 593, 240, blue);
     } else if (!app.index_busy) {
         text(app.normal, app.favorites_open ? "У вибраному немає ігор" :
              app.entry_count ? "Ігор за цими фільтрами не знайдено" : "Каталог порожній",

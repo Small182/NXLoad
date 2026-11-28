@@ -139,7 +139,7 @@ typedef struct {
     SDL_Surface *image;
     Thread thread;
     CURL *connection;
-    CatalogFetchStatus screenshot_status;
+    CatalogFetchStatus screenshot_status, cover_status;
     bool screenshot, busy, from_network;
 } CoverJob;
 
@@ -1097,7 +1097,8 @@ static void cover_worker(void *arg) {
     if (!job->connection) job->connection = curl_easy_init();
     if (!job->connection) return;
     job->from_network = true;
-    bytes = catalog_fetch_thumbnail(job->connection, job->url, &job->cancel, &count);
+    bytes = catalog_fetch_thumbnail_status(job->connection, job->url, &job->cancel,
+                                           &count, &job->cover_status);
     if (!atomic_load(&job->cancel)) {
         job->image = decode_cover(bytes, count, false);
         if (job->image) {
@@ -1208,10 +1209,17 @@ static void finish_cover(CoverJob *job) {
         SDL_Texture *texture = job->image ? SDL_CreateTextureFromSurface(app.renderer, job->image) : NULL;
         if (!job->screenshot && app.screen == LIBRARY && !texture && cover_install_active()) {
             // Show a short diagnostic instead of silently failing throughout NSP install.
-            const char *error = job->from_network ? "Мережа або формат зображення" :
-                                                    "Помилка обкладинки";
-            snprintf(app.cover_issue, sizeof(app.cover_issue),
-                     "Обкладинка: %s", error);
+            if (job->cover_status.curl)
+                snprintf(app.cover_issue, sizeof(app.cover_issue),
+                         "Обкладинка · cURL %d", job->cover_status.curl);
+            else if (job->cover_status.http && job->cover_status.http != 200)
+                snprintf(app.cover_issue, sizeof(app.cover_issue),
+                         "Обкладинка · HTTP %ld", job->cover_status.http);
+            else
+                snprintf(app.cover_issue, sizeof(app.cover_issue),
+                         "%s", job->from_network ?
+                         "Обкладинка · неможливо декодувати" :
+                         "Обкладинка · помилка кешу");
             app.cover_issue_until = SDL_GetTicks64() + 5500;
         } else if (!job->screenshot && texture) {
             app.cover_issue[0] = 0;
@@ -1324,6 +1332,7 @@ static bool pump_covers(void) {
         job->image = NULL;
         job->from_network = false;
         job->screenshot_status = (CatalogFetchStatus){0};
+        job->cover_status = (CatalogFetchStatus){0};
         job->busy = start_worker(&job->thread, cover_worker, job);
         if (job->busy) ++active;
     }

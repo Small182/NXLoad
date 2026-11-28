@@ -105,6 +105,9 @@ unsigned char *catalog_fetch_cover(const char *url, atomic_bool *cancel, size_t 
 unsigned char *catalog_fetch_cover_status(const char *url, atomic_bool *cancel, size_t *bytes,
                                           CatalogFetchStatus *status);
 unsigned char *catalog_fetch_thumbnail(CURL *connection, const char *url, atomic_bool *cancel, size_t *bytes);
+unsigned char *catalog_fetch_thumbnail_status(CURL *connection, const char *url,
+                                              atomic_bool *cancel, size_t *bytes,
+                                              CatalogFetchStatus *status);
 unsigned char *catalog_fetch_document(const char *url, atomic_bool *cancel, size_t *bytes,
                                       CatalogFetchStatus *status);
 

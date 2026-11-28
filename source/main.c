@@ -635,6 +635,13 @@ static bool network_download_active(void) {
     return app.download_busy && transfer_stage() == 0;
 }
 
+// Installing NSP writes to the console, not the download network.
+// Keep one low-priority image request alive so game covers can load.
+static bool cover_install_active(void) {
+    return app.download_busy && transfer_stage() == 2 &&
+           !app.active_transfer.app_update;
+}
+
 static bool wake_download_screen(void);
 
 /* Only interactive + can request confirmation. The system can forcibly
@@ -1176,9 +1183,11 @@ static bool cover_visible(const CoverJob *job) {
     }
     if (app.screen != LIBRARY || job->screenshot) return false;
     size_t first = grid_first(), end = grid_end();
-    if (!app.download_busy) {
-        first = first > COVER_LOOKAHEAD ? first - COVER_LOOKAHEAD : 0;
-        end = SDL_min(app.game_count, end + COVER_LOOKAHEAD);
+    if (!app.download_busy || cover_install_active()) {
+        size_t ahead = cover_install_active() ?
+            GRID_COLUMNS : COVER_LOOKAHEAD;
+        first = first > ahead ? first - ahead : 0;
+        end = SDL_min(app.game_count, end + ahead);
     }
     for (size_t i = first; i < end; ++i) {
         const CatalogEntry *entry = &app.entries[app.rows[i]];
@@ -1255,8 +1264,12 @@ static const char *next_cover(bool *screenshot) {
         if (url) return url;
     }
     uint64_t now = SDL_GetTicks64();
-    if (app.download_busy || now < app.prefetch_at) return NULL;
-    for (size_t distance = 0; distance < COVER_LOOKAHEAD; ++distance) {
+    bool installing = cover_install_active();
+    if ((app.download_busy && !installing) || now < app.prefetch_at) return NULL;
+    // Avoid competing with NSP writes: prefetch just the nearest row,
+    // whereas an idle catalog keeps its normal two-screen lookahead.
+    size_t limit = installing ? GRID_COLUMNS : COVER_LOOKAHEAD;
+    for (size_t distance = 0; distance < limit; ++distance) {
         size_t positions[] = {end + distance, distance < first ? first - 1 - distance : SIZE_MAX};
         for (size_t direction = 0; direction < 2; ++direction) {
             if (positions[direction] >= app.game_count) continue;
@@ -1282,6 +1295,8 @@ static bool pump_covers(void) {
     }
     if (app.gallery_busy && !app.gallery.count) return finished;
     for (size_t i = 0; i < COVER_WORKERS; ++i) {
+        // Use one background cover worker while installing NSP.
+        if (cover_install_active() && i > 0) continue;
         CoverJob *job = &app.cover_jobs[i];
         if (job->busy) continue;
         const char *url = next_cover(&job->screenshot);
